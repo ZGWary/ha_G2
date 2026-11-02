@@ -37,6 +37,11 @@ that mirror the layout of the Hoymiles app.
 - **Eight bundled Lovelace cards**, registered as frontend modules automatically, so
   there is no manual "add resource" step. All of them are self-drawn SVG with
   **no CDN and no third-party card** — they work offline.
+- **A sidebar panel, one per device.** Adding the integration puts an entry named after
+  your `dev_id` in the sidebar. It is a ready-made dashboard — live power flow, today's
+  energy, power history, energy sankey, battery & pack detail, and the full control /
+  TOU page — so nothing has to be assembled by hand. It composes the same eight cards;
+  see [The sidebar panel](#the-sidebar-panel).
 - **Follows the UI language.** All eight cards use the language of the Home Assistant
   user viewing them (`hass.language`), so one dashboard reads correctly for an
   English and a Chinese user at the same time. Text **you** write can follow too -
@@ -58,7 +63,7 @@ that mirror the layout of the Hoymiles app.
 |---|---|
 | **Home Assistant** | 2023.8 or newer (declared in `hacs.json`) |
 | **Required integration** | Home Assistant **MQTT**, pointed at the same broker as the device |
-| **Devices** | MS-A2 · HiBattery 4020 X · HiBattery 1920 AC |
+| **Devices** | MS-A2 · HiBattery 4020 X · HiBattery 1920 AC · RMI-1650 series |
 | **Firmware** | Must publish MQTT discovery under the `homeassistant/` prefix |
 | **Recorder** | Optional — only needed by the history chart and the energy sankey |
 
@@ -123,7 +128,28 @@ The `dev_id` is `<client_prefix>-<SN>`, or just the SN when no prefix is configu
 
 ## Quick start
 
-Once the device is added you get entities plus eight cards. A minimal dashboard:
+Once the device is added you get entities, a sidebar panel and eight cards.
+
+### The sidebar panel
+
+Adding the integration registers a `panel_custom` page per device, at
+`/hoymiles-<dev_id>` and named after the `dev_id` in the sidebar. Nothing to configure —
+open it and it is already showing that device:
+
+| Tab | Contents |
+|---|---|
+| **System** | Live power flow, today's PV / charged / discharged energy, day power history, energy sankey |
+| **Device** | Battery stack with per-pack SOC and temperature, pack list, diagnostics (model, firmware, serial, live battery/grid readings) |
+| **Control** | On/off, EMS mode, power set-point, per-phase output, TOU plan editor, reboot |
+
+The panel is *composed*, not duplicated: it embeds the eight cards below and simply
+resolves the entity ids for you. Everything is still available as individual cards if
+you prefer to build your own dashboard.
+
+> Panel titles are fixed when the panel is registered, so the sidebar entry is the raw
+> `dev_id`. The text *inside* the panel follows the viewing user's language.
+
+### A minimal dashboard, if you prefer cards
 
 ```yaml
 type: vertical-stack

@@ -11,8 +11,8 @@ discovery patches, the entity model and the availability logic.
 
 | File | Responsibility |
 |---|---|
-| `__init__.py` | Config entry setup, frontend asset registration, service registration |
-| `manifest.json` | Domain, version, dependencies (`mqtt`, `http`, `frontend`) |
+| `__init__.py` | Config entry setup, frontend asset + sidebar panel registration, service registration |
+| `manifest.json` | Domain, version, dependencies (`mqtt`, `http`, `frontend`, `panel_custom`) |
 | `const.py` | Topic templates, constants, TOU reply codes, card asset list |
 | `mqtt_util.py` | Publish/subscribe helpers and device auto-discovery |
 | `coordinator.py` | Push-based `DataUpdateCoordinator` plus availability tracking |
@@ -25,7 +25,39 @@ discovery patches, the entity model and the availability logic.
 | `services.py` / `services.yaml` | The `hoymiles.*` services |
 | `strings.json` / `translations/` | UI strings (`en`, `zh-Hans`) |
 | `brand/` | `icon.png` (256×256) and `logo.png` (657×256) |
-| `www/` | The eight Lovelace cards, plain ES modules |
+| `www/` | The eight Lovelace cards, the sidebar panel, and the bootstrap they share |
+
+### Frontend loading
+
+`www/` holds eleven ES modules, but only **one** URL is handed to the frontend:
+
+```
+www/hoymiles-boot.js      <- add_extra_js_url() + the panel's module_url
+www/hoymiles-base.js         static imports, evaluated in this order
+www/hoymiles-panel.js
+www/hoymiles-power-flow.js
+www/hoymiles-…              (the remaining cards)
+```
+
+Two constraints force this shape:
+
+- **`add_extra_js_url` stores its URLs in a set**, so registering every file
+  separately yields an arbitrary `<script>` order. A card that evaluated before
+  the bootstrap could not find `LitElement`. Static `import` statements are
+  evaluated in source order, deterministically, which is why the boot module
+  exists.
+- **`ha-panel-lovelace` does not exist on a `panel_custom` page.** Every card
+  used to borrow Lit via
+  `Object.getPrototypeOf(customElements.get("ha-panel-lovelace"))`, which only
+  resolves on a Lovelace dashboard — inside the sidebar panel it waited forever.
+  `hoymiles-base.js` publishes `window.__hmLit()` / `window.__hmWhenLit()`,
+  which probe several candidate elements (`ha-card` covers the panel) by walking
+  their prototype chain for `html` + `css` + `requestUpdate`.
+
+The sidebar panel itself is a `panel_custom` page registered per config entry
+(`async_register_built_in_panel`, `component_name="custom"`), at
+`/hoymiles-<slug(dev_id)>`, with `config={"dev_id": …}` passed through to
+`<hoymiles-panel>`. See [CARDS.md](CARDS.md#the-sidebar-panel).
 
 ## Topic model
 
@@ -181,8 +213,9 @@ payload sets `device.model`. Observed values:
 | Device | `device.model` |
 |---|---|
 | `MSA-2805…` | `HiBattery 4020 X` |
+| `MSA-2804…` | `HiBattery 1920 AC` |
 | `MSA-2800…` | `MS-A2` |
-| (third variant) | `HiBattery 1920 AC` |
+| `RMI-1650…` | reported by the firmware (auto-detected) |
 
 Two important caveats:
 
@@ -192,10 +225,11 @@ Two important caveats:
    on our test unit.
 2. **`DeviceInfo` is written to the device registry only when an entity is first
    added** (`entity_platform._async_add_entity`). Mutating it later does not
-   propagate. To backfill a model, capture it from `payload["device"]["model"]` in
-   `discovery_override._on_discovery_message` and apply it with
-   `device_registry.async_update_device(model=...)` once the discovery message
-   arrives.
+   propagate, so `discovery_override` now backfills it: it captures
+   `payload["device"]["model"]` from the firmware's discovery message and applies
+   it with `device_registry.async_update_device(model=...)` as soon as the message
+   arrives.  That is what lets a new prefix such as `RMI-1650` show its model
+   without any hard-coded list.
 
 Models also differ substantially in **how much they publish**: an `MSA-2800`
 series unit publishes roughly 3–7 objects where an `MSA-2805` publishes around 95.

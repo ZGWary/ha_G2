@@ -193,6 +193,10 @@ FRONTEND_URL: Final = "/hoymiles_static"
 
 # Frontend assets bundled in ``www/`` and auto-injected as ES modules.
 # Add new cards here; ``__init__._async_register_frontend`` walks this tuple.
+# Order matters: the bootstrap runs first and publishes ``window.__hmLit`` /
+# ``window.__hmWhenLit``, which every file below it uses to find LitElement.
+BASE_FILENAME: Final = "hoymiles-base.js"
+PANEL_FILENAME: Final = "hoymiles-panel.js"
 CARD_FILENAME: Final = "hoymiles-tou-editor.js"
 SANKEY_CARD_FILENAME: Final = "hoymiles-energy-sankey.js"
 POWER_FLOW_CARD_FILENAME: Final = "hoymiles-power-flow.js"
@@ -201,7 +205,15 @@ HISTORY_CHART_CARD_FILENAME: Final = "hoymiles-history-chart.js"
 GAUGE_CARD_FILENAME: Final = "hoymiles-gauge.js"
 CONTROL_CARD_FILENAME: Final = "hoymiles-control.js"
 PACK_LIST_CARD_FILENAME: Final = "hoymiles-pack-list.js"
+# Only this one is injected into the frontend.  ``add_extra_js_url`` stores the
+# URLs in a set, so registering every file separately made the load order
+# arbitrary and a card could run before the bootstrap.  The boot module imports
+# the others with static ``import`` statements, which ES modules always evaluate
+# in source order.
+BOOT_FILENAME: Final = "hoymiles-boot.js"
 FRONTEND_ASSETS: Final = (
+    BASE_FILENAME,
+    PANEL_FILENAME,
     CARD_FILENAME,
     SANKEY_CARD_FILENAME,
     POWER_FLOW_CARD_FILENAME,
@@ -210,7 +222,13 @@ FRONTEND_ASSETS: Final = (
     GAUGE_CARD_FILENAME,
     CONTROL_CARD_FILENAME,
     PACK_LIST_CARD_FILENAME,
+    BOOT_FILENAME,
 )
+
+# The sidebar panel: element name (``webcomponent_name``) and URL path.
+PANEL_ELEMENT: Final = "hoymiles-panel"
+PANEL_URL_PATH: Final = "hoymiles"
+PANEL_ICON: Final = "mdi:home-battery"
 
 CARD_URL: Final = f"{FRONTEND_URL}/{CARD_FILENAME}"
 

@@ -10,8 +10,8 @@
 
 | 文件 | 职责 |
 |---|---|
-| `__init__.py` | 配置项加载、前端资源注册、服务注册 |
-| `manifest.json` | 域、版本、依赖（`mqtt`、`http`、`frontend`） |
+| `__init__.py` | 配置项加载、前端资源与侧栏面板注册、服务注册 |
+| `manifest.json` | 域、版本、依赖（`mqtt`、`http`、`frontend`、`panel_custom`） |
 | `const.py` | topic 模板、常量、TOU 应答状态码、卡片资源清单 |
 | `mqtt_util.py` | MQTT 收发与设备自动发现 |
 | `coordinator.py` | MQTT 推送型 `DataUpdateCoordinator` + 可用性判定 |
@@ -24,7 +24,36 @@
 | `services.py` / `services.yaml` | `hoymiles.*` 服务 |
 | `strings.json` / `translations/` | 界面文案（`en`、`zh-Hans`） |
 | `brand/` | `icon.png`（256×256）与 `logo.png`（657×256） |
-| `www/` | 八张 Lovelace 卡片（纯 ES module） |
+| `www/` | 八张 Lovelace 卡片、侧栏面板，以及它们共用的引导模块 |
+
+### 前端加载方式
+
+`www/` 里有十一个 ES module，但交给前端的 URL **只有一个**：
+
+```
+www/hoymiles-boot.js      <- add_extra_js_url() 与面板的 module_url 都用它
+www/hoymiles-base.js        按此顺序静态 import
+www/hoymiles-panel.js
+www/hoymiles-power-flow.js
+www/hoymiles-…              其余卡片
+```
+
+两个限制决定了这个结构：
+
+- **`add_extra_js_url` 内部用 set 存放 URL**，所以逐个注册文件时 `<script>` 顺序是随机的，
+  某张卡片可能在引导模块之前执行而找不到 `LitElement`。静态 `import` 会按源码顺序、
+  确定性地先求值依赖，这正是 boot 模块存在的理由。
+- **`panel_custom` 页面上不存在 `ha-panel-lovelace`。** 原来每张卡片都靠
+  `Object.getPrototypeOf(customElements.get("ha-panel-lovelace"))` 借 Lit，而这个元素只在
+  Lovelace 仪表盘上才有定义 —— 在侧栏面板里它永远等不到。
+  `hoymiles-base.js` 对外提供 `window.__hmLit()` / `window.__hmWhenLit()`，
+  内部遍历多个候选元素（`ha-card` 覆盖了侧栏面板）的原型链，找带
+  `html` + `css` + `requestUpdate` 的那一层。
+
+侧栏面板本身是每个配置项注册一个 `panel_custom` 页面
+（`async_register_built_in_panel`，`component_name="custom"`），路径
+`/hoymiles-<slug(dev_id)>`，并通过 `config={"dev_id": …}` 传参给
+`<hoymiles-panel>`。详见 [CARDS.zh-Hans.md](CARDS.zh-Hans.md#侧栏面板)。
 
 ## 话题模型
 
@@ -153,8 +182,9 @@
 | 设备 | `device.model` |
 |---|---|
 | `MSA-2805…` | `HiBattery 4020 X` |
+| `MSA-2804…` | `HiBattery 1920 AC` |
 | `MSA-2800…` | `MS-A2` |
-| （第三种变体） | `HiBattery 1920 AC` |
+| `RMI-1650…` | 由固件上报（自动识别） |
 
 两个重要前提：
 
@@ -162,9 +192,11 @@
    `model: null`。电池卡片是从**设备注册表**读型号的，这也是本机标题能默认显示
    `HiBattery 4020 X` 的原因。
 2. **`DeviceInfo` 只在实体首次添加时写入设备注册表**
-   （`entity_platform._async_add_entity`），之后再修改不会同步过去。若要回填型号，
-   需要在 `discovery_override._on_discovery_message` 里从 `payload["device"]["model"]`
-   取出，等 discovery 报文到达后用 `device_registry.async_update_device(model=...)` 写入。
+   （`entity_platform._async_add_entity`），之后再修改不会同步过去。因此
+   `discovery_override` 现在会自动回填：它从固件 discovery 报文里取出
+   `payload["device"]["model"]`，报文到达后用
+   `device_registry.async_update_device(model=...)` 写入。这样 `RMI-1650` 之类的新
+   前缀无需硬编码列表也能显示真实型号。
 
 不同型号**上报的数据量差异也很大**：`MSA-2800` 系列只发布约 3~7 个对象，而
 `MSA-2805` 约 95 个。集成无论如何都会创建固定的实体清单，因此小型号上会有大量

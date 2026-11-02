@@ -44,7 +44,10 @@
  * ========================================================================== */
 
 function _hmGaugeRegister() {
-  const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
+  /* Lit comes from hoymiles-base.js: the Lovelace panel is not defined on the
+   * sidebar panel, so probing it alone would leave the card unregistered. */
+  const LitElement = (window.__hmLit && window.__hmLit())
+    || Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
@@ -447,7 +450,12 @@ function _hmGaugeRegister() {
   }
 }
 
-if (customElements.get("ha-panel-lovelace")) {
+/* Register on any page that has Lit - see hoymiles-base.js.  The old
+ * `ha-panel-lovelace` wait is kept as the fallback for a page that loaded this
+ * file but not the bootstrap. */
+if (window.__hmWhenLit) {
+  window.__hmWhenLit(() => _hmGaugeRegister());
+} else if (customElements.get("ha-panel-lovelace")) {
   _hmGaugeRegister();
 } else {
   customElements.whenDefined("ha-panel-lovelace").then(() => _hmGaugeRegister());

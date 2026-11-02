@@ -45,7 +45,10 @@
         │   ├── icon.png              # HACS 品牌校验必需；本地图标可免去上游 PR
         │   └── logo.png              # 横向锁定版：圆标 + 字标
         ├── manifest.json             # 必需，含 version（HACS 硬性要求）
-        ├── www/                      # 八张 Lovelace 卡片
+        ├── www/                      # 侧栏面板 + 八张 Lovelace 卡片
+        │   ├── hoymiles-boot.js      # ★ 唯一注入前端的模块，静态 import 下面全部
+        │   ├── hoymiles-base.js      # ★ 共享引导：提供 LitElement 与实体解析
+        │   ├── hoymiles-panel.js     # ★ 侧栏面板 <hoymiles-panel>
         │   ├── hoymiles-power-flow.js
         │   ├── hoymiles-battery.js
         │   ├── hoymiles-pack-list.js
@@ -231,6 +234,22 @@ Docker/Core：`docker cp` 或直接 `cp -r`。
 
 > 固件已通过 MQTT Discovery 注册的实体（`switch` / `ems_mode` / `power_ctrl` / `soc` / `bat_power` / `output_power` / `reboot`）
 > 集成**刻意不重复创建**，避免同一数据出现两个实体。
+
+#### 侧栏面板
+
+添加成功后，左侧工作栏会多出一个以 `dev_id` 命名的入口（页面路径 `/hoymiles-<dev_id>`），
+在里面分三个页签：**系统**（功率流图 / 今日电量 / 功率曲线 / 能量桑基图）、
+**设备**（电池堆 / 电池包列表 / 诊断信息）、**控制**（开关机 / EMS 模式 / 功率下发 /
+分相输出 / TOU 计划 / 重启）。它复用的就是那八张卡片，不用自己搭仪表盘。
+
+面板是 `panel_custom` 页面，由 `__init__._async_register_panel()` 在配置项加载时注册、
+在最后一个使用该设备的配置项卸载时移除（`manifest.json` 因此声明了
+`dependencies: [..., "panel_custom"]`）。
+
+> 侧栏标题在注册时固定，所以显示的是原始 `dev_id`；面板内部的文字跟随界面语言。
+>
+> 面板不出现时依次检查：`manifest.json` 是否已加 `panel_custom`、
+> 是否**完整重启**过（不只是 reload config entry）、浏览器是否硬刷新过。
 
 #### 下拉框里的设备是怎么来的
 

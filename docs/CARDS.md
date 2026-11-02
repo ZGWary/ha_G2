@@ -9,14 +9,55 @@ Complete option list for the eight Lovelace cards bundled with the
 
 ## How the cards are loaded
 
-The integration registers all eight cards as frontend modules when it starts, so
-there is **no "add resource" step** and no CDN is used. Add a card with
+The integration registers the cards as frontend modules when it starts, so there
+is **no "add resource" step** and no CDN is used. Add a card with
 **Add card → Manual** and paste YAML, or add it directly to a dashboard YAML file.
 
 After the integration is installed and Home Assistant has restarted, the cards
 appear as `custom:hoymiles-*`.
 
+Only one module is injected: `hoymiles-boot.js`, which imports the bootstrap, the
+panel and the eight cards with static `import` statements. That keeps the
+evaluation order fixed — `add_extra_js_url` stores URLs in a set, so registering
+each file separately made the order arbitrary.
+
 > Changed a card file? Hard-refresh the browser (`Ctrl` + `F5`).
+
+---
+
+## The sidebar panel
+
+Adding the integration also registers a `panel_custom` page per device, so you do
+**not** have to build a dashboard at all. It sits in the sidebar under the raw
+`dev_id`, at `/hoymiles-<dev_id>`.
+
+| Tab | Cards it composes |
+|---|---|
+| **System** | `hoymiles-power-flow`, three `hoymiles-gauge` tiles (PV / charged / discharged today), `hoymiles-history-chart` (PV, battery and grid power, day range), `hoymiles-energy-sankey` |
+| **Device** | `hoymiles-battery`, `hoymiles-pack-list`, plus a diagnostics table (model, firmware, serial, live battery voltage / temperature, grid voltage, RSSI) |
+| **Control** | `hoymiles-control`, `hoymiles-tou-editor` |
+
+Points worth knowing:
+
+- **It is a composition, not a second implementation.** Every widget inside the
+  panel is one of the eight cards below, configured for the device. If you want a
+  different layout, use the cards yourself.
+- **Entity ids are resolved at runtime**, not hard-coded: the conventional
+  `sensor.<slug(dev_id)>_<key>` id first, then a normalized scan, then the
+  integration's `unique_id`. A card whose entity does not exist is simply left
+  out, so a device without a grid meter shows no grid series.
+- **The layout follows the UI language** of the viewing user; the sidebar title
+  does not, because Home Assistant fixes a panel title when it is registered —
+  that is why the title is the plain `dev_id`.
+- **Only the active tab's cards exist.** Switching tabs reuses the card elements,
+  so a chart is not rebuilt and the power-flow animation does not restart.
+- Cards are created imperatively and their config is only re-applied when it
+  actually changes. That matters because the panel re-renders once per second
+  (the 1 s MQTT push) and `setConfig()` resets the card's internal caches.
+
+There is nothing to configure: the panel is registered automatically when the
+config entry is set up and removed when the last entry for that device is
+unloaded.
 
 ## Options shared by every card
 
