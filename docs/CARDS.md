@@ -591,6 +591,15 @@ on subscribes to two wildcards over the Home Assistant websocket (the
 
 - Range hints such as `-1000 ~ 1000 W` prefer the entity's `min` / `max`
   attributes, falling back to protocol defaults.
+- **A device with more than one `number` entity must be pinned with
+  `entities:`.** `power_ctrl` and `output_power` are sibling `number` entities
+  and either can end up as `number.<dev>` or `number.<dev>_2` — *which is which
+  varies per device* (measured: on FF6 `_2` is `power_ctrl`, on FC22 it is the
+  other way round). The frontend is given no `unique_id`, so every heuristic
+  after the explicit `entities:` pin skips entities already claimed by another
+  key; anything still ambiguous is assigned in `power_ctrl` → `output_power` →
+  `phase_output_power` order. If a row shows obviously wrong bounds (e.g.
+  *Power control* showing `100~800`), this pinning is what is missing.
 - The layout follows the iOS settings idiom: rounded groups, small grey section
   headers (**Power & mode / Power settings / Plan & maintenance**), rows of
   icon + name + right-aligned control, and hairlines that stop short of the card
@@ -617,6 +626,11 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   device is really in. The keep-alive trusts what the device *reports* (and
   refuses to send otherwise, since a device in another mode ignores
   `power_ctrl`), and the error text names the mode the device actually reported.
+  Measured on FF6: after commanding `mqtt_ctrl` the device still self-reported
+  `general` in two independent long-window probes, and `power_ctrl` was then
+  ignored outright. When debugging, read
+  `sensor.<dev_id>_ems_mode_device` (the device's own `device/state`), never
+  `select.ems_mode` — the latter is the integration echoing your command back.
 
 ---
 

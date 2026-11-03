@@ -573,6 +573,30 @@ function _hmControlRegister() {
      * integration's own entities use `hoymiles_g2_<dev_id>_<key>`; entity ids are
      * slugified from the *name*, so they are matched normalized.
      */
+    /**
+     * Entity ids the card config pins to some *other* protocol key.
+     *
+     * `power_ctrl` and `output_power` are both plain `number` entities of the
+     * same device, so every heuristic below can hand the same entity to both.
+     * A config that pins `output_power: number.<dev>` therefore made the
+     * `power_ctrl` row read that very entity - showing the output power's
+     * range and step on the power control row, and (worse) letting one row's
+     * declared bounds describe the other's setting. An explicit pin is the
+     * one authoritative signal the frontend actually gets, so an entity
+     * claimed by another key is excluded from every guess here.
+     */
+    _claimedByOther(key) {
+      const overrides = this._config.entities || {};
+      const claimed = new Set();
+      for (const [other, entityId] of Object.entries(overrides)) {
+        if (other !== key && typeof entityId === "string" && entityId) {
+          claimed.add(entityId);
+        }
+      }
+      claimed.delete(overrides[key]);
+      return claimed;
+    }
+
     _resolve(key, domain = "number") {
       const overrides = this._config.entities || {};
       if (overrides[key]) return overrides[key];
@@ -580,9 +604,10 @@ function _hmControlRegister() {
       const hass = this._hass;
       if (!hass || !hass.states) return null;
 
+      const claimed = this._claimedByOther(key);
       const cacheKey = `${domain}:${key}`;
       const cached = this._cache.get(cacheKey);
-      if (cached && hass.states[cached]) return cached;
+      if (cached && hass.states[cached] && !claimed.has(cached)) return cached;
 
       let found = null;
       const wantUid = new Set([
@@ -591,6 +616,7 @@ function _hmControlRegister() {
       ]);
       for (const [entityId, entry] of Object.entries(hass.entities || {})) {
         if (!entry || !entityId.startsWith(`${domain}.`)) continue;
+        if (claimed.has(entityId)) continue;
         if (wantUid.has(entry.unique_id)) { found = entityId; break; }
       }
 
@@ -599,6 +625,7 @@ function _hmControlRegister() {
         const wanted = norm(key);
         for (const entityId of Object.keys(hass.states)) {
           if (!entityId.startsWith(prefix)) continue;
+          if (claimed.has(entityId)) continue;
           const tail = norm(entityId.slice(prefix.length + 1));
           if (tail !== wanted) continue;
           if (!found || entityId.length < found.length) found = entityId;
@@ -613,6 +640,7 @@ function _hmControlRegister() {
       if (!found) {
         const wanted = normKey(key);
         const scoped = this._deviceEntityIds(domain)
+          .filter((entityId) => !claimed.has(entityId))
           .filter((entityId) => normKey(entityId).endsWith(wanted));
         if (scoped.length === 1) found = scoped[0];
         else if (scoped.length > 1) {
@@ -638,6 +666,7 @@ function _hmControlRegister() {
           // The device SN is numeric too, so the duplicate suffix must be short
           // (`_2`), never the SN itself (`number.<dev>_280520260806`).
           const numbered = Object.keys(hass.states).filter((entityId) => {
+            if (claimed.has(entityId)) return false;
             if (entityId === base) return true;
             return new RegExp(`^${base.replace(/\./g, "\\.")}_\\d{1,2}$`).test(entityId);
           });

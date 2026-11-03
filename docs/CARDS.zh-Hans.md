@@ -523,6 +523,13 @@ WebSocket（`mqtt/subscribe` 命令）订阅两个通配主题，把两个方向
 
 - 卡片的范围提示（如 `-1000 ~ 1000 W`）优先读实体的 `min` / `max` 属性，
   读不到时用协议默认值。
+- **同一设备有多个 `number` 实体时，必须用 `entities:` 钉住。** `power_ctrl` 与
+  `output_power` 是两个平级的 `number` 实体，都可能落在 `number.<dev>` 与
+  `number.<dev>_2` 上，而**哪个是哪个随设备而变**（实测 FF6 是 `_2` = `power_ctrl`，
+  FC22 正好相反）。前端拿不到 `unique_id`，所以除了 `entities:` 显式指定的那一个，
+  其余启发式一律跳过已被别的键占用的实体；仍无法区分时按 `power_ctrl` →
+  `output_power` → `phase_output_power` 的顺序分配后缀。若两行显示的范围明显不对
+  （例如「功率控制」显示成 `100~800`），就是这一条没配上。
 - 布局参考 iOS 设置页：小组件包在圆角分组里、组间有灰色小节标题
   （**电源与模式 / 功率设置 / 计划与维护**）、每行是「图标 + 名称 + 右侧控件」，
   分割线**左侧内缩**；开关机与 EMS 模式用**分段控件**，危险操作（重启）用红色。
@@ -540,7 +547,10 @@ WebSocket（`mqtt/subscribe` 命令）订阅两个通配主题，把两个方向
 - **EMS 那一行写着 `mqtt_ctrl`，却提示「需先切到 mqtt_ctrl」**：这是可能的。select 的
   状态主题是 retained 值，固件按自己的慢节奏刷新，可能与设备**实际**所处的模式不一致。
   保活相信设备**上报**的模式（不一致时拒绝下发，因为其他模式下设备根本不理会
-  `power_ctrl`），错误文本里写的也是设备实际报告的模式。
+  `power_ctrl`），错误文本里写的也是设备实际报告的模式。实测 FF6 在切到 `mqtt_ctrl` 后
+  设备仍连续两次自报 `general`，此时下发 `power_ctrl` 设备毫无反应。排查时请只看
+  `sensor.<dev_id>_ems_mode_device`（来自设备自报的 `device/state`），不要看
+  `select.ems_mode`——后者是集成的回显。
 
 ---
 

@@ -120,6 +120,26 @@ ha core restart
 
 除了这个超时，还有一层**物理抖动无法消除**：设备在不停地重扫 MPPT，`system_pv_power` 大约每 20 秒循环一次（约 1.4 W → 700 W → 140 W → 5 W → 1.4 W，实测峰值 698.4 / 499.8 / 407.0 / 340.6 W），`sys_plug_p` 会跟着它起伏（0 → 260 → 140 → 0）。即使定时器正常工作，瞬时读数也仍会随扫描周期摆动；判断是否受控应看**每个峰值对应的平台值**，而不是随手取一个瞬间采样。
 
+### `ems_mode/state` 是集成的回声，不是设备真值
+
+这是「串口日志里看不到 MQTT 控制下发」这一类问题的根源，必须牢记：
+
+- `hoymiles_g2/<dev_id>/ems_mode/state` 由集成自己维护。`_handle_ems_mode_command` 会把**任何**被下发的模式原样回写到该主题（retained, qos 1），**不等待设备确认**。所以 HA 的 `select.ems_mode` 显示 `mqtt_ctrl`，只代表「用户/卡片下发过 `mqtt_ctrl`」。
+- 设备的真值只有一处：`homeassistant/sensor/<dev_id>/device/state` 里的 `ems_mode` 字段（微逆约每 5 分钟一帧）。
+- 实测（FF6, `RMI-4161A0209FF6`, 固件 `01.05.00`）：卡片下发 `ems_mode = mqtt_ctrl` 后，两个独立长窗口探针分别在同一时刻读到设备自报 `ems_mode=general`（16:49:58 与 16:59:59），而集成主题一直显示 `mqtt_ctrl`。
+- **后果**：设备处于 `general` 时会**忽略** `power_ctrl`。此时卡片因为读到 `mqtt_ctrl` 而照常下发 `power_ctrl/set`，设备完全无反应、串口无任何打印——看起来像「下发失败」，其实是模式不对。keep-alive 的错误信息 `EMS mode is general, not mqtt_ctrl` 是同一现象的告警。
+- `_async_sync_ems_mode_state` 会跟随设备的 `device/state`，但被 `EMS_MODE_ECHO_GUARD_SECONDS`（30 秒）压制，以免命令刚发出就被设备旧值弹回。因此短期内 UI 不可信。
+
+排查顺序应该是：先看 `sensor.<dev>_ems_mode_device`（来自 `device/state`）是否等于 `mqtt_ctrl`，再怀疑下行链路。
+
+### `output_power/set` 是否被设备收到，可用 `power_ctrl/config` 反证
+
+`power_ctrl` 无 `state_topic`、无 ack，`output_power` 同样无回执，因此无法直接确认投递。但固件收到 `output_power/set` 后会重写 `power_ctrl` 声明的 `max`（见上文），于是：
+
+> 下发 `output_power` 前后对比 `homeassistant/number/<dev_id>/power_ctrl/config` 里的 `max`。
+
+实测：`max = 350`（等于此前下发过的 `output_power`）→ 下发 `output_power = 777` → retained config 先被清空（DELETED）→ 重新发布 `max = 777`。这证明消息**确实到达并被执行**。用同样的手法可验证任意下行主题的投递。注意此操作会改写设备的 `power_ctrl` 上界，验证完应恢复原值。
+
 ## 能力门控
 
 集成不再靠型号名判断设备形态，而是读取固件在连接时发布的 retained `homeassistant/sensor/<dev_id>/attributes` 里的 `supported_topics`：
