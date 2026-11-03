@@ -683,9 +683,25 @@ function _hmControlRegister() {
       return state ? num(state.state) : null;
     }
 
+    /* Declared attributes survive an unusable state, the value does not.
+     *
+     * `min` / `max` / `step` / `options` are part of the entity's declaration and
+     * are present even while its state reads `unknown` - which is exactly the
+     * situation right after setup, before the device has accepted a command (a
+     * number entity whose firmware publishes no state topic stays `unknown`
+     * indefinitely). Reading them through `_state()` therefore threw the range
+     * away and every consumer fell back to the protocol default, so a HiFlow Pro
+     * whose firmware declares `100 ~ 1000 W` offered `100 ~ 2000 W` - a range the
+     * device rejects. The value lookup keeps the strict filter, because a stale
+     * number is worse than no number.
+     */
     _attr(key, domain, name) {
-      const state = this._state(key, domain);
-      return state && state.attributes ? state.attributes[name] : null;
+      const entityId = this._resolve(key, domain);
+      if (!entityId || !this._hass || !this._hass.states) return null;
+      const state = this._hass.states[entityId];
+      if (!state || !state.attributes) return null;
+      const value = state.attributes[name];
+      return value === undefined ? null : value;
     }
 
     /** True when this device actually has that entity.
