@@ -492,7 +492,8 @@ title: 设备控制
 |---|---|---|
 | 设备开关 | `switch/<dev_id>/set` | `ON` / `OFF` |
 | EMS 模式 | `select/<dev_id>/ems_mode/command` | `general` / `mqtt_ctrl` / `tou_plan`，不支持的选项自动置灰 |
-| 功率控制 | `number/<dev_id>/power_ctrl/set` | 仅 `mqtt_ctrl` 模式有效，需至少每分钟下发一次 |
+| 功率控制 | `number/<dev_id>/power_ctrl/set` | 仅 `mqtt_ctrl` 模式有效；它是**租约**：约 60 秒后设备会自动丢弃并回落到 `output_power`。要用「定时下发」行维持。 |
+| 定时下发 | 重复下发 `number/<dev_id>/power_ctrl/set` | 默认关闭。打开后按周期（5–3600 秒，默认 30 秒）重复下发当前功率控制值，使租约始终有效。关闭开关、卡片卸载、切换设备、或 EMS 模式离开 `mqtt_ctrl` 时自动停止；非 `mqtt_ctrl` 模式下不可操作。 |
 | 输出功率 | `number/<dev_id>/output_power/set` | 满载输出上限（W） |
 | 多相输出功率 | `number/<dev_id>/phase_output_power/set` | 按 `{"phase_a":..,"phase_b":..,"phase_c":..}` 下发 |
 | 获取 TOU 计划 | `sensor/<dev_id>/tou_plan/get` | 应答发布在 `tou_plan/status` |

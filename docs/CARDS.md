@@ -554,7 +554,8 @@ title: 设备控制
 |---|---|---|
 | Device on/off | `switch/<dev_id>/set` | `ON` / `OFF` |
 | EMS mode | `select/<dev_id>/ems_mode/command` | `general` / `mqtt_ctrl` / `tou_plan`; unsupported options are greyed out |
-| Power control | `number/<dev_id>/power_ctrl/set` | Only effective in `mqtt_ctrl` mode; must be sent at least once a minute |
+| Power control | `number/<dev_id>/power_ctrl/set` | Only effective in `mqtt_ctrl` mode, and it is a *lease*: the device drops it after ~60 s and falls back to `output_power`. Use the *Re-send timer* row to hold it. |
+| Re-send timer | re-sends `number/<dev_id>/power_ctrl/set` | Off by default. On, it publishes the current power-control value on a period (5–3600 s, default 30 s) so the lease never lapses. Stops when switched off, when the card is removed, when the device changes, or when the EMS mode leaves `mqtt_ctrl`. Disabled outside `mqtt_ctrl`. |
 | Output power | `number/<dev_id>/output_power/set` | Full-load output ceiling (W) |
 | Per-phase output power | `number/<dev_id>/phase_output_power/set` | Sent as `{"phase_a":..,"phase_b":..,"phase_c":..}` |
 | Fetch TOU plan | `sensor/<dev_id>/tou_plan/get` | The reply is published on `tou_plan/status` |

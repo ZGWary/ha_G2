@@ -77,10 +77,18 @@ def main() -> None:
 
     if suffix:
         topic = f"homeassistant/number/{sn}/{suffix}/set"
-        print(f"\n>>> publishing {payload!r} -> {topic}\n", flush=True)
-        rows.append((time.time(), f"PUBLISH {topic}", payload, False))
-        cli.publish(topic, payload, qos=1)
-        time.sleep(seconds)
+        # An optional 5th argument turns this into a repeat test: the same value
+        # is re-published every N seconds, which is how the card's timer works.
+        every = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+        print(f"\n>>> publishing {payload!r} -> {topic}"
+              + (f" every {every}s" if every else "") + "\n", flush=True)
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            rows.append((time.time(), f"PUBLISH {topic}", payload, False))
+            print(f"[{time.strftime('%H:%M:%S')}] --- publish {payload!r}", flush=True)
+            cli.publish(topic, payload, qos=1)
+            nap = every if every else seconds
+            time.sleep(min(nap, max(0, deadline - time.time())))
     else:
         time.sleep(seconds)
 

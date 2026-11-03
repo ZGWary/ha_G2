@@ -120,6 +120,19 @@ function _hmControlRegister() {
 
   const PING_MS = 8000; // how long the "sent" confirmation stays visible
 
+  /* Power control is a *lease*, not a setting: the firmware remembers the last
+   * `power_ctrl` for about a minute and then falls back to `output_power`. A
+   * single send therefore produces a burst that matches the requested wattage
+   * and then silently jumps back to the output-power ceiling, which reads as
+   * "the value jitters and the device ignores me". Re-publishing on a period is
+   * the only way to hold it, so the card offers a timer for exactly that. The
+   * default is well inside the lease; anything above a minute is pointless.
+   */
+  const TIMER_MIN_S = 5;
+  const TIMER_MAX_S = 3600;
+  const TIMER_DEFAULT_S = 30;
+  const TIMER_LEASE_S = 60; // the firmware's own hold time, for the hint text
+
   /* ------------------------------------------------------------------ *
    * MQTT log
    *
@@ -185,6 +198,10 @@ function _hmControlRegister() {
         _toastError: { type: Boolean },
         _optimistic: { type: Object },
         _logOpen: { type: Boolean },
+        _timerOn: { type: Boolean },
+        _timerPeriod: { type: String },
+        _timerCount: { type: Number },
+        _timerLastAt: { type: Number },
       };
     }
 
@@ -216,6 +233,16 @@ function _hmControlRegister() {
       this._logList = null;
       this._logUnsubs = [];
       this._logGen = 0;
+      /* Periodic re-send of the power-control lease (see TIMER_LEASE_S). The
+         timer deliberately lives on the element only: it starts sending the
+         moment the switch is turned on and stops when the card goes away, so a
+         dashboard left open keeps the value in force and nothing is published
+         behind the user's back once it is closed. */
+      this._timerOn = false;
+      this._timerPeriod = String(TIMER_DEFAULT_S);
+      this._timerCount = 0;
+      this._timerLastAt = 0;
+      this._timerHandle = null;
     }
 
     static getConfigElement() {
@@ -314,6 +341,9 @@ function _hmControlRegister() {
                                animation: hm-pulse 1.3s ease-in-out infinite; }
         .item .nm small.done { color: var(--success-color, #0da035);
                                font-weight: 500; }
+        /* The re-send timer runs indefinitely, so it gets a steady tint -
+           "busy" above pulses and would blink for as long as the switch is on. */
+        .item .nm small.ticking { color: var(--primary-color); font-weight: 500; }
         @keyframes hm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 
         /* plain pill button */
@@ -449,6 +479,15 @@ function _hmControlRegister() {
          go of the old ones. Closing it is friendlier than silently subscribing
          to the new device: the user asked for that view. */
       if (changed && this._logOpen) this._closeLog();
+      /* The timer publishes `this._powerCtrl` on a period; pointing the card at
+         another device without stopping it would send this device's wattage to
+         the new one. Stop first, let the user arm it again on purpose. */
+      if (changed) {
+        this._timerOn = false;
+        this._timerDisarm();
+        this._timerCount = 0;
+        this._timerLastAt = 0;
+      }
     }
 
     set hass(hass) {
@@ -468,6 +507,9 @@ function _hmControlRegister() {
          log still switched on must resume the stream. The guard also keeps a
          re-connect from subscribing twice. */
       if (this._logOpen && !this._logUnsubs.length) this._subscribeLog();
+      // Re-attaching to the same element (a view switch that does not destroy
+      // the card) must resume the re-send, or the lease would lapse silently.
+      if (this._timerOn) this._timerArm();
     }
 
     disconnectedCallback() {
@@ -475,6 +517,7 @@ function _hmControlRegister() {
       if (this._toastTimer) clearTimeout(this._toastTimer);
       if (this._pendingTimer) clearTimeout(this._pendingTimer);
       this._unsubscribeLog();
+      this._timerDisarm();
     }
 
     updated() {
@@ -654,8 +697,14 @@ function _hmControlRegister() {
 
     /* ------------------------------ sending ------------------------------ */
 
-    async _publish(topic, payload, label) {
+    async _publish(topic, payload, label, opts) {
       if (!this._hass || typeof this._hass.callService !== "function") return;
+      /* `quiet` suppresses the success toast only. The timer repeats the same
+         command every few seconds, and a toast each time would cover the card
+         permanently - its progress lives on the row's own sub-line instead. A
+         failure is still reported, because that is exactly what must not pass
+         unnoticed. */
+      const quiet = Boolean(opts && opts.quiet);
       try {
         await this._hass.callService("mqtt", "publish", {
           topic,
@@ -663,7 +712,7 @@ function _hmControlRegister() {
           qos: 1,
           retain: false,
         });
-        this._showToast(`${this._t("Sent", "已下发")} ${label} → ${topic}`);
+        if (!quiet) this._showToast(`${this._t("Sent", "已下发")} ${label} → ${topic}`);
       } catch (err) {
         this._showToast(`${this._t("Failed", "下发失败")}: ${topic} (${err.message || err})`, true);
       }
@@ -795,6 +844,11 @@ function _hmControlRegister() {
 
     _setEmsMode(mode) {
       this._optimistic.ems_mode = mode;
+      /* Leaving mqtt_ctrl makes the lease meaningless: the firmware ignores
+         `power_ctrl` in every other mode, so re-sending it would only add
+         broker traffic. The switch reflects that instead of staying on while
+         doing nothing. */
+      if (mode !== "mqtt_ctrl" && this._timerOn) this._setTimer(false);
       this._publish(this._topic("select/<dev_id>/ems_mode/command"), mode,
         `${this._t("EMS mode", "EMS 模式")} → ${mode}`);
     }
@@ -810,11 +864,107 @@ function _hmControlRegister() {
       return EMS_MODES.map((m) => m.id);
     }
 
-    _sendPowerCtrl() {
+    _sendPowerCtrl(opts) {
       const value = Number(this._powerCtrl);
       if (!Number.isFinite(value)) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
       this._publish(this._topic("number/<dev_id>/power_ctrl/set"), String(value),
-        `${this._t("Power control", "功率控制")} ${value} W`);
+        `${this._t("Power control", "功率控制")} ${value} W`, opts);
+    }
+
+    /* ---------------------------- re-send timer ---------------------------- */
+
+    /**
+     * The period actually used, clamped into the supported window. A blank or
+     * unparsable field falls back to the default rather than stopping the beat:
+     * letting the lease lapse because someone cleared the input mid-edit would
+     * be the worst possible outcome.
+     */
+    _timerPeriodValue() {
+      return this._clampPeriod(this._timerPeriod);
+    }
+
+    /** `num()` maps anything unparsable to 0, so a blank field has to be caught
+     * before the clamp or clearing the input would mean "every 5 s". */
+    _clampPeriod(raw) {
+      if (String(raw == null ? "" : raw).trim() === "") return TIMER_DEFAULT_S;
+      const n = Math.round(Number(raw));
+      if (!Number.isFinite(n) || n <= 0) return TIMER_DEFAULT_S;
+      return Math.min(Math.max(n, TIMER_MIN_S), TIMER_MAX_S);
+    }
+
+    _timerClock(ts) {
+      if (!ts) return "";
+      const d = new Date(ts);
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+
+    _setTimer(on) {
+      const want = on === true;
+      if (want === (this._timerOn === true)) return;
+      /* `power_ctrl` is only honoured in mqtt_ctrl mode, so arming the timer in
+         any other mode would publish into the void. The row disables its
+         buttons there; this guard covers the programmatic paths too. */
+      if (want && this._emsMode() !== "mqtt_ctrl") return;
+      this._timerOn = want;
+      if (want) {
+        this._timerCount = 0;
+        /* Send straight away instead of waiting out one period: the user just
+           pressed the switch and needs to see the device react now. */
+        this._timerFire();
+      } else {
+        this._timerDisarm();
+        this.requestUpdate();
+      }
+    }
+
+    /** Schedule the next tick. Called after every send, so the beat is measured
+     * from the last one and a slow publish can never stack up intervals. */
+    _timerArm() {
+      this._timerDisarm();
+      if (!this._timerOn) return;
+      this._timerHandle = setTimeout(() => {
+        this._timerHandle = null;
+        this._timerFire();
+      }, this._timerPeriodValue() * 1000);
+    }
+
+    _timerDisarm() {
+      if (this._timerHandle) {
+        clearTimeout(this._timerHandle);
+        this._timerHandle = null;
+      }
+    }
+
+    _timerFire() {
+      if (!this._timerOn) return;
+      // Another mode makes `power_ctrl` a no-op, so the timer switches itself
+      // off instead of publishing into the void. Same condition as the row's
+      // `ready`, so switch and behaviour can never disagree.
+      if (this._emsMode() !== "mqtt_ctrl") { this._setTimer(false); return; }
+      const value = Number(this._powerCtrl);
+      if (!Number.isFinite(value)) {
+        this._setTimer(false);
+        this._showToast(this._t(
+          "Power control is not a number - timer stopped",
+          "功率控制数值无效，已停止定时下发",
+        ), true);
+        return;
+      }
+      this._timerCount += 1;
+      this._timerLastAt = this._now();
+      // Quiet: a toast every period would cover the card for ever. Progress is
+      // shown on the row's own sub-line instead.
+      this._sendPowerCtrl({ quiet: true });
+      this._timerArm();
+      this.requestUpdate();
+    }
+
+    _setTimerPeriod(raw) {
+      this._timerPeriod = String(this._clampPeriod(raw));
+      // A new period takes effect on the next beat, not by sending right now.
+      if (this._timerOn) this._timerArm();
+      this.requestUpdate();
     }
 
     _sendOutputPower() {
@@ -1190,6 +1340,7 @@ function _hmControlRegister() {
           ])}
           ${this._group(this._t("Power settings", "功率设置"), [
             showPowerCtrl ? this._powerCtrlItem() : "",
+            showPowerCtrl ? this._timerItem() : "",
             this._outputItem(),
             showPhase ? this._phaseItem() : "",
           ])}
@@ -1462,6 +1613,56 @@ function _hmControlRegister() {
           onInput: (v) => { this._powerCtrl = v; },
           onSend: () => this._sendPowerCtrl(),
         }),
+      });
+    }
+
+    /**
+     * The re-send timer, directly under the slider it applies to.
+     *
+     * `power_ctrl` is a lease that the firmware drops after about a minute (it
+     * falls back to `output_power`), which is why a single send looks like the
+     * device "ignores" the value after a short while. Re-publishing on a period
+     * holds it; this row is the switch for that. The period defaults well
+     * inside the lease, and the running state is spelled out - count and last
+     * send time - because a command that is sent quietly every 30 s is
+     * otherwise invisible.
+     */
+    _timerItem() {
+      const ready = this._emsMode() === "mqtt_ctrl";
+      const on = this._timerOn === true && ready;
+      const period = this._timerPeriodValue();
+      const sub = !ready
+        ? this._t("switch EMS to mqtt_ctrl first", "需先切到 mqtt_ctrl")
+        : on
+          ? this._t(
+            `Re-sending every ${period} s · ${this._timerCount} sent`
+              + (this._timerLastAt ? ` · last ${this._timerClock(this._timerLastAt)}` : ""),
+            `每 ${period} 秒下发一次 · 已下发 ${this._timerCount} 次`
+              + (this._timerLastAt ? ` · 上次 ${this._timerClock(this._timerLastAt)}` : ""),
+          )
+          : this._t(
+            `Off. The device drops power control after ~${TIMER_LEASE_S} s - `
+              + "turn this on to hold the value.",
+            `已关闭。设备约 ${TIMER_LEASE_S} 秒后自动失效——打开后持续维持该功率。`,
+          );
+      return this._item({
+        icon: "⏱",
+        name: this._t("Re-send timer", "定时下发"),
+        sub,
+        subClass: on ? "ticking" : "",
+        ctrl: html`
+          ${this._segment(
+            [
+              { id: "on", label: this._t("On", "开启"), enabled: ready },
+              { id: "off", label: this._t("Off", "关闭"), enabled: ready },
+            ],
+            on ? "on" : "off",
+            (id) => this._setTimer(id === "on"),
+          )}
+          <input type="number" class="narrow" min=${TIMER_MIN_S} max=${TIMER_MAX_S}
+            step="1" .value=${String(period)} ?disabled=${!ready}
+            @change=${(e) => this._setTimerPeriod(e.target.value)} />
+          <span class="state">${this._t("s", "秒")}</span>`,
       });
     }
 
