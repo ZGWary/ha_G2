@@ -138,6 +138,22 @@
         "phase_b": { "name": "B 相限值", "description": "B 相输出功率限值 (W, 100..2500)" },
         "phase_c": { "name": "C 相限值", "description": "C 相输出功率限值 (W, 100..2500)" }
       }
+    },
+    "start_power_ctrl_keepalive": {
+      "name": "开启功率控制保活",
+      "description": "按周期重复下发同一个 power_ctrl 数值。设备把该值当作租约，约 60 秒后自动退回输出功率，只发一次无法维持。保活运行在 Home Assistant 内，不开仪表盘也持续生效。需先切到 mqtt_ctrl，离开该模式或集成卸载时会自动停止。",
+      "fields": {
+        "dev_id": { "name": "设备标识", "description": "设备标识 (client_prefix-SN)" },
+        "power": { "name": "功率", "description": "需要维持的功率限值 (W)" },
+        "period": { "name": "周期", "description": "两次下发的间隔秒数 (5..3600，默认 30)" }
+      }
+    },
+    "stop_power_ctrl_keepalive": {
+      "name": "关闭功率控制保活",
+      "description": "停止为该设备重复下发 power_ctrl。",
+      "fields": {
+        "dev_id": { "name": "设备标识", "description": "设备标识 (client_prefix-SN)" }
+      }
     }
   }
 }

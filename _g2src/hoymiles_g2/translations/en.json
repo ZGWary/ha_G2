@@ -138,6 +138,22 @@
         "phase_b": { "name": "Phase B limit", "description": "Output power limit in watt (100..2500)." },
         "phase_c": { "name": "Phase C limit", "description": "Output power limit in watt (100..2500)." }
       }
+    },
+    "start_power_ctrl_keepalive": {
+      "name": "Start power control keep-alive",
+      "description": "Re-publish one power_ctrl value on a period. The firmware treats it as a lease and falls back after about 60 seconds. Runs inside Home Assistant, so it keeps working with no dashboard open. Requires mqtt_ctrl mode.",
+      "fields": {
+        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
+        "power": { "name": "Power", "description": "Power limit in watt to hold." },
+        "period": { "name": "Period", "description": "Seconds between two sends (5..3600, default 30)." }
+      }
+    },
+    "stop_power_ctrl_keepalive": {
+      "name": "Stop power control keep-alive",
+      "description": "Stop re-publishing power_ctrl for a device.",
+      "fields": {
+        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." }
+      }
     }
   }
 }

@@ -24,6 +24,9 @@ from .const import (
     PHASE_C,
     PHASE_POWER_MAX,
     PHASE_POWER_MIN,
+    POWER_CTRL_KEEPALIVE_DEFAULT_S,
+    POWER_CTRL_KEEPALIVE_MAX_S,
+    POWER_CTRL_KEEPALIVE_MIN_S,
     T_EMS_MODE_CMD,
     T_PHASE_OUTPUT_POWER_SET,
     T_REBOOT,
@@ -50,6 +53,8 @@ SERVICE_GET_TOU_PLAN = "get_tou_plan"
 SERVICE_SET_EMS_MODE = "set_ems_mode"
 SERVICE_SET_PHASE_OUTPUT_POWER = "set_phase_output_power"
 SERVICE_REBOOT = "reboot"
+SERVICE_START_POWER_CTRL_KEEPALIVE = "start_power_ctrl_keepalive"
+SERVICE_STOP_POWER_CTRL_KEEPALIVE = "stop_power_ctrl_keepalive"
 
 DAY_PLAN_ITEM = vol.Schema(
     {
@@ -122,6 +127,23 @@ SCHEMA_SET_EMS_MODE = vol.Schema(
 
 SCHEMA_REBOOT = vol.Schema({**DEVICE_FIELDS})
 
+SCHEMA_START_POWER_CTRL_KEEPALIVE = vol.Schema(
+    {
+        **DEVICE_FIELDS,
+        vol.Required("power"): vol.Coerce(float),
+        vol.Optional(
+            "period", default=POWER_CTRL_KEEPALIVE_DEFAULT_S
+        ): vol.All(
+            vol.Coerce(int),
+            vol.Range(
+                min=POWER_CTRL_KEEPALIVE_MIN_S, max=POWER_CTRL_KEEPALIVE_MAX_S
+            ),
+        ),
+    }
+)
+
+SCHEMA_STOP_POWER_CTRL_KEEPALIVE = vol.Schema({**DEVICE_FIELDS})
+
 _PHASE_POWER = vol.All(
     vol.Coerce(int), vol.Range(min=PHASE_POWER_MIN, max=PHASE_POWER_MAX)
 )
@@ -143,6 +165,14 @@ def _find_coordinator(hass: HomeAssistant, dev_id: str) -> Any | None:
     for entry_data in hass.data.get(DOMAIN, {}).values():
         if isinstance(entry_data, dict) and entry_data.get("dev_id") == dev_id:
             return entry_data.get("coordinator")
+    return None
+
+
+def _find_entry_data(hass: HomeAssistant, dev_id: str) -> dict[str, Any] | None:
+    """Return the ``hass.data`` record of a loaded device."""
+    for entry_data in hass.data.get(DOMAIN, {}).values():
+        if isinstance(entry_data, dict) and entry_data.get("dev_id") == dev_id:
+            return entry_data
     return None
 
 
@@ -249,6 +279,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             hass, mqtt_util.topic(T_REBOOT, dev_id), "RESTART"
         )
 
+    async def _handle_start_power_ctrl_keepalive(call: ServiceCall) -> None:
+        dev_id = _resolve_dev_id(hass, dict(call.data))
+        entry_data = _find_entry_data(hass, dev_id)
+        if entry_data is None:
+            raise vol.Invalid(f"Device {dev_id} is not loaded")
+
+        keepalive = entry_data.get("keepalive")
+        if keepalive is None:
+            raise vol.Invalid(f"Device {dev_id} has no power control keep-alive")
+
+        await keepalive.async_start(call.data["power"], call.data.get("period"))
+
+    async def _handle_stop_power_ctrl_keepalive(call: ServiceCall) -> None:
+        dev_id = _resolve_dev_id(hass, dict(call.data))
+        entry_data = _find_entry_data(hass, dev_id)
+        if entry_data is None:
+            raise vol.Invalid(f"Device {dev_id} is not loaded")
+
+        keepalive = entry_data.get("keepalive")
+        if keepalive is None:
+            raise vol.Invalid(f"Device {dev_id} has no power control keep-alive")
+
+        await keepalive.async_stop()
+
     hass.services.async_register(
         DOMAIN, SERVICE_SET_TOU_DAY_PLAN, _handle_set_tou_day_plan, SCHEMA_SET_TOU_DAY_PLAN
     )
@@ -268,3 +322,15 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         SCHEMA_SET_PHASE_OUTPUT_POWER,
     )
     hass.services.async_register(DOMAIN, SERVICE_REBOOT, _handle_reboot, SCHEMA_REBOOT)
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_START_POWER_CTRL_KEEPALIVE,
+        _handle_start_power_ctrl_keepalive,
+        SCHEMA_START_POWER_CTRL_KEEPALIVE,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_STOP_POWER_CTRL_KEEPALIVE,
+        _handle_stop_power_ctrl_keepalive,
+        SCHEMA_STOP_POWER_CTRL_KEEPALIVE,
+    )

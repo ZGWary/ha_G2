@@ -493,7 +493,7 @@ title: 设备控制
 | 设备开关 | `switch/<dev_id>/set` | `ON` / `OFF` |
 | EMS 模式 | `select/<dev_id>/ems_mode/command` | `general` / `mqtt_ctrl` / `tou_plan`，不支持的选项自动置灰 |
 | 功率控制 | `number/<dev_id>/power_ctrl/set` | 仅 `mqtt_ctrl` 模式有效；它是**租约**：约 60 秒后设备会自动丢弃并回落到 `output_power`。要用「定时下发」行维持。 |
-| 定时下发 | 重复下发 `number/<dev_id>/power_ctrl/set` | 默认关闭。打开后按周期（5–3600 秒，默认 30 秒）重复下发当前功率控制值，使租约始终有效。关闭开关、卡片卸载、切换设备、或 EMS 模式离开 `mqtt_ctrl` 时自动停止；非 `mqtt_ctrl` 模式下不可操作。 |
+| 定时下发 | 由集成每 N 秒重复下发 `number/<dev_id>/power_ctrl/set` | 默认关闭。打开后按周期（5–3600 秒，默认 30 秒）重复下发当前功率控制值，使租约始终有效。**下发在 Home Assistant 里执行，不在浏览器里**——切到别的页面、刷新、关闭标签页甚至关掉浏览器都不影响。卡片只是这个后台保活的遥控器，状态从 `sensor.<dev_id>_power_control_keep_alive` 实体读回。关闭开关、或 EMS 模式离开 `mqtt_ctrl` 时自动停止；连续 5 次下发失败也会自动停止并记录错误。非 `mqtt_ctrl` 模式下不可操作。 |
 | 输出功率 | `number/<dev_id>/output_power/set` | 满载输出上限（W） |
 | 多相输出功率 | `number/<dev_id>/phase_output_power/set` | 按 `{"phase_a":..,"phase_b":..,"phase_c":..}` 下发 |
 | 获取 TOU 计划 | `sensor/<dev_id>/tou_plan/get` | 应答发布在 `tou_plan/status` |
@@ -532,6 +532,15 @@ WebSocket（`mqtt/subscribe` 命令）订阅两个通配主题，把两个方向
   `show_topics: true` 打开。
 - **MQTT 日志**：见上一节。它默认关闭，开关就在「计划与维护」那一行；`show_log: false`
   可以把整行去掉。
+- **「定时下发」不是浏览器定时器。** 早期版本在卡片里挂了一个 `setTimeout`，只要离开面板
+  就失效：元素被移出 DOM，定时器随之消亡，设备一分钟后回落到 `output_power`，而界面上
+  没有任何提示。现在这个心跳放在集成里（`keepalive.py`），关掉面板也会继续跑，卡片只负责
+  遥控和回显。两个后果值得知道：两个浏览器不会互相打架（每台设备只有一个心跳），
+  刷新后这一行也是诚实的（它读实体的属性，而不是本地标志位）。
+- **EMS 那一行写着 `mqtt_ctrl`，却提示「需先切到 mqtt_ctrl」**：这是可能的。select 的
+  状态主题是 retained 值，固件按自己的慢节奏刷新，可能与设备**实际**所处的模式不一致。
+  保活相信设备**上报**的模式（不一致时拒绝下发，因为其他模式下设备根本不理会
+  `power_ctrl`），错误文本里写的也是设备实际报告的模式。
 
 ---
 

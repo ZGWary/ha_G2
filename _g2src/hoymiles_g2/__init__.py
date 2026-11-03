@@ -19,6 +19,7 @@ from .const import (
 )
 from .coordinator import HoymilesCoordinator
 from .discovery_override import FirmwareDiscoveryPatcher
+from .keepalive import PowerCtrlKeepAlive
 from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,14 +47,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     await patcher.async_setup()
 
+    # Re-publishes `power_ctrl` so the firmware's ~60 s lease stays in force.
+    # It lives here rather than in the card, because a browser timer stops the
+    # moment the dashboard is closed - exactly when the lease still needs
+    # holding.  Not started on its own: only a service call / the card arms it.
+    # Its state is pushed through the coordinator so the keep-alive sensor can
+    # mirror it, which is how the card knows the truth after a page reload.
+    keepalive = PowerCtrlKeepAlive(
+        hass,
+        dev_id,
+        coordinator,
+        on_change=coordinator.set_keepalive_state,
+    )
+
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         "coordinator": coordinator,
         "patcher": patcher,
         "dev_id": dev_id,
+        "keepalive": keepalive,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Seed the idle state now that the entities exist, so the card can tell
+    # "never started" from "running" on the very first render.
+    await keepalive.async_publish_initial_state()
 
     await _async_register_frontend(hass)
     await async_setup_services(hass)
@@ -66,6 +84,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded:
         entry_data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
         if entry_data:
+            keepalive = entry_data.get("keepalive")
+            if keepalive is not None:
+                # Stop before the coordinator goes away: the final state
+                # publish still needs the MQTT connection to be alive.
+                await keepalive.async_shutdown()
             entry_data["patcher"].async_shutdown()
             await entry_data["coordinator"].async_shutdown()
     return unloaded

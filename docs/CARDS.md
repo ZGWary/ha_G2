@@ -555,7 +555,7 @@ title: 设备控制
 | Device on/off | `switch/<dev_id>/set` | `ON` / `OFF` |
 | EMS mode | `select/<dev_id>/ems_mode/command` | `general` / `mqtt_ctrl` / `tou_plan`; unsupported options are greyed out |
 | Power control | `number/<dev_id>/power_ctrl/set` | Only effective in `mqtt_ctrl` mode, and it is a *lease*: the device drops it after ~60 s and falls back to `output_power`. Use the *Re-send timer* row to hold it. |
-| Re-send timer | re-sends `number/<dev_id>/power_ctrl/set` | Off by default. On, it publishes the current power-control value on a period (5–3600 s, default 30 s) so the lease never lapses. Stops when switched off, when the card is removed, when the device changes, or when the EMS mode leaves `mqtt_ctrl`. Disabled outside `mqtt_ctrl`. |
+| Re-send timer | the integration re-sends `number/<dev_id>/power_ctrl/set` every N s | Off by default. On, it publishes the current power-control value on a period (5–3600 s, default 30 s) so the lease never lapses. **The beat runs inside Home Assistant, not in the browser** - navigating away, reloading, closing the tab, or closing the browser entirely does not stop it. The card is only a remote control for that background beat and reads its state back from `sensor.<dev_id>_power_control_keep_alive`. Stops when switched off or when the EMS mode leaves `mqtt_ctrl`; it also stops itself after 5 consecutive publish errors and records the reason. Disabled outside `mqtt_ctrl`. |
 | Output power | `number/<dev_id>/output_power/set` | Full-load output ceiling (W) |
 | Per-phase output power | `number/<dev_id>/phase_output_power/set` | Sent as `{"phase_a":..,"phase_b":..,"phase_c":..}` |
 | Fetch TOU plan | `sensor/<dev_id>/tou_plan/get` | The reply is published on `tou_plan/status` |
@@ -602,6 +602,21 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   crowds out the content; enable `show_topics: true` when debugging.
 - The **MQTT log** (see above) is a per-card switch, not a global one: it is off
   until you turn it on, and `show_log: false` removes the row entirely.
+- **The re-send timer is not a browser timer.** An earlier version armed a
+  `setTimeout` inside the card, which worked until you left the dashboard: the
+  element was removed from the DOM, the timer died with it, and the device
+  reverted to `output_power` a minute later with nothing on screen explaining
+  why. The beat now lives in the integration (`keepalive.py`), so it keeps
+  running with no dashboard open, and the card only mirrors it. Two consequences
+  worth knowing: two browsers cannot fight over it (there is one beat per
+  device), and the row is honest right after a reload because it reads the
+  entity's attributes rather than a local flag.
+- **"Switch EMS to mqtt_ctrl first" can appear while the EMS row still reads
+  `mqtt_ctrl`.** The select's state topic is a retained value that the firmware
+  only refreshes on its own slow schedule, so it can lag behind the mode the
+  device is really in. The keep-alive trusts what the device *reports* (and
+  refuses to send otherwise, since a device in another mode ignores
+  `power_ctrl`), and the error text names the mode the device actually reported.
 
 ---
 

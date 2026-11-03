@@ -44,6 +44,7 @@ from .const import (
     DOMAIN,
     MANUFACTURER,
     SRC_DEVICE,
+    SRC_KEEPALIVE,
     SRC_QUICK,
     SRC_SYSTEM,
     SRC_TOU_DAY_ACK,
@@ -301,6 +302,23 @@ def _tou_status_value(data: dict[str, Any]) -> str | None:
     return f"{code} - {text}"
 
 
+def _keepalive_value(data: dict[str, Any]) -> str:
+    """Return the keep-alive's running state as a readable string."""
+    payload = _payload(data, SRC_KEEPALIVE)
+    if not payload:
+        return "off"
+    if payload.get("enabled") is True:
+        return "on"
+    if payload.get("error"):
+        return "error"
+    return "off"
+
+
+def _keepalive_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    """Expose the full keep-alive payload, which is what the card reads."""
+    return _payload(data, SRC_KEEPALIVE)
+
+
 def _tou_attrs(source: str) -> Callable[[dict], dict[str, Any]]:
     def _fn(data: dict[str, Any]) -> dict[str, Any]:
         payload = _payload(data, source)
@@ -340,6 +358,11 @@ class HoymilesSensorDescription(SensorEntityDescription):
     # that has no ``system/state``.  Expressed as an absence so it keeps working
     # if a future storage model ever starts sending them.
     requires_absent: str | None = None
+    # Skip the device watchdog for entities whose value comes from the
+    # integration rather than from the device.  An offline device must not make
+    # the keep-alive state unreadable, because the card uses it to decide whether
+    # the lease is being held - exactly when that matters most.
+    ignores_device_availability: bool = False
 
 
 _POWER = {
@@ -704,6 +727,17 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
         attrs_fn=_tou_attrs(SRC_TOU_WEEK_ACK),
         requires=CAP_TOU,
     ),
+    # Integration-owned, not a device topic: whether the power-control lease is
+    # being held, and how often. The control card reads it back so a dashboard
+    # reload shows the truth instead of guessing from a local timer.
+    HoymilesSensorDescription(
+        key="power_ctrl_keepalive",
+        name="Power Control Keep-alive",
+        icon="mdi:timer-sync-outline",
+        value_fn=_keepalive_value,
+        attrs_fn=_keepalive_attrs,
+        ignores_device_availability=True,
+    ),
 )
 
 
@@ -755,6 +789,8 @@ class HoymilesSensor(CoordinatorEntity[HoymilesCoordinator], SensorEntity):
     @property
     def available(self) -> bool:
         """Return True while the device is still pushing data."""
+        if self.entity_description.ignores_device_availability:
+            return True
         return self.coordinator.available
 
     @property

@@ -187,3 +187,69 @@ set_phase_output_power:
           max: 2500
           step: 1
           mode: box
+
+start_power_ctrl_keepalive:
+  name: Start power control keep-alive
+  description: >-
+    Re-publish one power_ctrl value on a fixed period. The firmware treats
+    power_ctrl as a lease and falls back to output_power after about 60 seconds,
+    so a single send never holds a limit. Runs inside Home Assistant, so it
+    keeps working while no dashboard is open. Requires EMS mode mqtt_ctrl; it
+    stops itself when the device leaves that mode or is unloaded.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles_g2
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "RMI-1650A028FC22"
+      selector:
+        text:
+    power:
+      name: Power
+      description: Power limit in watt to hold.
+      required: true
+      example: 200
+      selector:
+        number:
+          min: -1000
+          max: 3000
+          step: 1
+          mode: box
+    period:
+      name: Period
+      description: Seconds between two sends. Keep it below the 60 s lease.
+      required: false
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 3600
+          step: 1
+          unit_of_measurement: s
+          mode: box
+
+stop_power_ctrl_keepalive:
+  name: Stop power control keep-alive
+  description: Stop re-publishing power_ctrl for a device.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles_g2
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "RMI-1650A028FC22"
+      selector:
+        text:

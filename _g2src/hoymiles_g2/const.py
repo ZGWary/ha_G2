@@ -101,6 +101,19 @@ PAYLOAD_NOT_AVAILABLE: Final = "offline"
 # freshly issued command would take up to 5 minutes to show up.
 T_EMS_MODE_STATE: Final = "hoymiles_g2/{dev_id}/ems_mode/state"
 
+# Running state of the power-control keep-alive (see keepalive.py), retained so
+# a dashboard reload reads the truth instead of guessing from a local timer.
+T_POWER_CTRL_KEEPALIVE: Final = "hoymiles_g2/{dev_id}/power_ctrl/keepalive"
+
+# Period bounds for the keep-alive.  ``power_ctrl`` is a lease the firmware drops
+# after roughly 60 s, so the floor is short enough to stay well inside it and the
+# ceiling is only a guard against a typo; the default sits comfortably between.
+POWER_CTRL_KEEPALIVE_MIN_S: Final = 5
+POWER_CTRL_KEEPALIVE_MAX_S: Final = 3600
+POWER_CTRL_KEEPALIVE_DEFAULT_S: Final = 30
+# The firmware's own hold time, used for user facing hints only.
+POWER_CTRL_LEASE_SECONDS: Final = 60
+
 # ---------------------------------------------------------------------------
 # Multi phase output power (protocol §8 command, §15 payload)
 # ---------------------------------------------------------------------------
@@ -143,6 +156,9 @@ SRC_TOU_STATUS: Final = "tou_status"
 SRC_TOU_DAY_ACK: Final = "tou_day_ack"
 SRC_TOU_WEEK_ACK: Final = "tou_week_ack"
 SRC_ALARM: Final = "alarm"
+# Integration-owned, not a device topic: the running state of the power-control
+# keep-alive, so an entity can expose it to dashboards and automations.
+SRC_KEEPALIVE: Final = "keepalive"
 
 # ---------------------------------------------------------------------------
 # Device capabilities

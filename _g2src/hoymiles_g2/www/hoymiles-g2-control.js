@@ -125,8 +125,13 @@ function _hmControlRegister() {
    * single send therefore produces a burst that matches the requested wattage
    * and then silently jumps back to the output-power ceiling, which reads as
    * "the value jitters and the device ignores me". Re-publishing on a period is
-   * the only way to hold it, so the card offers a timer for exactly that. The
-   * default is well inside the lease; anything above a minute is pointless.
+   * the only way to hold it.
+   *
+   * That beat runs in the integration (`keepalive.py`), not here: a browser
+   * timer dies the moment the dashboard is closed, which is exactly when the
+   * lease still needs holding. This card only starts and stops the service and
+   * reads its retained state back, so a reload shows the truth and leaving the
+   * page changes nothing.
    */
   const TIMER_MIN_S = 5;
   const TIMER_MAX_S = 3600;
@@ -169,6 +174,14 @@ function _hmControlRegister() {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  /* Protocol keys and the names Home Assistant derives entity ids from do not
+   * always agree on abbreviations: the protocol says `power_ctrl`, the entity is
+   * called "Power Control Keep-alive". Folding `ctrl` into `control` before
+   * comparing lets both spellings match without an alias table. */
+  function normKey(name) {
+    return norm(name).replace(/ctrl/g, "control");
+  }
+
   function num(value) {
     if (typeof value === "number") return Number.isFinite(value) ? value : 0;
     const parsed = Number(value);
@@ -202,6 +215,12 @@ function _hmControlRegister() {
         _timerPeriod: { type: String },
         _timerCount: { type: Number },
         _timerLastAt: { type: Number },
+        _timerError: { type: String },
+        _timerBusy: { type: Boolean },
+        /* The wattage the running beat is holding. Kept separately from
+           `_powerCtrl` because the slider is an input in flight, not a
+           statement of what the device is doing. */
+        _timerPower: { type: Number },
       };
     }
 
@@ -233,16 +252,17 @@ function _hmControlRegister() {
       this._logList = null;
       this._logUnsubs = [];
       this._logGen = 0;
-      /* Periodic re-send of the power-control lease (see TIMER_LEASE_S). The
-         timer deliberately lives on the element only: it starts sending the
-         moment the switch is turned on and stops when the card goes away, so a
-         dashboard left open keeps the value in force and nothing is published
-         behind the user's back once it is closed. */
+      /* Periodic re-send of the power-control lease, mirrored from the
+         integration. The card never owns the beat: it starts the service and
+         then follows the retained state topic, so the switch stays correct after
+         a reload and leaving the dashboard stops nothing. */
       this._timerOn = false;
       this._timerPeriod = String(TIMER_DEFAULT_S);
       this._timerCount = 0;
       this._timerLastAt = 0;
-      this._timerHandle = null;
+      this._timerError = "";
+      this._timerBusy = false;
+      this._timerPower = NaN;
     }
 
     static getConfigElement() {
@@ -479,14 +499,17 @@ function _hmControlRegister() {
          go of the old ones. Closing it is friendlier than silently subscribing
          to the new device: the user asked for that view. */
       if (changed && this._logOpen) this._closeLog();
-      /* The timer publishes `this._powerCtrl` on a period; pointing the card at
-         another device without stopping it would send this device's wattage to
-         the new one. Stop first, let the user arm it again on purpose. */
+      /* A different device means different topics. The keep-alive belongs to the
+         old device and must not be stopped for it (the user may still want it
+         running), so this only drops the local mirror and re-reads the new
+         device's own state. */
       if (changed) {
         this._timerOn = false;
-        this._timerDisarm();
         this._timerCount = 0;
         this._timerLastAt = 0;
+        this._timerError = "";
+        this._timerPower = NaN;
+        this._timerPeriod = String(TIMER_DEFAULT_S);
       }
     }
 
@@ -494,6 +517,10 @@ function _hmControlRegister() {
       this._hass = hass;
       if (!this._initialised) this._seedInputs();
       this._reconcileSwitch();
+      /* The beat runs in the integration, so its running state arrives as an
+         entity state - reading it here means every update re-syncs the row for
+         free, and a card opened after the fact shows the truth immediately. */
+      this._syncKeepalive();
       this.requestUpdate();
     }
 
@@ -507,9 +534,6 @@ function _hmControlRegister() {
          log still switched on must resume the stream. The guard also keeps a
          re-connect from subscribing twice. */
       if (this._logOpen && !this._logUnsubs.length) this._subscribeLog();
-      // Re-attaching to the same element (a view switch that does not destroy
-      // the card) must resume the re-send, or the lease would lapse silently.
-      if (this._timerOn) this._timerArm();
     }
 
     disconnectedCallback() {
@@ -517,7 +541,10 @@ function _hmControlRegister() {
       if (this._toastTimer) clearTimeout(this._toastTimer);
       if (this._pendingTimer) clearTimeout(this._pendingTimer);
       this._unsubscribeLog();
-      this._timerDisarm();
+      /* Deliberately nothing here stops the keep-alive: the whole point of
+         moving it into the integration is that leaving the dashboard (or
+         closing the browser) must not drop the power limit. Stop it from the
+         row's own Off button, the stop service, or an automation. */
     }
 
     updated() {
@@ -575,6 +602,23 @@ function _hmControlRegister() {
           const tail = norm(entityId.slice(prefix.length + 1));
           if (tail !== wanted) continue;
           if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
+      /* Device-scoped tail match: "the entity of this device whose id ends with
+       * the protocol key". This is what survives a renamed entity - the id may
+       * pick up an area prefix (`wo_shi_...`) or spell `ctrl` out as `control`,
+       * but the tail still names the setting. Scoped to the device, so a match
+       * can never cross over to another inverter. */
+      if (!found) {
+        const wanted = normKey(key);
+        const scoped = this._deviceEntityIds(domain)
+          .filter((entityId) => normKey(entityId).endsWith(wanted));
+        if (scoped.length === 1) found = scoped[0];
+        else if (scoped.length > 1) {
+          // Prefer the shortest id: a rename adds prefixes, it does not shorten.
+          scoped.sort((a, b) => a.length - b.length || a.localeCompare(b));
+          found = scoped[0];
         }
       }
 
@@ -654,6 +698,43 @@ function _hmControlRegister() {
      */
     _hasEntity(key, domain) {
       return this._resolve(key, domain) != null;
+    }
+
+    /** Entity ids the registry attributes to *this* device.
+     *
+     * `hass.entities` does expose `device_id`, and `hass.devices` carries the
+     * device's identifiers, so the device can be found from the configured
+     * `dev_id` even when the entity was renamed. That matters: a user-renamed
+     * entity keeps its `unique_id` but gets a new entity id, and the frontend
+     * registry snapshot does not ship `unique_id` at all - so neither guessing
+     * the id nor matching on unique_id works after a rename. The device link is
+     * the only stable join.
+     */
+    _deviceEntityIds(domain) {
+      const hass = this._hass;
+      if (!hass || !hass.entities || !hass.devices) return [];
+
+      const wanted = String(this._dev()).toLowerCase();
+      let deviceId = null;
+      for (const [id, device] of Object.entries(hass.devices)) {
+        const ids = (device && device.identifiers) || [];
+        for (const pair of ids) {
+          if (!Array.isArray(pair) || pair.length < 2) continue;
+          if (String(pair[0]).toLowerCase() !== "hoymiles_g2") continue;
+          if (String(pair[1]).toLowerCase() === wanted) { deviceId = id; break; }
+        }
+        if (deviceId) break;
+      }
+      if (!deviceId) return [];
+
+      const out = [];
+      for (const [entityId, entry] of Object.entries(hass.entities)) {
+        if (!entry || entry.device_id !== deviceId) continue;
+        if (domain && !entityId.startsWith(`${domain}.`)) continue;
+        if (!hass.states || !hass.states[entityId]) continue;
+        out.push(entityId);
+      }
+      return out;
     }
 
     _topic(suffix) {
@@ -867,6 +948,22 @@ function _hmControlRegister() {
     _sendPowerCtrl(opts) {
       const value = Number(this._powerCtrl);
       if (!Number.isFinite(value)) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
+      /* While the beat is running it re-publishes its own value, so a plain
+         send would be silently overwritten one period later - "I sent 200 W"
+         then looks ignored a minute later, which is exactly the symptom this
+         timer exists to cure. Retuning the beat publishes the new target
+         immediately and keeps holding it, so it is the whole operation. */
+      if (this._timerOn) {
+        this._showToast(
+          this._t(
+            `Power control ${value} W (timer retuned)`,
+            `功率控制 ${value} W（已同步定时下发）`,
+          ),
+          false,
+        );
+        this._keepaliveStart(value);
+        return;
+      }
       this._publish(this._topic("number/<dev_id>/power_ctrl/set"), String(value),
         `${this._t("Power control", "功率控制")} ${value} W`, opts);
     }
@@ -900,71 +997,162 @@ function _hmControlRegister() {
     }
 
     _setTimer(on) {
+      if (this._timerBusy) return;
       const want = on === true;
-      if (want === (this._timerOn === true)) return;
+      /* Off must always be possible, even mid-send or when this element's
+         mirror disagrees with the integration: leaving the device holding a
+         power limit because the UI was out of step is far worse than a
+         redundant stop call (which the service treats as a no-op). */
+      if (!want) { this._keepaliveStop(); return; }
+      if (this._timerOn === true) return;
       /* `power_ctrl` is only honoured in mqtt_ctrl mode, so arming the timer in
          any other mode would publish into the void. The row disables its
          buttons there; this guard covers the programmatic paths too. */
-      if (want && this._emsMode() !== "mqtt_ctrl") return;
-      this._timerOn = want;
-      if (want) {
-        this._timerCount = 0;
-        /* Send straight away instead of waiting out one period: the user just
-           pressed the switch and needs to see the device react now. */
-        this._timerFire();
-      } else {
-        this._timerDisarm();
+      if (this._emsMode() !== "mqtt_ctrl") return;
+      const value = Number(this._powerCtrl);
+      if (!Number.isFinite(value)) {
+        this._showToast(this._t("Invalid value", "数值无效"), true);
+        return;
+      }
+      this._keepaliveStart(value);
+    }
+
+    /**
+     * Start (or retune) the server-side beat.
+     *
+     * The value is sent by the integration, so the card does not re-publish it
+     * here - a second publish would only duplicate the first beat.
+     */
+    async _keepaliveStart(power) {
+      this._timerBusy = true;
+      this.requestUpdate();
+      try {
+        await this._hass.callService("hoymiles_g2", "start_power_ctrl_keepalive", {
+          dev_id: this._dev(),
+          power,
+          period: this._timerPeriodValue(),
+        });
+        // The state topic carries the authoritative count, so read it back
+        // instead of assuming the call did what was asked.
+        this._syncKeepalive();
+      } catch (err) {
+        this._showToast(this._t(
+          `Could not start the timer: ${err.message || err}`,
+          `无法开启定时下发：${err.message || err}`,
+        ), true);
+      } finally {
+        this._timerBusy = false;
         this.requestUpdate();
       }
     }
 
-    /** Schedule the next tick. Called after every send, so the beat is measured
-     * from the last one and a slow publish can never stack up intervals. */
-    _timerArm() {
-      this._timerDisarm();
-      if (!this._timerOn) return;
-      this._timerHandle = setTimeout(() => {
-        this._timerHandle = null;
-        this._timerFire();
-      }, this._timerPeriodValue() * 1000);
-    }
-
-    _timerDisarm() {
-      if (this._timerHandle) {
-        clearTimeout(this._timerHandle);
-        this._timerHandle = null;
+    async _keepaliveStop() {
+      this._timerBusy = true;
+      this.requestUpdate();
+      try {
+        await this._hass.callService("hoymiles_g2", "stop_power_ctrl_keepalive", {
+          dev_id: this._dev(),
+        });
+        this._syncKeepalive();
+      } catch (err) {
+        this._showToast(this._t(
+          `Could not stop the timer: ${err.message || err}`,
+          `无法关闭定时下发：${err.message || err}`,
+        ), true);
+      } finally {
+        this._timerBusy = false;
+        this.requestUpdate();
       }
     }
 
-    _timerFire() {
-      if (!this._timerOn) return;
-      // Another mode makes `power_ctrl` a no-op, so the timer switches itself
-      // off instead of publishing into the void. Same condition as the row's
-      // `ready`, so switch and behaviour can never disagree.
-      if (this._emsMode() !== "mqtt_ctrl") { this._setTimer(false); return; }
-      const value = Number(this._powerCtrl);
-      if (!Number.isFinite(value)) {
-        this._setTimer(false);
-        this._showToast(this._t(
-          "Power control is not a number - timer stopped",
-          "功率控制数值无效，已停止定时下发",
-        ), true);
+    /**
+     * Read the integration's running state from its entity.
+     *
+     * The keep-alive publishes a retained topic, but a card must not depend on
+     * having received it - right after a page load the retained message may not
+     * have arrived yet. The integration mirrors the same payload into an
+     * entity's attributes, which `hass.states` always has, so the row is
+     * correct the moment it renders.
+     */
+    _syncKeepalive() {
+      const state = this._state("power_ctrl_keepalive", "sensor");
+      this._applyKeepalive(state ? state.attributes : null);
+    }
+
+    /**
+     * Mirror the integration's state onto the row.
+     *
+     * `set hass` runs for every state change in the whole system, so the
+     * re-render is skipped unless something actually differs - otherwise the
+     * card would redraw continuously for no reason.
+     */
+    _applyKeepalive(payload) {
+      if (!payload || typeof payload !== "object") return;
+      const on = payload.enabled === true;
+      const period = payload.period != null
+        ? String(this._clampPeriod(payload.period))
+        : this._timerPeriod;
+      const count = typeof payload.count === "number" ? payload.count : 0;
+      const lastAt = typeof payload.last_at === "number" ? payload.last_at : 0;
+      const power = typeof payload.power === "number" ? payload.power : NaN;
+      /* An error is only worth showing while stopped: a beat that is running
+         has already recovered by definition, and a stale message would sit
+         there contradicting the "re-sending every N s" line right above it. */
+      const error = !on && payload.error ? String(payload.error) : "";
+      if (on === this._timerOn && period === this._timerPeriod
+        && count === this._timerCount && lastAt === this._timerLastAt
+        && error === this._timerError && power === this._timerPower) {
         return;
       }
-      this._timerCount += 1;
-      this._timerLastAt = this._now();
-      // Quiet: a toast every period would cover the card for ever. Progress is
-      // shown on the row's own sub-line instead.
-      this._sendPowerCtrl({ quiet: true });
-      this._timerArm();
+      this._timerOn = on;
+      this._timerPeriod = period;
+      this._timerCount = count;
+      this._timerLastAt = lastAt;
+      this._timerError = error;
+      this._timerPower = power;
       this.requestUpdate();
     }
 
-    _setTimerPeriod(raw) {
+    /** Turn a keep-alive error into a sentence the user can act on.
+     *
+     * The integration reports English diagnostics meant for the log. Two of them
+     * have a real user-facing meaning, and one is actively misleading without
+     * context: the EMS select can read `mqtt_ctrl` while the device is actually
+     * in another mode, because the select's state topic is a retained value the
+     * firmware only refreshes every few minutes. Saying just "not mqtt_ctrl"
+     * next to a row that visibly *does* say mqtt_ctrl looks like a bug.
+     */
+    _timerErrorText(err) {
+      const text = String(err || "");
+      const ems = text.match(/EMS mode is (\w+), not (\w+)/i);
+      if (ems) {
+        return this._t(
+          `The device reports ${ems[1]}, so it ignores power control - the EMS mode shown above may be stale. `
+            + `Switch to ${ems[2]} and try again.`,
+          `设备实际处于 ${ems[1]}，会忽略功率控制（上方的 EMS 模式显示可能是旧值）。`
+            + `请切到 ${ems[2]} 后重试。`,
+        );
+      }
+      if (/integration unloaded/i.test(text)) {
+        return this._t("The integration was reloaded - turn this on again.",
+          "集成已重新加载，请重新开启。");
+      }
+      return text;
+    }
+
+    async _setTimerPeriod(raw) {
       this._timerPeriod = String(this._clampPeriod(raw));
-      // A new period takes effect on the next beat, not by sending right now.
-      if (this._timerOn) this._timerArm();
       this.requestUpdate();
+      /* A new period must reach the integration, not just this element: the
+         beat is scheduled server side. Restarting retunes it so the change
+         takes effect immediately.
+
+         The power comes from what the beat is already holding, not from the
+         slider: the slider may show an unsent value, and editing the period
+         must not silently push that value onto the device. */
+      if (!this._timerOn) return;
+      if (!Number.isFinite(this._timerPower)) return;
+      await this._keepaliveStart(this._timerPower);
     }
 
     _sendOutputPower() {
@@ -1622,29 +1810,38 @@ function _hmControlRegister() {
      * `power_ctrl` is a lease that the firmware drops after about a minute (it
      * falls back to `output_power`), which is why a single send looks like the
      * device "ignores" the value after a short while. Re-publishing on a period
-     * holds it; this row is the switch for that. The period defaults well
-     * inside the lease, and the running state is spelled out - count and last
-     * send time - because a command that is sent quietly every 30 s is
-     * otherwise invisible.
+     * holds it; this row is the switch for that.
+     *
+     * The beat is run by the integration, not by this element. An earlier
+     * version used a browser `setTimeout`, which fired once and then died the
+     * moment the dashboard was left - navigation, reload, or closing the tab
+     * cleared it, and the device reverted a minute later with no visible cause.
+     * Living in Home Assistant means the value is held whether or not any
+     * dashboard is open, and this row is only a remote control for it - which
+     * is why it reads its state back from the entity instead of trusting a
+     * local flag.
      */
     _timerItem() {
       const ready = this._emsMode() === "mqtt_ctrl";
       const on = this._timerOn === true && ready;
       const period = this._timerPeriodValue();
       const sub = !ready
-        ? this._t("switch EMS to mqtt_ctrl first", "需先切到 mqtt_ctrl")
-        : on
-          ? this._t(
-            `Re-sending every ${period} s · ${this._timerCount} sent`
-              + (this._timerLastAt ? ` · last ${this._timerClock(this._timerLastAt)}` : ""),
-            `每 ${period} 秒下发一次 · 已下发 ${this._timerCount} 次`
-              + (this._timerLastAt ? ` · 上次 ${this._timerClock(this._timerLastAt)}` : ""),
-          )
-          : this._t(
-            `Off. The device drops power control after ~${TIMER_LEASE_S} s - `
-              + "turn this on to hold the value.",
-            `已关闭。设备约 ${TIMER_LEASE_S} 秒后自动失效——打开后持续维持该功率。`,
-          );
+        ? this._t("Switch EMS to mqtt_ctrl first", "需先切到 mqtt_ctrl")
+        : this._timerError
+          ? this._timerErrorText(this._timerError)
+          : on
+            ? this._t(
+              `Re-sending every ${period} s · ${this._timerCount} sent`
+                + (this._timerLastAt ? ` · last ${this._timerClock(this._timerLastAt)}` : ""),
+              `每 ${period} 秒下发一次 · 已下发 ${this._timerCount} 次`
+                + (this._timerLastAt ? ` · 上次 ${this._timerClock(this._timerLastAt)}` : ""),
+            )
+            : this._t(
+              `Off. The device drops power control after ~${TIMER_LEASE_S} s - `
+                + "turn this on and Home Assistant keeps sending it, even with no dashboard open.",
+              `已关闭。设备约 ${TIMER_LEASE_S} 秒后自动失效——`
+                + "打开后由 Home Assistant 持续下发，关闭页面也不受影响。",
+            );
       return this._item({
         icon: "⏱",
         name: this._t("Re-send timer", "定时下发"),
@@ -1653,14 +1850,14 @@ function _hmControlRegister() {
         ctrl: html`
           ${this._segment(
             [
-              { id: "on", label: this._t("On", "开启"), enabled: ready },
-              { id: "off", label: this._t("Off", "关闭"), enabled: ready },
+              { id: "on", label: this._t("On", "开启"), enabled: ready && !this._timerBusy },
+              { id: "off", label: this._t("Off", "关闭"), enabled: ready && !this._timerBusy },
             ],
             on ? "on" : "off",
             (id) => this._setTimer(id === "on"),
           )}
           <input type="number" class="narrow" min=${TIMER_MIN_S} max=${TIMER_MAX_S}
-            step="1" .value=${String(period)} ?disabled=${!ready}
+            step="1" .value=${String(period)} ?disabled=${!ready || this._timerBusy}
             @change=${(e) => this._setTimerPeriod(e.target.value)} />
           <span class="state">${this._t("s", "秒")}</span>`,
       });

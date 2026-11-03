@@ -31,6 +31,7 @@ from .const import (
     SOURCE_STALE_SECONDS,
     SRC_ALARM,
     SRC_DEVICE,
+    SRC_KEEPALIVE,
     SRC_QUICK,
     SRC_SYSTEM,
     SRC_TOU_DAY_ACK,
@@ -115,6 +116,26 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Topic the patched discovery payloads subscribe to."""
         return mqtt_util.topic(T_AVAILABILITY, self.dev_id)
 
+    @property
+    def ems_mode(self) -> str | None:
+        """Return the EMS mode the device is believed to be running.
+
+        ``_ems_mode_state`` is what the select's state topic carries - the last
+        commanded value, refined by whatever the device reports.  It is only
+        ``None`` before the first command or report, which the keep-alive treats
+        as "unknown, do not second guess" rather than "not mqtt_ctrl".
+        """
+        if self._ems_mode_state is not None:
+            return self._ems_mode_state
+        for source in (SRC_SYSTEM, SRC_DEVICE):
+            payload = self.data.get(source)
+            if not isinstance(payload, dict):
+                continue
+            mode = payload.get("ems_mode")
+            if isinstance(mode, str) and mode:
+                return mode
+        return None
+
     # ------------------------------------------------------------------
     # capabilities
     # ------------------------------------------------------------------
@@ -126,6 +147,18 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def has_capability(self, capability: str) -> bool:
         """Return True when the firmware declared this capability."""
         return capability in self.capabilities
+
+    @callback
+    def set_keepalive_state(self, payload: dict[str, Any]) -> None:
+        """Store the power-control keep-alive state for the entity.
+
+        The keep-alive owns this data; pushing it through the coordinator means
+        the sensor updates through the normal listener path instead of needing a
+        subscription of its own.
+        """
+        data = dict(self.data)
+        data[SRC_KEEPALIVE] = dict(payload)
+        self.async_set_updated_data(data)
 
     @callback
     def add_capability(self, capability: str) -> None:
