@@ -199,6 +199,9 @@ language: zh
 | `gradient` | bool | `true` | Draw the plain **white** backdrop the schematic sits on. `false` leaves the card background instead — pair it with a light theme, since the diagram's text colours are fixed. |
 | `max_width` | number (px) | `620` | Maximum width of the illustration; it stays centred. |
 | `flow_speed` | number | `1` | Speed multiplier for the moving pearls. `0.5` is calmer, `2` is faster. |
+| `variant` | `inverter` | — | Set to `inverter` for the **micro-inverter layout** (see below). Empty keeps the four-branch storage schematic. |
+| `image` | URL | HiFlow Pro 2-in-1 photo | Product photo drawn in the middle of the micro-inverter layout; must be a transparent cut-out. |
+| `dim_when_idle` | bool | `true` | In the micro-inverter layout the photo fades to 55 % when nothing flows. `false` keeps it fully opaque. |
 | `entities` | map | — | Entity overrides, keyed by suffix (see below). |
 
 ### Data sources
@@ -273,6 +276,39 @@ vendor app's system page shows:
 `sys_grid_p` is **positive while importing** and the storage power is
 **negative while charging**; the card normalises both before drawing. A node
 carrying no power gets a grey ring — never a *standby* chip.
+
+### Micro-inverter layout (`variant: inverter`)
+
+A HiFlow is a grid-tied micro inverter with no battery and no off-grid port, so
+the four-branch schematic spends half its area on branches the hardware does
+not have. With `variant: inverter` the card draws only the two ends it really
+has:
+
+```
+⬜ PV ────────── ▣ HiFlow Pro 2-in-1 ────────── ⬜ Grid port
+```
+
+```yaml
+- type: custom:hoymiles-g2-power-flow
+  dev_id: RMI-4161A0209FF6
+  variant: inverter
+  title: My home
+  show_title: false
+  max_width: 700
+```
+
+- The **grid port shows an absolute value** with a fixed `Grid port` caption, so
+the number never flips sign. Direction is carried by the moving pearls and the
+connector colour instead: `> 0` is importing (pearls run towards the unit, blue
+line), `< 0` is exporting (pearls run towards the grid, amber line).
+- The middle is the real product photo (replace it with `image`), centred on the
+node row so both connectors meet the unit's own sides.
+- Below `|P| = 5 W` the photo fades to 55 %; `dim_when_idle: false` disables it.
+- No battery, load, smart-plug or off-grid node — the micro inverter has no such
+topics.
+- **The variant is never auto-detected.** The same card also draws the `system`
+  view of a storage device, and sniffing the `RMI-` serial prefix would silently
+  change those views too. Only an explicit `variant: inverter` switches drawings.
 
 ---
 

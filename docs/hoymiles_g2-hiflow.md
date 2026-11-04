@@ -8,10 +8,12 @@
 
 | 文件 | 改动 |
 | --- | --- |
-| `const.py` | 新增 `HIFLOW_IMAGE_FILENAME`、`FRONTEND_IMAGES`、`HIFLOW_IMAGE_URL` |
+| `const.py` | 新增 `HIFLOW_IMAGE_FILENAME` / `HIFLOW_PRO_IMAGE_FILENAME`、`FRONTEND_IMAGES`、`HIFLOW_IMAGE_URL` / `HIFLOW_PRO_IMAGE_URL` |
 | `__init__.py` | `_collect_assets()` 同时把 `FRONTEND_IMAGES` 注册为静态路由；`add_extra_js_url` 跳过非 `.js` 资源 |
 | `www/hoymiles-g2-battery.js` | 微逆模式：设备识别、`_isMicroInverter()`、`_microInverterBody()`、样式 |
-| `www/hiflow.png` | 产品图（27087 B），随卡片一起由集成提供 |
+| `www/hoymiles-g2-power-flow.js` | 微逆布局 `variant: inverter`：只画光伏 + 并网端口，中间放产品图 |
+| `www/hiflow.png` | 产品图（27087 B，736×486），随卡片一起由集成提供 |
+| `www/hiflow-pro-2in1.png` | HiFlow Pro 2-in-1 产品图（38150 B，360×168 透明裁切），供电网卡片微逆布局使用 |
 
 ## 应用方式
 
@@ -32,9 +34,38 @@ ha core restart
 
 ## 卡片行为
 
+### 电池卡片（`hoymiles-g2-battery`）
+
 - `model` 含 `HiFlow`，或 `dev_id` 以 `RMI-` 开头 → 显示产品图 + 光伏输入 / 并网输出 / 今日发电。
 - 其他（MSA / `HiBattery`）→ 保持原有电池堆栈示意图，行为不变。
 - 可用 `variant: inverter` / `variant: battery` 强制指定，`image:` 覆盖产品图。
+
+### 电网卡片（`hoymiles-g2-power-flow`）
+
+这张卡片有两套画法，**由 `variant` 显式选择，不自动识别机型**：
+
+- 默认（`variant` 留空）→ 四支路储能示意图。`system` 视图一直用这套，**不受影响**。
+- `variant: inverter` → 微逆画法：左边光伏、右边并网端口、中间产品图，没有电池 / 负载 / 智能插座 / 离网端口。
+
+> 之所以不做自动识别：同一张卡片既用于储能机的 `system` 视图，也用于微逆的 `system` 视图（RMI 同样有 `sys_pv_p` / `sys_grid_p`），若靠 `RMI-` 前缀自动切换，`system` 视图也会一起被改掉。
+
+```yaml
+# 微逆的 device 视图
+- type: custom:hoymiles-g2-power-flow
+  dev_id: RMI-4161A0209FF6
+  variant: inverter
+  image: /hoymiles_g2_static/hiflow-pro-2in1.png   # 默认即此图，可省略
+  title: 我的家
+  show_title: false
+  max_width: 700
+```
+
+微逆画法的并网端口：
+
+- 数值取**绝对值**，正文固定为「并网端口」，不随符号改写（避免「绝对值 + 方向字幕」自相矛盾）。
+- 方向由**流动珠子**和连线颜色表达：`> 0` 取电，珠子朝机组方向流动、线为 `#4a90d9`；`< 0` 馈电，珠子朝电网方向流动、线为 `#f59e0b`。
+- `|P| < 5 W` 时不显示珠子，产品图降为 55% 透明度；`dim_when_idle: false` 可关掉这个变暗效果。
+- 光伏节点与储能画法一致：`sys_pv_p` 为负（夜间耗电）时珠子反向。
 
 ## 已知限制
 

@@ -283,9 +283,14 @@ CARD_URL: Final = f"{FRONTEND_URL}/{CARD_FILENAME}"
 # never injected with ``add_extra_js_url``, because a PNG is not a module. The
 # cards reference them as ``{FRONTEND_URL}/<name>``.
 HIFLOW_IMAGE_FILENAME: Final = "hiflow.png"
-FRONTEND_IMAGES: Final = (HIFLOW_IMAGE_FILENAME,)
+# The HiFlow Pro 2-in-1 (RMI-4161) product photo drawn in the middle of the
+# power-flow schematic. It is a transparent cut-out, so the connectors can run
+# up to the body instead of stopping at a white rectangle.
+HIFLOW_PRO_IMAGE_FILENAME: Final = "hiflow-pro-2in1.png"
+FRONTEND_IMAGES: Final = (HIFLOW_IMAGE_FILENAME, HIFLOW_PRO_IMAGE_FILENAME)
 
 HIFLOW_IMAGE_URL: Final = f"{FRONTEND_URL}/{HIFLOW_IMAGE_FILENAME}"
+HIFLOW_PRO_IMAGE_URL: Final = f"{FRONTEND_URL}/{HIFLOW_PRO_IMAGE_FILENAME}"
 
 # ---------------------------------------------------------------------------
 # Sankey card defaults

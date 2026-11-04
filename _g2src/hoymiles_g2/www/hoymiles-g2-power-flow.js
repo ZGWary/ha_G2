@@ -47,6 +47,15 @@
  *   max_width: 620                # optional px, the drawing stays centered
  *   flow_speed: 1                 # optional multiplier for the moving pearls;
  *                                 # 0.5 = half speed (calmer), 2 = faster
+ *   variant: inverter             # optional; 'inverter' draws the HiFlow
+ *                                 # micro-inverter layout (PV + grid port
+ *                                 # only) instead of the four-branch storage
+ *                                 # schematic.  Never auto-detected, so the
+ *                                 # system view of a storage device is
+ *                                 # unaffected.
+ *   image: /local/photo.png       # optional product photo for that layout;
+ *                                 # defaults to the HiFlow Pro 2-in-1 cut-out
+ *   dim_when_idle: true           # optional; fade the photo when nothing flows
  *   entities:                     # optional entity id overrides, keyed by the
  *                                 # suffix the card looks up
  *     system_pv_power: sensor.my_pv_power
@@ -212,6 +221,47 @@ function _hmPowerFlowRegister() {
   const LAMP_B = { x: JUNCTION.x, y: JUNCTION.y + 6 };
   const PV2_ROUTE = `M${PV2_A.x} ${PV2_A.y} L${PV2_B.x} ${PV2_B.y}`;
   const LAMP_ROUTE = `M${LAMP_A.x} ${LAMP_A.y} L${LAMP_B.x} ${LAMP_B.y}`;
+
+  /* ------------------------------------------------------------------ *
+   * The micro-inverter layout (`variant: inverter`)
+   *
+   * A HiFlow is a grid-tied micro inverter: it has no battery and no
+   * off-grid port, so the four node schematic spends half its area on
+   * branches the hardware does not have.  This layout draws what the unit
+   * actually is - PV in on the left, the grid port on the right, the
+   * product photo itself in the middle - and keeps the two powers that
+   * matter.  The 并网端口 value is the *absolute* reading: whether the
+   * energy is being drawn from the grid (取电) or fed back into it (馈电)
+   * is carried by the pearls, which run towards the unit while importing
+   * and away from it while exporting, and by the colour of the connector.
+   *
+   * The photo is a transparent cut-out but the unit fills almost the whole
+   * frame (measured: opaque pixels reach the left edge and both vertical
+   * extremes), so there is no transparent margin to run a line *into*.
+   * The connectors therefore stop at the image's own bounding box, which
+   * reads as touching the unit because the artwork is flush with it.
+   * ------------------------------------------------------------------ */
+  const IV_W = 700;
+  const IV_H = 238;
+  const IV_NODE_ROW = 145;
+  const IV_NODE_PV = { x: 68, y: IV_NODE_ROW };
+  const IV_NODE_GRID = { x: 632, y: IV_NODE_ROW };
+  const IV_IMG_W = 300;                        // 360x168 scaled to 300x140
+  const IV_IMG_H = IV_IMG_W * (168 / 360);
+  const IV_CENTER_X = IV_W / 2;
+  /* Vertically centred on the node row, so both connectors meet the unit at
+     the same height as the nodes they belong to. */
+  const IV_IMG_Y = IV_NODE_ROW - IV_IMG_H / 2;
+  const IV_IMG_L = IV_CENTER_X - IV_IMG_W / 2;
+  const IV_IMG_R = IV_CENTER_X + IV_IMG_W / 2;
+  /* Both connectors are written from their node towards the unit, so
+     `reverse` means "the energy runs from the unit out to this side" - see
+     the direction table in `_svgInverter`. */
+  const IV_PV_ROUTE = `M${IV_NODE_PV.x + NODE_R} ${IV_NODE_PV.y} H${IV_IMG_L}`;
+  const IV_GRID_ROUTE = `M${IV_NODE_GRID.x - NODE_R} ${IV_NODE_GRID.y} H${IV_IMG_R}`;
+  /* Served by the integration itself (see const.FRONTEND_IMAGES), so no
+     dashboard has to register an image resource by hand. */
+  const IV_IMAGE = "/hoymiles_g2_static/hiflow-pro-2in1.png";
 
   /* Node artwork, baked straight out of the vendor app's icon set (see
      _preview/bake-icons.py).  Every branch has two variants: the coloured one
@@ -811,6 +861,9 @@ function _hmPowerFlowRegister() {
                 fill: #1f2933; letter-spacing: 0.2px; }
         .pf-soc { font-size: 15px; font-weight: 500; opacity: 0.9; }
         .pf-c { font-size: 13px; fill: #8b95a5; }
+        /* The product photo in the micro-inverter layout.  It is a transparent
+           cut-out, so it is drawn straight on the backdrop with no frame. */
+        .pf-body { display: block; }
         .note { font-size: 12px; color: var(--secondary-text-color);
                 text-align: center; padding: 4px 0 8px; }
       `;
@@ -853,6 +906,11 @@ function _hmPowerFlowRegister() {
         this._config.gradient, this._config.max_width,
         this._text(this._config.title), this._config.show_title, this._config.show_rssi,
         this._config.flow_speed,
+        /* Which of the two drawings is shown, and what the unit looks like:
+           both are part of the visual result, so a changed `variant` or
+           `image` must rebuild the SVG. */
+        this._isMicroInverter() ? "inv" : "sys",
+        this._config.image, this._config.dim_when_idle,
         this._temperature(),
         /* Readings are compared at the precision the card prints them with.
            They wiggle in their last digit every second, and rebuilding the
@@ -1242,6 +1300,126 @@ function _hmPowerFlowRegister() {
     /* --------------------------- the diagram --------------------------- */
 
     _svg(d) {
+      if (this._isMicroInverter()) return this._svgInverter(d);
+      return this._svgSystem(d);
+    }
+
+    /**
+     * True when the card is asked to draw a micro inverter (HiFlow) rather
+     * than the storage schematic.
+     *
+     * This is deliberately an explicit option and NOT auto-detected.  The same
+     * card is used for the `system` view of a storage device *and* of a micro
+     * inverter (an RMI can read `system_pv_power` / `system_grid_power` too), so
+     * sniffing the serial prefix would silently change the system view as well.
+     * `variant: inverter` is opt-in, which keeps those views pixel-identical -
+     * only the view that asks for it changes.
+     */
+    _isMicroInverter() {
+      const variant = this._config && this._config.variant;
+      return String(variant || "").toLowerCase() === "inverter";
+    }
+
+    /**
+     * The micro-inverter drawing: PV on the left, the 并网端口 on the right,
+     * the product photo in the middle, and nothing else.
+     *
+     * The 并网端口 reading is printed as an absolute value - the user asked for
+     * the number to stay unsigned and to be seen at a glance - so the direction
+     * of the energy is carried by the pearls instead: they run towards the unit
+     * while it is drawing from the grid (取电) and away from it while it is
+     * feeding back (馈电).  That is why the grid route is reversed for a
+     * *positive* reading rather than a negative one; see the table below.
+     *
+     *   pv     producing            node -> unit
+     *          consuming (night)    unit -> node    (reverse)
+     *   grid   取电 / importing      node -> unit    (> 0)
+     *          馈电 / exporting      unit -> node    (reverse, < 0)
+     */
+    _svgInverter(d) {
+      const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
+
+      const routes = [
+        { id: "pv", d: IV_PV_ROUTE, power: d.pv, color: COLORS.pv,
+          reverse: num(d.pv) < 0 },
+      ];
+      if (present(d.grid)) {
+        /* Importing is the mirrored case: the connector is written from the
+           node towards the unit, so a *forward* run already means "into the
+           unit".  Exporting therefore reverses it. */
+        routes.push({ id: "grid", d: IV_GRID_ROUTE, power: d.grid,
+          color: num(d.grid) < 0 ? COLORS.grid_out : COLORS.grid,
+          reverse: num(d.grid) < 0 });
+      }
+
+      const edges = routes.map((r) => `
+        <path class="pf-edge" d="${r.d}" fill="none"
+              vector-effect="non-scaling-stroke"/>`).join("");
+      const dots = routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("");
+
+      const busy = [d.pv, d.grid]
+        .some((v) => present(v) && Math.abs(num(v)) >= MIN_FLOW);
+
+      return `<svg viewBox="0 0 ${IV_W} ${IV_H}" preserveAspectRatio="xMidYMid meet"
+                   xmlns="http://www.w3.org/2000/svg" role="img">
+        ${this._config.gradient === false
+          ? ""
+          : `<rect x="0" y="0" width="${IV_W}" height="${IV_H}" fill="#ffffff"/>`}
+        <clipPath id="${NODE_CLIP_ID}" clipPathUnits="userSpaceOnUse">
+          <circle cx="0" cy="0" r="${NODE_CLIP_R}"/>
+        </clipPath>
+        ${edges}
+        ${dots}
+        ${this._unitImage(busy)}
+        ${this._inverterNodes(d, { grid: present(d.grid) })}
+      </svg>`;
+    }
+
+    /** The product photo at the centre of the micro-inverter layout. */
+    _unitImage(busy) {
+      const art = (this._config && this._config.image) || IV_IMAGE;
+      /* The stubs are drawn on the product photo itself, so the image is
+         placed - not merely centred - to put them on the node row. */
+      return `<image class="pf-body" x="${IV_IMG_L}" y="${IV_IMG_Y}"
+                    width="${IV_IMG_W}" height="${IV_IMG_H}"
+                    preserveAspectRatio="xMidYMid meet"
+                    opacity="${busy || this._config.dim_when_idle === false ? 1 : 0.55}"
+                    href="${esc(art)}"/>`;
+    }
+
+    /** The two nodes of the micro-inverter layout. */
+    _inverterNodes(d, opts) {
+      const t = (en, zh) => this._t(en, zh);
+      const working = (v) => Math.abs(num(v)) >= MIN_FLOW;
+      const parts = [];
+
+      const node = (x, y, icon, on, value, caption, anchor, tx) => {
+        const art = PF_ICONS[`${icon}.${on ? "on" : "off"}`] || "";
+        parts.push(`<g class="pf-node" transform="translate(${x} ${y})">
+            <image class="pf-ic" x="${-NODE_R}" y="${-NODE_R}"
+                   width="${NODE_R * 2}" height="${NODE_R * 2}"
+                   clip-path="url(#${NODE_CLIP_ID})" href="${art}"/>
+            <text class="pf-v" x="${tx}" y="${NODE_R + 26}"
+                  text-anchor="${anchor}">${value}</text>
+            <text class="pf-c" x="${tx}" y="${NODE_R + 46}"
+                  text-anchor="${anchor}">${esc(caption)}</text>
+          </g>`);
+      };
+
+      node(IV_NODE_PV.x, IV_NODE_PV.y, "pv", working(d.pv),
+        fmtW(d.pv), t("PV", "光伏"), "middle", 0);
+      if (opts.grid) {
+        /* No 电网输入 / 电网输出 wording here: the number is absolute and the
+           direction is already drawn by the pearls, so a caption that moved
+           with the sign would contradict it. */
+        node(IV_NODE_GRID.x, IV_NODE_GRID.y, "grid", working(d.grid),
+          fmtW(d.grid), t("Grid port", "并网端口"), "middle", 0);
+      }
+
+      return parts.join("");
+    }
+
+    _svgSystem(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
 
       /* The wiring diagram: PV1 / storage run into the inverter's left side, the
@@ -1536,6 +1714,12 @@ function _hmPowerFlowRegister() {
           <ha-textfield label="flow_speed (default 1, 0.5 = slower)"
             .value=${config.flow_speed === undefined ? "" : String(config.flow_speed)}
             @change=${this._changed("flow_speed")}></ha-textfield>
+          <ha-textfield
+            label="variant (auto|inverter - 'inverter' draws the HiFlow PV + grid port layout)"
+            .value=${config.variant || ""} @change=${this._changed("variant")}></ha-textfield>
+          <ha-textfield
+            label="image (product photo URL, default the HiFlow Pro 2-in-1)"
+            .value=${config.image || ""} @change=${this._changed("image")}></ha-textfield>
           <label class="sw">
             <ha-switch .checked=${config.show_title !== false}
               @change=${this._toggle("show_title")}></ha-switch>
@@ -1545,6 +1729,15 @@ function _hmPowerFlowRegister() {
             <ha-switch .checked=${config.show_rssi !== false}
               @change=${this._toggle("show_rssi")}></ha-switch>
             <span>show_rssi (signal icon)</span>
+          </label>
+          <label class="sw">
+            <ha-switch .checked=${config.dim_when_idle === false}
+              @change=${(event) => {
+                const config2 = { ...(this._config || {}), dim_when_idle: !event.target.checked };
+                this._config = config2;
+                this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: config2 } }));
+              }}></ha-switch>
+            <span>dim the unit photo when nothing flows</span>
           </label>
         </div>
       `;
