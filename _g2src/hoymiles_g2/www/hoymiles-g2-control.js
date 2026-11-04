@@ -412,9 +412,6 @@ function _hmControlRegister() {
                                animation: hm-pulse 1.3s ease-in-out infinite; }
         .item .nm small.done { color: var(--success-color, #0da035);
                                font-weight: 500; }
-        /* The re-send timer runs indefinitely, so it gets a steady tint -
-           "busy" above pulses and would blink for as long as the switch is on. */
-        .item .nm small.ticking { color: var(--primary-color); font-weight: 500; }
         @keyframes hm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 
         /* plain pill button */
@@ -486,23 +483,6 @@ function _hmControlRegister() {
                  white-space: nowrap; }
         .state.live { color: var(--primary-color); font-weight: 500; }
 
-        /* Device read-back chips: label + value pairs, wrapped so a narrow
-           column stacks them instead of clipping the last one. */
-        .chip {
-          display: inline-flex; align-items: baseline; gap: 5px;
-          font-size: 13px; line-height: 1.6;
-          padding: 2px 9px; border-radius: 999px;
-          font-variant-numeric: tabular-nums;
-          background: var(--secondary-background-color, rgba(120,120,128,.14));
-          color: var(--primary-text-color);
-        }
-        .chip b { font-size: 11px; font-weight: 500; letter-spacing: .02em;
-                  color: var(--secondary-text-color); text-transform: uppercase; }
-        .chip.pv { background: rgba(34,197,94,.16); }
-        .chip.grid { background: rgba(34,211,238,.16); }
-        .chip.load { background: rgba(245,166,35,.16); }
-        .chip.mode { background: rgba(120,120,128,.22); }
-
         /* MQTT log. It sits inside the "Plan & maintenance" group, directly
            under its own row, and grows downwards - the panel itself is the
            scroll container so the card never jumps. */
@@ -528,6 +508,14 @@ function _hmControlRegister() {
                             color: var(--secondary-text-color); }
         .log-row.down .log-dir { background: rgba(3,169,244,.16);
                                  color: var(--primary-color); }
+        /* A retained message is the broker's stored copy, not a live frame - it
+           gets a dashed, neutral badge so it cannot be read as an up-to-date
+           report from the device. */
+        .log-row .log-dir.retained { background: transparent;
+                                     color: var(--secondary-text-color);
+                                     border: 1px dashed var(--divider-color);
+                                     font-style: italic; }
+        .log-row .log-time.cached { font-style: italic; opacity: .7; }
         .log-row .log-topic { font-family: ui-monospace, SFMono-Regular, Menlo,
                               Consolas, monospace; word-break: break-all;
                               color: var(--primary-text-color); }
@@ -935,6 +923,12 @@ function _hmControlRegister() {
         const b = this._bounds("output_power", 100, 2000);
         this._outputPower = String(this._clamp(opPick.value, b.lo, b.hi));
         any = true;
+      } else {
+        /* Neither live nor remembered: leave the box genuinely empty (rendered
+           with a placeholder, not as "0"). The slider still parks at the low
+           bound, which is the only value the device is certain to accept, but
+           that is a drawing position and is never published on its own. */
+        this._outputPower = "";
       }
       /* Nothing was ever sent for power control: start it at the output power,
          which is the wattage the device already holds by default. Leaving the
@@ -1183,136 +1177,6 @@ function _hmControlRegister() {
       return this._switchView().on;
     }
 
-    /* --------------------------- device read-back --------------------------- */
-
-    /**
-     * The device's own numbers, as opposed to what this card last commanded.
-     *
-     * This distinction is the whole reason the read-back row exists. Two of the
-     * controls above are write-only by design:
-     *
-     * * `power_ctrl` and `output_power` publish to a `command_topic` and the
-     *   firmware declares no `state_topic` for either, so Home Assistant's value
-     *   is nothing but a memory of the last command *this* Home Assistant sent
-     *   (the entities are `assumed_state` and read `unknown` after a restart).
-     * * `switch/<dev_id>` is the same: ON wakes the unit, OFF puts it to sleep,
-     *   and nothing readable comes back.
-     *
-     * The sensors below, by contrast, are decoded from the device's own
-     * `device/state` / `system/state` payloads, so they are the honest answer to
-     * "what is it doing right now". They are read-only here - just displayed.
-     *
-     * `pv1_power` / `pv2_power` describe the PV ports, so they are summed for the
-     * production figure; the storage models that report `sys_pv_p` answer through
-     * `system_pv_power` instead, and whichever of the two exists is used.
-     */
-    _readback() {
-      const read = (key, domain = "sensor") => {
-        const state = this._state(key, domain);
-        if (!state) return null;
-        const value = num(state.state);
-        const unit = (state.attributes && state.attributes.unit_of_measurement) || "";
-        const ok = state.state !== "unknown" && state.state !== "unavailable"
-          && Number.isFinite(value);
-        return ok ? { value, unit, text: `${value}${unit ? ` ${unit}` : ""}` } : null;
-      };
-
-      /* A word, not a number: the EMS mode entity state is `general` /
-         `mqtt_ctrl` / ..., and `num()` turns that into `0`. Text states are
-         therefore read raw instead of through `read()`. */
-      const readText = (key, domain = "sensor") => {
-        const state = this._state(key, domain);
-        if (!state) return null;
-        const text = String(state.state).trim();
-        return text && text !== "unknown" && text !== "unavailable" ? text : null;
-      };
-
-      const pv1 = read("pv1_power");
-      const pv2 = read("pv2_power");
-      let pvTotal = null;
-      if (pv1 || pv2) {
-        // Summed here rather than read from an entity, so it has no state of its
-        // own to copy - the `text` field is what `_readChip()` prints.
-        const value = (pv1 ? pv1.value : 0) + (pv2 ? pv2.value : 0);
-        pvTotal = { value, unit: "W", text: `${value} W` };
-      } else {
-        pvTotal = read("system_pv_power");
-      }
-      const grid = read("system_grid_power") || read("grid_on_power");
-      const load = read("system_load_power") || read("system_plug_power");
-
-      /* The mode the device itself reports. `select.*_mqtt_select` is the value
-         Home Assistant last wrote (the integration keeps it retained precisely
-         because the firmware has no state topic for it), so it is shown next to
-         the device's own reading rather than instead of it.
-         The sensor's protocol key is `ems_mode_running` but its entity is named
-         "EMS Mode (Device)", so the id is matched through `_state_regex`-free
-         candidate lookup: `ems_mode_device` is what the slug actually produces. */
-      const deviceMode = readText("ems_mode_running") || readText("ems_mode_device");
-      const selectMode = this._emsMode();
-
-      return { pv1, pv2, pvTotal, grid, load, deviceMode, selectMode };
-    }
-
-    /** One "label: value" fragment, dropped when the device reports nothing. */
-    _readChip(label, item, cls = "") {
-      if (!item) return "";
-      const text = typeof item === "object" && item.text ? item.text : item;
-      return html`<span class="chip ${cls}"><b>${label}</b>${text}</span>`;
-    }
-
-    /**
-     * Read-back of the device's real measurement, plus the honest status of the
-     * two write-only controls.
-     *
-     * The user-facing question this answers is "did my command take effect, and
-     * what is the unit doing?" - which the entity states of `power_ctrl`,
-     * `output_power` and the power switch cannot answer, since none of the three
-     * has a state topic. The PV / grid / load figures do come from the device,
-     * so they double as proof that it is awake and producing even while the
-     * switch entity says OFF.
-     */
-    _readbackItem() {
-      const rb = this._readback();
-      /* The device's own mode wins; the select is the fallback because its state
-         is the integration's retained echo. Either way only the text is shown,
-         so both shapes are collapsed to a string here. */
-      const modeSource = rb.deviceMode || rb.selectMode;
-      const modeText = modeSource
-        ? String(typeof modeSource === "object" ? modeSource.text : modeSource)
-        : "";
-      const nothing = !rb.pvTotal && !rb.grid && !rb.load && !modeText;
-
-      const sub = nothing
-        ? this._t(
-          "The device reports no measurement yet.",
-          "设备尚未上报任何测量值。",
-        )
-        : this._t(
-          "Live values decoded from the device's own state messages. "
-            + "Power control and output power have no state topic, so their "
-            + "boxes above hold the last value sent from this browser.",
-          "以下数值来自设备自身上报的状态消息。功率控制与输出功率没有状态话题，"
-            + "上方输入框会记住本机最后一次下发的值。",
-        );
-
-      return this._item({
-        icon: "📊",
-        name: this._t("Device read-back", "设备回读"),
-        sub,
-        stack: true,
-        ctrl: nothing ? html`<span class="state">—</span>` : html`
-          ${this._readChip(this._t("PV", "光伏"), rb.pvTotal, "pv")}
-          ${this._readChip("PV1", rb.pv1)}
-          ${this._readChip("PV2", rb.pv2)}
-          ${this._readChip(this._t("Grid", "并网"), rb.grid, "grid")}
-          ${this._readChip(this._t("Load", "负载"), rb.load, "load")}
-          ${modeText
-            ? html`<span class="chip mode"><b>${this._t("EMS", "EMS")}</b>${modeText}</span>`
-            : ""}`,
-      });
-    }
-
     _setEmsMode(mode) {
       this._optimistic.ems_mode = mode;
       this._remember({ ems_mode: mode });
@@ -1337,8 +1201,8 @@ function _hmControlRegister() {
     }
 
     _sendPowerCtrl(opts) {
-      const value = Number(this._powerCtrl);
-      if (!Number.isFinite(value)) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
+      const value = this._draftNumber(this._powerCtrl);
+      if (value === null) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
       /* Remembered before the send, so a failed publish still leaves the card
          showing what was attempted - that is more useful than silently going
          back to an older value the user has since replaced. */
@@ -1384,13 +1248,6 @@ function _hmControlRegister() {
       return Math.min(Math.max(n, TIMER_MIN_S), TIMER_MAX_S);
     }
 
-    _timerClock(ts) {
-      if (!ts) return "";
-      const d = new Date(ts);
-      const pad = (n) => String(n).padStart(2, "0");
-      return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-    }
-
     _setTimer(on) {
       if (this._timerBusy) return;
       const want = on === true;
@@ -1404,8 +1261,10 @@ function _hmControlRegister() {
          any other mode would publish into the void. The row disables its
          buttons there; this guard covers the programmatic paths too. */
       if (this._emsMode() !== "mqtt_ctrl") return;
-      const value = Number(this._powerCtrl);
-      if (!Number.isFinite(value)) {
+      /* Same blank-is-not-zero rule as the sliders: arming the beat on an empty
+         field used to start it holding 0 W, which stops the unit producing. */
+      const value = this._draftNumber(this._powerCtrl);
+      if (value === null) {
         this._showToast(this._t("Invalid value", "数值无效"), true);
         return;
       }
@@ -1588,23 +1447,38 @@ function _hmControlRegister() {
     }
 
     _sendOutputPower() {
-      const value = Number(this._outputPower);
-      if (!Number.isFinite(value)) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
+      const value = this._draftNumber(this._outputPower);
+      if (value === null) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
       this._remember({ output_power: value });
       this._publish(this._topic("number/<dev_id>/output_power/set"), String(value),
         `${this._t("Output power", "输出功率")} ${value} W`);
     }
 
+    /**
+     * A drafted value from an input box, or `null` when there is nothing usable.
+     *
+     * `Number("")` is `0` and `Number.isFinite(0)` is true, so the plain
+     * `Number()` + `isFinite` guard this replaces let an emptied field through as
+     * a genuine zero - pressing send then published `output_power = 0` and the
+     * device dutifully went quiet. Blank is therefore tested on the raw string,
+     * before any coercion, and treated as "no value" rather than "zero".
+     */
+    _draftNumber(raw) {
+      const text = String(raw == null ? "" : raw).trim();
+      if (text === "") return null;
+      const value = Number(text);
+      return Number.isFinite(value) ? value : null;
+    }
+
     _sendPhase() {
-      const payload = {
-        phase_a: Number(this._phase.a),
-        phase_b: Number(this._phase.b),
-        phase_c: Number(this._phase.c),
-      };
-      if (!Object.values(payload).every(Number.isFinite)) {
+      /* Per-phase boxes go through the same blank-is-not-zero rule: a phase the
+         user never filled must not be published as 0 W. */
+      const parts = ["a", "b", "c"].map((p) => this._draftNumber(this._phase[p]));
+      if (parts.some((v) => v === null)) {
         this._showToast(this._t("Invalid value", "数值无效"), true);
         return;
       }
+      const payload = { phase_a: parts[0], phase_b: parts[1], phase_c: parts[2] };
       this._remember({ phase: { a: payload.phase_a, b: payload.phase_b, c: payload.phase_c } });
       this._publish(this._topic("number/<dev_id>/phase_output_power/set"), payload,
         `${this._t("Phase output", "多相输出")} ${payload.phase_a}/${payload.phase_b}/${payload.phase_c} W`);
@@ -1704,13 +1578,24 @@ function _hmControlRegister() {
       const topic = String((msg && msg.topic) || "");
       const payload = (msg && msg.payload) != null ? String(msg.payload) : "";
       const down = this._logDown(topic);
+      /* Retained: the broker replays one stored copy the moment anything
+         subscribes. It carries no timestamp of its own, so the only honest
+         clock is none at all - `new Date()` here would date the *receipt* of a
+         message the device published days ago, which on an offline unit made
+         the log look freshly updated every time it was opened. Marked, not
+         dropped: the `attributes` capability list only ever arrives retained,
+         and throwing it away would leave blank payloads in the log. */
+      const retain = Boolean(msg && msg.retain);
       const now = new Date();
       const pad = (n) => String(n).padStart(2, "0");
       return {
         topic,
         down,
+        retain,
         text: this._logPayload(payload),
-        clock: `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
+        clock: retain
+          ? "—"
+          : `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
       };
     }
 
@@ -1726,13 +1611,22 @@ function _hmControlRegister() {
       const meta = document.createElement("div");
       meta.className = "log-meta";
       const time = document.createElement("span");
-      time.className = "log-time";
+      time.className = `log-time${entry.retain ? " cached" : ""}`;
       time.textContent = entry.clock;
       const dir = document.createElement("span");
-      dir.className = "log-dir";
-      dir.textContent = entry.down
-        ? this._t("HA → device", "HA 下发")
-        : this._t("device → HA", "设备上报");
+      dir.className = `log-dir${entry.retain ? " retained" : ""}`;
+      dir.textContent = entry.retain
+        ? this._t("retained · cached", "缓存（非实时）")
+        : entry.down
+          ? this._t("HA → device", "HA 下发")
+          : this._t("device → HA", "设备上报");
+      if (entry.retain) {
+        dir.title = this._t(
+          "Retained message: the broker replayed its last stored copy when the log opened."
+            + " The clock is unknown - this is not a live report.",
+          "保留消息：打开日志时由服务端补发的最后一份缓存，非实时上报，具体时间未知。",
+        );
+      }
       const topic = document.createElement("span");
       topic.className = "log-topic";
       this._logTopic(entry.topic, topic);
@@ -1958,7 +1852,6 @@ function _hmControlRegister() {
           </div>
           ${this._group(this._t("Power & mode", "电源与模式"), [
             this._switchItem(),
-            this._readbackItem(),
             this._emsItem(),
           ])}
           ${this._group(this._t("Power settings", "功率设置"), [
@@ -2038,12 +1931,21 @@ function _hmControlRegister() {
     _slider({ value, min, max, step, unit, tag, disabled, onInput, onSend, sendLabel }) {
       const lo = num(min);
       const hi = num(max);
-      const current = num(value);
+      /* `Number("")` is `0`, and `Number.isFinite(0)` is true, so an untouched
+         or cleared field used to render as "0" - a real-looking value the
+         device would be happy to accept. Blankness is therefore detected on the
+         raw string, before `num()` gets a chance to lie, and the number box is
+         left genuinely empty. The range input still needs a position, so it
+         falls back to the low bound; that is a drawing decision only and is
+         never read back as the user's value. */
+      const blank = String(value == null ? "" : value).trim() === "";
+      const current = blank ? NaN : num(value);
       const inRange = Number.isFinite(current)
         ? Math.min(Math.max(current, lo), hi)
         : lo;
       const span = hi - lo;
       const pct = span > 0 ? ((inRange - lo) / span) * 100 : 0;
+      const shown = Number.isFinite(current) ? String(current) : "";
 
       return html`
         <div class="slider">
@@ -2053,7 +1955,8 @@ function _hmControlRegister() {
             style="--pct:${pct.toFixed(1)}%"
             @input=${(e) => onInput(e.target.value)} />
           <input type="number" min=${lo} max=${hi} step=${step}
-            .value=${String(Number.isFinite(current) ? current : "")}
+            .value=${shown}
+            placeholder=${this._t("not set", "未设置")}
             ?disabled=${disabled}
             @input=${(e) => onInput(e.target.value)}
             @change=${(e) => {
@@ -2062,6 +1965,9 @@ function _hmControlRegister() {
               // and the value that gets published never disagree. The DOM value
               // is rewritten here as well - the draft alone would not show until
               // the next `hass` push, i.e. up to a second later.
+              // A field left empty stays empty: there is no "nearest" number to
+              // snap it to, and inventing one would silently re-arm a send.
+              if (String(e.target.value).trim() === "") return;
               const typed = num(e.target.value);
               const fixed = Number.isFinite(typed)
                 ? Math.min(Math.max(typed, lo), hi)
@@ -2131,8 +2037,8 @@ function _hmControlRegister() {
               `上次下发：${view.on ? "开机" : "关机"}（设备不上报开关状态）`,
             )
             : this._t(
-              "No command sent yet - the device does not report its switch state. See the power read-out below.",
-              "尚未下发指令——设备不上报开关状态，请看下方的实时回读。",
+              "No command sent yet - the device does not report its switch state.",
+              "尚未下发指令——设备不上报开关状态。",
             ))
           : view.confirmed
             ? this._t(
@@ -2278,17 +2184,17 @@ function _hmControlRegister() {
       const ready = this._emsMode() === "mqtt_ctrl";
       const on = this._timerOn === true && ready;
       const period = this._timerPeriodValue();
+      /* While the beat runs the row says nothing: the segment already shows On,
+         the box shows the period and the device is being held. The old counter
+         ("every 30 s · 12 sent · last 10:04:11") was pure noise that pushed the
+         row taller to restate something the controls already express. Only the
+         two cases that need a word keep one: not armed, or failed. */
       const sub = !ready
         ? this._t("Switch EMS to mqtt_ctrl first", "需先切到 mqtt_ctrl")
         : this._timerError
           ? this._timerErrorText(this._timerError)
           : on
-            ? this._t(
-              `Re-sending every ${period} s · ${this._timerCount} sent`
-                + (this._timerLastAt ? ` · last ${this._timerClock(this._timerLastAt)}` : ""),
-              `每 ${period} 秒下发一次 · 已下发 ${this._timerCount} 次`
-                + (this._timerLastAt ? ` · 上次 ${this._timerClock(this._timerLastAt)}` : ""),
-            )
+            ? ""
             : this._t(
               `Off. The device drops power control after ~${TIMER_LEASE_S} s - `
                 + "turn this on and Home Assistant keeps sending it, even with no dashboard open.",
@@ -2299,7 +2205,6 @@ function _hmControlRegister() {
         icon: "⏱",
         name: this._t("Re-send timer", "定时下发"),
         sub,
-        subClass: on ? "ticking" : "",
         /* The row is stacked for the same reason the two sliders are: the
            segment plus the number box plus the unit do not fit beside the name
            at every width. Unstacked they wrapped onto a second line, the row
@@ -2416,8 +2321,9 @@ function _hmControlRegister() {
         name: this._t("MQTT log", "MQTT 日志"),
         sub: open
           ? this._t(
-            "Live traffic: what the device reports and what HA sends",
-            "实时数据：设备上报 + HA 下发",
+            "Live traffic: what the device reports and what HA sends. Rows marked retained"
+              + " are the broker's stored copy, not a new report.",
+            "实时数据：设备上报 + HA 下发。标记为「缓存」的行来自服务端保留消息，不是新上报。",
           )
           : this._t(
             "Off. Turn on to watch what the device reports and what Home Assistant sends",

@@ -631,7 +631,7 @@ title: 设备控制
 | Per-phase output power | `number/<dev_id>/phase_output_power/set` | Sent as `{"phase_a":..,"phase_b":..,"phase_c":..}` |
 | Fetch TOU plan | `sensor/<dev_id>/tou_plan/get` | The reply is published on `tou_plan/status` |
 | Reboot | `button/<dev_id>/reboot/trigger` | Sends `RESTART` after a confirmation |
-| MQTT log | *(subscribes only, sends nothing)* | Off by default; on, it streams what the device reports and what HA sends |
+| MQTT log | *(subscribes only, sends nothing)* | Off by default; on, it streams what the device reports and what HA sends, with retained messages labelled |
 
 ### MQTT log
 
@@ -647,6 +647,14 @@ on subscribes to two wildcards over the Home Assistant websocket (the
 - Direction is read off the topic: the command side (`/set`, `/command`,
   `/trigger`, `/get`) is *HA → device*, everything else on those trees is
   *device → HA*, and the `hoymiles/` family belongs to this end as well.
+- **Retained messages are labelled, not hidden.** A retained MQTT message lives
+  on the broker and is replayed the instant anything subscribes — so an offline
+  unit still "sends" one, and an earlier build stamped it with its *receipt*
+  time, making an offline device look like it had just reported. Such rows now
+  show `—` instead of a clock and carry a grey italic *retained · cached* badge
+  (with a tooltip). They are **annotated, not dropped**: the `attributes`
+  capability list only ever arrives retained, so filtering them would leave a
+  log full of blank payloads.
 - Every row shows the time, a direction badge, the topic with the boilerplate
   stripped (`sensor/quick/state`; the full topic is the tooltip) and the payload,
   pretty printed when it is JSON and truncated when it is long.
@@ -677,13 +685,6 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   not unique, and an explicit `entities:` pin always wins. If a row still shows
   obviously wrong bounds (e.g. *Output power* showing `0~132`), that pin is
   what is missing.
-- **The *Device read-back* row is the honest answer to "what is it doing".** The
-  card renders the values the device itself reports (`PV` / `PV1` / `PV2` /
-  `Grid` / `Load` / `EMS`) as a row of chips, all read-only. It exists because
-  `power_ctrl`, `output_power` and the power switch **all lack a state topic**, so
-  their entity states can only remember the last command sent from this Home
-  Assistant instance — never what the device is actually doing. The boxes above
-  are intent; this row is fact.
 - **The power switch shows "last sent", it never pretends to know the state.**
   The firmware does publish a `state_topic`, but its payload is a nested JSON
   document (`device/state`) that can never equal `ON` / `OFF`, so the
@@ -693,10 +694,12 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   command**, not the device answering — it resets to `unknown` on restart and
   cannot tell you whether the unit is running. The card therefore says *last
   sent: on / off (the device does not report its switch state)* or *nothing sent
-  yet — the device does not report its switch state, see the live read-back
-  below.* To check whether the unit is actually up, use the PV / grid / load
-  figures in the read-back row: **non-zero readings prove it is awake and
-  producing even while the switch row reads off.**
+  yet — the device does not report its switch state.* To check whether the unit
+  is actually up, use the power-flow card in the `device` view: **non-zero PV
+  power proves it is awake and producing even while the switch row reads off.**
+  (An earlier version added a *Device read-back* row here; it was removed — the
+  same numbers are larger and clearer in the `device` view's power-flow card,
+  and repeating them on the control page was just noise.)
 - **The card remembers the last values you sent, so a reload no longer needs a
   re-dial.** As said above, `power_ctrl`, `output_power` and the power switch
   have no usable state topic, so their entities read back as `unknown`. Seeding
@@ -735,8 +738,26 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   the device reports it, then keeps a tick visible for a moment.
 - MQTT topics are hidden by default because they are engineering detail that
   crowds out the content; enable `show_topics: true` when debugging.
+- **A blank box stays blank — it is never read as zero.** `Number("")` is `0` in
+  JavaScript and `Number.isFinite(0)` is `true`, so an earlier build rendered a
+  cleared or never-filled field as `0`, which looks like a real value; one stray
+  press of *Send* then published `output_power = 0` and the device obediently
+  stopped producing. Blankness is now detected **before** any coercion: the
+  number box is genuinely empty with a grey *not set* placeholder, the range
+  input parks at the low bound (a drawing position only, never read back as the
+  user's value), and `_draftNumber()` returns `null` for an empty or
+  whitespace-only draft. Every send path (power control, output power, phase
+  output, arming the timer) treats `null` as *invalid value* and publishes
+  nothing at all.
 - The **MQTT log** (see above) is a per-card switch, not a global one: it is off
   until you turn it on, and `show_log: false` removes the row entirely.
+- **The timer says nothing while it is on.** Its sub-line used to read
+  *"re-sending every 30 s · 12 sent · last 10:04:11"*, rewritten on every state
+  push — jitter, and enough height that it once pushed the sub-line out of the
+  clipped row entirely. With the timer running, the segment already reads *On*
+  and the box already shows the period, so restating it is noise. Only the two
+  states that need a word keep one: not armed (*switch EMS to mqtt_ctrl first*)
+  and failed (the integration's error, translated into a sentence you can act on).
 - **The re-send timer is not a browser timer.** An earlier version armed a
   `setTimeout` inside the card, which worked until you left the dashboard: the
   element was removed from the DOM, the timer died with it, and the device
