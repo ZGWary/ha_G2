@@ -55,6 +55,11 @@
  *                                 # unaffected.
  *   image: /local/photo.png       # optional product photo for that layout;
  *                                 # defaults to the HiFlow Pro 2-in-1 cut-out
+ *   pv_count: 2                   # optional; number of PV inputs drawn in
+ *                                 # the inverter layout (1 = single-input
+ *                                 # HiFlow, 2 = two-input HiFlow Pro). Omit to
+ *                                 # auto-detect: a live pv2 reading, else the
+ *                                 # device registry's model name decides.
  *   dim_when_idle: true           # optional; fade the photo when nothing flows
  *   entities:                     # optional entity id overrides, keyed by the
  *                                 # suffix the card looks up
@@ -242,10 +247,17 @@ function _hmPowerFlowRegister() {
    * reads as touching the unit because the artwork is flush with it.
    * ------------------------------------------------------------------ */
   const IV_W = 700;
-  const IV_H = 238;
-  const IV_NODE_ROW = 145;
+  /* Taller than the storage schematic on purpose: a two-input unit needs two
+     PV nodes stacked on the left, and they have to stay clear of each other
+     *and* of the product photo. */
+  const IV_H = 300;
+  const IV_NODE_ROW = 150;
   const IV_NODE_PV = { x: 68, y: IV_NODE_ROW };
   const IV_NODE_GRID = { x: 632, y: IV_NODE_ROW };
+  /* Half the distance between the two PV nodes of a 一拖二 unit: 45 px keeps
+     both 34 px rings, their two text lines and a readable gap inside the
+     photo's own 140 px height. */
+  const IV_PV_GAP = 45;
   const IV_IMG_W = 300;                        // 360x168 scaled to 300x140
   const IV_IMG_H = IV_IMG_W * (168 / 360);
   const IV_CENTER_X = IV_W / 2;
@@ -256,12 +268,18 @@ function _hmPowerFlowRegister() {
   const IV_IMG_R = IV_CENTER_X + IV_IMG_W / 2;
   /* Both connectors are written from their node towards the unit, so
      `reverse` means "the energy runs from the unit out to this side" - see
-     the direction table in `_svgInverter`. */
-  const IV_PV_ROUTE = `M${IV_NODE_PV.x + NODE_R} ${IV_NODE_PV.y} H${IV_IMG_L}`;
+     the direction table in `_svgInverter`.  The PV connectors are per node
+     (their Y varies with the node count), so only the grid one is a constant. */
   const IV_GRID_ROUTE = `M${IV_NODE_GRID.x - NODE_R} ${IV_NODE_GRID.y} H${IV_IMG_R}`;
   /* Served by the integration itself (see const.FRONTEND_IMAGES), so no
      dashboard has to register an image resource by hand. */
   const IV_IMAGE = "/hoymiles_g2_static/hiflow-pro-2in1.png";
+
+  /** Y coordinate of the n-th (0 based) PV node in a multi-input layout. */
+  function ivPvY(index, count) {
+    if (count <= 1) return IV_NODE_ROW;
+    return IV_NODE_ROW + (index - (count - 1) / 2) * (IV_PV_GAP * 2);
+  }
 
   /* Node artwork, baked straight out of the vendor app's icon set (see
      _preview/bake-icons.py).  Every branch has two variants: the coloured one
@@ -911,6 +929,12 @@ function _hmPowerFlowRegister() {
            `image` must rebuild the SVG. */
         this._isMicroInverter() ? "inv" : "sys",
         this._config.image, this._config.dim_when_idle,
+        /* How many PV inputs the unit has decides how many nodes are drawn,
+           and it is resolved from the readings / the device registry rather
+           than from a config field alone - so it has to be part of the key or a
+           unit that starts reporting its second input keeps the old single-node
+           layout forever. */
+        this._pvCount(),
         this._temperature(),
         /* Readings are compared at the precision the card prints them with.
            They wiggle in their last digit every second, and rebuilding the
@@ -920,6 +944,9 @@ function _hmPowerFlowRegister() {
            of the key: otherwise a branch could stay grey at exactly MIN_FLOW. */
         wkey(d.pv), wkey(d.pv2), wkey(d.grid), wkey(d.load), wkey(d.smartPlug),
         wkey(d.battery),
+        /* The micro-inverter layout prints the per-port readings, not the
+           system totals, so they are part of the key as well. */
+        wkey(d.pvPort1), wkey(d.pvPort2),
         d.soc === null || d.soc === undefined ? "x" : num(d.soc).toFixed(2),
         d.status, d.rssi, d.packs,
       ].join("\u0001");
@@ -1158,9 +1185,28 @@ function _hmPowerFlowRegister() {
       // node is left out.
       const pv = this._read("system_pv_power", null);
       const pv2 = this._read("system_pv2_power", null);
-      const grid = this._read("system_grid_power", null);
+      /* The micro-inverter layout labels one node per *physical* PV input, so
+         it needs the per-port readings (`pvs[]`), not the system totals: pv1 is
+         the unit's own first input and pv2 its second.  They are `null` on a
+         one-input unit, which is exactly what decides how many nodes to draw. */
+      const pvPort1 = this._read("pv1_power", null);
+      const pvPort2 = this._read("pv2_power", null);
       const load = this._read("system_load_power", null);
       const smartPlug = this._read("system_smart_plug_power", null);
+
+      /* 并网端口. `system_grid_power` is the system level reading and the one
+         the caption belongs to; `grid_on_power` is the device's own on-grid
+         port and is used as a fallback so a unit that only reports the latter
+         still gets a number.  Either may be missing entirely (the device has
+         not published yet), and then the node is still drawn without a value -
+         see `_inverterNodes`.
+         NOTE: `grid_on_p` uses the opposite sign (negative = drawing from the
+         grid), so it is negated to keep one convention in the drawing. */
+      let grid = this._read("system_grid_power", null);
+      if (grid === null) {
+        const onGrid = this._read("grid_on_power", null);
+        if (onGrid !== null) grid = -onGrid;
+      }
 
       // Battery is the one node without a `sys_` counterpart at the system
       // level, so it keeps the usual system → device fallback. A pure micro
@@ -1196,9 +1242,61 @@ function _hmPowerFlowRegister() {
       packs = Math.max(1, Math.min(declared > 0 ? declared : packs, STACK_MAX_PACKS));
 
       return {
-        pv, pv2, grid, load, smartPlug, battery, soc,
+        pv, pv2, pvPort1, pvPort2, grid, load, smartPlug, battery, soc,
         status: status.toLowerCase(), rssi, packs,
       };
+    }
+
+    /**
+     * How many PV inputs the micro inverter has: 1 (一拖一) or 2 (一拖二).
+     *
+     * Resolved in this order, first hit wins:
+     *
+     *  1. `pv_count: 1|2` in the card config - explicit, always wins, and the
+     *     only way to force it when every entity is still `unknown`.
+     *  2. A LIVE `pv2_power` / `system_pv2_power` reading.  Both RMI models
+     *     *create* the `pv2_*` entities (the description table is shared), so
+     *     existence proves nothing; a value does.  `unknown` / `unavailable`
+     *     means the unit never published a second input.
+     *  3. The model name from the device registry - `HiFlow Pro` is the
+     *     two-input unit, `HiFlow` the single-input one.  The G2 integration's
+     *     own device entry has `model: null`, so the parallel `mqtt` device
+     *     (same serial, no `RMI-` prefix) is the one that carries it.
+     *
+     * Falls back to 1, so a unit with nothing reported draws the simpler
+     * single-input layout instead of inventing a second connector.
+     */
+    _pvCount() {
+      const forced = Number(this._config && this._config.pv_count);
+      if (forced === 1 || forced === 2) return forced;
+
+      if (this._stateOf("pv2_power") || this._stateOf("system_pv2_power")) return 2;
+
+      const model = this._deviceModel();
+      if (/pro/i.test(model)) return 2;
+      if (/hiflow/i.test(model)) return 1;
+      return 1;
+    }
+
+    /** Model string of this device, from whichever registry entry has one. */
+    _deviceModel() {
+      const devices = (this._hass && this._hass.devices) || null;
+      if (!devices) return "";
+      const dev = this._dev();
+      const bare = dev.replace(/[^A-Za-z0-9]/g, "");
+      let found = "";
+      for (const entry of Object.values(devices)) {
+        if (!entry) continue;
+        const ids = (entry.identifiers || []).map((pair) => String((pair && pair[1]) || ""));
+        const names = [entry.name, entry.model_by, entry.default_name]
+          .filter(Boolean).map(String);
+        const matches = ids.some((id) => id === dev || id === bare)
+          || names.some((n) => n.replace(/[^A-Za-z0-9]/g, "") === bare);
+        if (!matches) continue;
+        if (entry.model) return String(entry.model);
+        found = found || "";
+      }
+      return found;
     }
 
     /* ----------------------------- render ----------------------------- */
@@ -1338,26 +1436,50 @@ function _hmPowerFlowRegister() {
      */
     _svgInverter(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
+      const pvCount = this._pvCount();
+      const pvNodes = [];
+      for (let i = 0; i < pvCount; i += 1) {
+        const y = ivPvY(i, pvCount);
+        // Port 1 is the unit's own first input, port 2 the third-party input on
+        // a 一拖二 unit.  A single-input unit still draws one node on port 1.
+        const power = i === 0 ? d.pvPort1 : d.pvPort2;
+        pvNodes.push({
+          id: `pv${i + 1}`,
+          x: IV_NODE_PV.x,
+          y,
+          power,
+          route: `M${IV_NODE_PV.x + NODE_R} ${y} H${IV_IMG_L}`,
+        });
+      }
 
-      const routes = [
-        { id: "pv", d: IV_PV_ROUTE, power: d.pv, color: COLORS.pv,
-          reverse: num(d.pv) < 0 },
-      ];
-      if (present(d.grid)) {
+      const routes = pvNodes.map((n) => ({
+        id: n.id, d: n.route, power: n.power, color: COLORS.pv,
+        reverse: num(n.power) < 0,
+      }));
+      /* The grid port is always drawn: a reading of 0 W is meaningful (the
+         unit is idle, not absent), and dropping the node left the right half of
+         the drawing empty with no explanation.  Only a genuinely missing value
+         makes it show a dash, and never removes it. */
+      {
         /* Importing is the mirrored case: the connector is written from the
            node towards the unit, so a *forward* run already means "into the
            unit".  Exporting therefore reverses it. */
-        routes.push({ id: "grid", d: IV_GRID_ROUTE, power: d.grid,
-          color: num(d.grid) < 0 ? COLORS.grid_out : COLORS.grid,
-          reverse: num(d.grid) < 0 });
+        const g = present(d.grid) ? num(d.grid) : 0;
+        routes.push({
+          id: "grid", d: IV_GRID_ROUTE, power: present(d.grid) ? d.grid : null,
+          color: g < 0 ? COLORS.grid_out : COLORS.grid,
+          reverse: g < 0,
+        });
       }
 
       const edges = routes.map((r) => `
         <path class="pf-edge" d="${r.d}" fill="none"
               vector-effect="non-scaling-stroke"/>`).join("");
-      const dots = routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("");
+      const dots = present(d.grid) || pvNodes.some((n) => present(n.power))
+        ? routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("")
+        : "";
 
-      const busy = [d.pv, d.grid]
+      const busy = [d.pvPort1, d.pvPort2, d.grid]
         .some((v) => present(v) && Math.abs(num(v)) >= MIN_FLOW);
 
       return `<svg viewBox="0 0 ${IV_W} ${IV_H}" preserveAspectRatio="xMidYMid meet"
@@ -1371,7 +1493,7 @@ function _hmPowerFlowRegister() {
         ${edges}
         ${dots}
         ${this._unitImage(busy)}
-        ${this._inverterNodes(d, { grid: present(d.grid) })}
+        ${this._inverterNodes(d, { pv: pvNodes, grid: true })}
       </svg>`;
     }
 
@@ -1387,33 +1509,48 @@ function _hmPowerFlowRegister() {
                     href="${esc(art)}"/>`;
     }
 
-    /** The two nodes of the micro-inverter layout. */
+    /**
+     * The nodes of the micro-inverter layout: one per PV input on the left, the
+     * 并网端口 on the right.
+     *
+     * The PV captions are `PV1` / `PV2` - the same wording the vendor app and
+     * the firmware's own port table use - because these are physical inputs on
+     * the unit, not the system level 光伏1 / 光伏2 aggregates of the storage
+     * schematic (`_nodes`).
+     */
     _inverterNodes(d, opts) {
       const t = (en, zh) => this._t(en, zh);
-      const working = (v) => Math.abs(num(v)) >= MIN_FLOW;
+      const working = (v) => v !== null && v !== undefined
+        && Math.abs(num(v)) >= MIN_FLOW;
       const parts = [];
+      /* A missing reading prints a dash instead of "0.0 W": the difference
+         between "the port is idle" and "the port has not reported yet" matters
+         while commissioning a unit. */
+      const reading = (v) => (v === null || v === undefined ? "—" : fmtW(v));
 
-      const node = (x, y, icon, on, value, caption, anchor, tx) => {
+      const node = (x, y, icon, on, value, caption) => {
         const art = PF_ICONS[`${icon}.${on ? "on" : "off"}`] || "";
         parts.push(`<g class="pf-node" transform="translate(${x} ${y})">
             <image class="pf-ic" x="${-NODE_R}" y="${-NODE_R}"
                    width="${NODE_R * 2}" height="${NODE_R * 2}"
                    clip-path="url(#${NODE_CLIP_ID})" href="${art}"/>
-            <text class="pf-v" x="${tx}" y="${NODE_R + 26}"
-                  text-anchor="${anchor}">${value}</text>
-            <text class="pf-c" x="${tx}" y="${NODE_R + 46}"
-                  text-anchor="${anchor}">${esc(caption)}</text>
+            <text class="pf-v" x="0" y="${NODE_R + 26}"
+                  text-anchor="middle">${value}</text>
+            <text class="pf-c" x="0" y="${NODE_R + 46}"
+                  text-anchor="middle">${esc(caption)}</text>
           </g>`);
       };
 
-      node(IV_NODE_PV.x, IV_NODE_PV.y, "pv", working(d.pv),
-        fmtW(d.pv), t("PV", "光伏"), "middle", 0);
+      for (const n of opts.pv) {
+        node(n.x, n.y, "pv", working(n.power), reading(n.power),
+          t(`PV${n.id.slice(2)}`, `PV${n.id.slice(2)}`));
+      }
       if (opts.grid) {
         /* No 电网输入 / 电网输出 wording here: the number is absolute and the
            direction is already drawn by the pearls, so a caption that moved
            with the sign would contradict it. */
         node(IV_NODE_GRID.x, IV_NODE_GRID.y, "grid", working(d.grid),
-          fmtW(d.grid), t("Grid port", "并网端口"), "middle", 0);
+          reading(d.grid), t("Grid port", "并网端口"));
       }
 
       return parts.join("");
@@ -1717,6 +1854,10 @@ function _hmPowerFlowRegister() {
           <ha-textfield
             label="variant (auto|inverter - 'inverter' draws the HiFlow PV + grid port layout)"
             .value=${config.variant || ""} @change=${this._changed("variant")}></ha-textfield>
+          <ha-textfield
+            label="pv_count (1|2 - PV inputs of a micro inverter, empty = auto)"
+            .value=${config.pv_count === undefined ? "" : String(config.pv_count)}
+            @change=${this._changed("pv_count")}></ha-textfield>
           <ha-textfield
             label="image (product photo URL, default the HiFlow Pro 2-in-1)"
             .value=${config.image || ""} @change=${this._changed("image")}></ha-textfield>

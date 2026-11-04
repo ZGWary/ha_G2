@@ -200,6 +200,9 @@ language: zh
 | `max_width` | number (px) | `620` | Maximum width of the illustration; it stays centred. |
 | `flow_speed` | number | `1` | Speed multiplier for the moving pearls. `0.5` is calmer, `2` is faster. |
 | `variant` | `inverter` | — | Set to `inverter` for the **micro-inverter layout** (see below). Empty keeps the four-branch storage schematic. |
+| `image` | URL | HiFlow Pro 2-in-1 product photo | Product photo in the middle of the micro-inverter layout; needs a transparent-backed crop. |
+| `pv_count` | number | *auto* | DC inputs to draw in the micro-inverter layout: `1` gives a single `PV1`, `2` gives `PV1` + `PV2`. Omit to infer (see below). |
+| `dim_when_idle` | bool | `true` | In the micro-inverter layout, fade the photo to 55 % when nothing is flowing. |
 | `image` | URL | HiFlow Pro 2-in-1 photo | Product photo drawn in the middle of the micro-inverter layout; must be a transparent cut-out. |
 | `dim_when_idle` | bool | `true` | In the micro-inverter layout the photo fades to 55 % when nothing flows. `false` keeps it fully opaque. |
 | `entities` | map | — | Entity overrides, keyed by suffix (see below). |
@@ -281,28 +284,43 @@ carrying no power gets a grey ring — never a *standby* chip.
 
 A HiFlow is a grid-tied micro inverter with no battery and no off-grid port, so
 the four-branch schematic spends half its area on branches the hardware does
-not have. With `variant: inverter` the card draws only the two ends it really
-has:
+not have. With `variant: inverter` the card draws only the ends it really has:
 
 ```
-⬜ PV ────────── ▣ HiFlow Pro 2-in-1 ────────── ⬜ Grid port
+⬜ PV1 ────────── ▣ HiFlow Pro 2-in-1 ────────── ⬜ Grid port
+⬜ PV2 ──────────╯
 ```
 
 ```yaml
 - type: custom:hoymiles-g2-power-flow
   dev_id: RMI-4161A0209FF6
   variant: inverter
+  image: /hoymiles_g2_static/hiflow-pro-2in1.png
+  pv_count: 2                 # 2-in-1: PV1 + PV2. Set 1 for a single-input unit.
   title: My home
   show_title: false
   max_width: 700
 ```
 
-- The **grid port shows an absolute value** with a fixed `Grid port` caption, so
+- **`pv_count` decides how many DC inputs are drawn, and it is inferred when
+  omitted.** A HiFlow Pro 2-in-1 has two PV ports, a plain HiFlow has one, and
+  getting it wrong does not merely omit a line — it adds a node that can never
+  show a reading. Resolution order: explicit `pv_count` → a live `pv2_power` /
+  `system_pv2_power` → the model name (contains `Pro` ⇒ 2, contains `HiFlow`
+  ⇒ 1) → 1. If your unit is misclassified, set `pv_count`; no code change needed.
+- **`PV1` / `PV2` are the unit's own DC inputs**, not third-party modules.
+  Third-party PV feeding the system is folded into the `system_pv_power` total
+  and deliberately does **not** become a `PV3` node — the inverter only has two
+  physical inputs.
+- The **grid port always shows an absolute value** with a fixed `Grid port` caption, so
 the number never flips sign. Direction is carried by the moving pearls and the
 connector colour instead: `> 0` is importing (pearls run towards the unit, blue
-line), `< 0` is exporting (pearls run towards the grid, amber line).
+line), `< 0` is exporting (pearls run towards the grid, amber line). The grid
+node is **always drawn**, even at 0 W or with no reading (`—`), because "no grid
+reading" and "0 W on the grid" are entirely different facts.
 - The middle is the real product photo (replace it with `image`), centred on the
-node row so both connectors meet the unit's own sides.
+node row so both connectors meet the unit's own sides. Match the photo to the
+model too: `hiflow-pro-2in1.png` for the 2-in-1, `hiflow.png` for the single.
 - Below `|P| = 5 W` the photo fades to 55 %; `dim_when_idle: false` disables it.
 - No battery, load, smart-plug or off-grid node — the micro inverter has no such
 topics.
@@ -591,7 +609,7 @@ title: 设备控制
 | Device on/off | `switch/<dev_id>/set` | `ON` / `OFF` |
 | EMS mode | `select/<dev_id>/ems_mode/command` | `general` / `mqtt_ctrl` / `tou_plan`; unsupported options are greyed out |
 | Power control | `number/<dev_id>/power_ctrl/set` | Only effective in `mqtt_ctrl` mode, and it is a *lease*: the device drops it after ~60 s and falls back to `output_power`. Use the *Re-send timer* row to hold it. |
-| Re-send timer | the integration re-sends `number/<dev_id>/power_ctrl/set` every N s | Off by default. On, it publishes the current power-control value on a period (5–3600 s, default 30 s) so the lease never lapses. **The beat runs inside Home Assistant, not in the browser** - navigating away, reloading, closing the tab, or closing the browser entirely does not stop it. The card is only a remote control for that background beat and reads its state back from `sensor.<dev_id>_power_control_keep_alive`. Stops when switched off or when the EMS mode leaves `mqtt_ctrl`; it also stops itself after 5 consecutive publish errors and records the reason. Disabled outside `mqtt_ctrl`. |
+| Re-send timer | the integration re-sends `number/<dev_id>/power_ctrl/set` every N s | Off by default. On, it publishes the current power-control value on a period (5–60 s in the card, default 30 s) so the lease never lapses. **The beat runs inside Home Assistant, not in the browser** - navigating away, reloading, closing the tab, or closing the browser entirely does not stop it. The card is only a remote control for that background beat and reads its state back from `sensor.<dev_id>_power_control_keep_alive`. Stops when switched off or when the EMS mode leaves `mqtt_ctrl`; it also stops itself after 5 consecutive publish errors and records the reason. Disabled outside `mqtt_ctrl`. **The 60 s ceiling is enforced by the card only; the backend service still accepts 5–3600 s** so existing automations keep working. |
 | Output power | `number/<dev_id>/output_power/set` | Full-load output ceiling (W) |
 | Per-phase output power | `number/<dev_id>/phase_output_power/set` | Sent as `{"phase_a":..,"phase_b":..,"phase_c":..}` |
 | Fetch TOU plan | `sensor/<dev_id>/tou_plan/get` | The reply is published on `tou_plan/status` |
@@ -627,15 +645,41 @@ on subscribes to two wildcards over the Home Assistant websocket (the
 
 - Range hints such as `-1000 ~ 1000 W` prefer the entity's `min` / `max`
   attributes, falling back to protocol defaults.
-- **A device with more than one `number` entity must be pinned with
-  `entities:`.** `power_ctrl` and `output_power` are sibling `number` entities
-  and either can end up as `number.<dev>` or `number.<dev>_2` — *which is which
-  varies per device* (measured: on FF6 `_2` is `power_ctrl`, on FC22 it is the
-  other way round). The frontend is given no `unique_id`, so every heuristic
-  after the explicit `entities:` pin skips entities already claimed by another
-  key; anything still ambiguous is assigned in `power_ctrl` → `output_power` →
-  `phase_output_power` order. If a row shows obviously wrong bounds (e.g.
-  *Power control* showing `100~800`), this pinning is what is missing.
+- **Pin `entities:` when a device has several `number` entities — but the card
+  now gets it right unpinned too.** `power_ctrl` and `output_power` are sibling
+  `number` entities and either can end up as `number.<dev>` or
+  `number.<dev>_2`. *Which is which varies per firmware*: measured, FF6
+  (2-in-1) uses `_2` for `power_ctrl`, FC22 (single-input) is the other way
+  round, and a storage unit puts `power_ctrl` on the base entity. So the suffix
+  order is **not** a reliable signal. What *is* stable is the range each entity
+  declares: `power_ctrl` has a floor at or below zero (it can curtail to
+  nothing, and a storage unit also charges / exports negative), while
+  `output_power` starts at the hardware minimum, 100 W on every model measured.
+  The card therefore tests `min` first (`min <= 0` ⇒ `power_ctrl`, `min > 0` ⇒
+  `output_power`), falls back to the suffix order only when the candidates are
+  not unique, and an explicit `entities:` pin always wins. If a row still shows
+  obviously wrong bounds (e.g. *Output power* showing `0~132`), that pin is
+  what is missing.
+- **The *Device read-back* row is the honest answer to "what is it doing".** The
+  card renders the values the device itself reports (`PV` / `PV1` / `PV2` /
+  `Grid` / `Load` / `EMS`) as a row of chips, all read-only. It exists because
+  `power_ctrl`, `output_power` and the power switch **all lack a state topic**, so
+  their entity states can only remember the last command sent from this Home
+  Assistant instance — never what the device is actually doing. The boxes above
+  are intent; this row is fact.
+- **The power switch shows "last sent", it never pretends to know the state.**
+  The firmware does publish a `state_topic`, but its payload is a nested JSON
+  document (`device/state`) that can never equal `ON` / `OFF`, so the
+  integration's discovery override deliberately strips it
+  (`discovery_override.py`, `_patch_switch`) and the entity becomes optimistic.
+  Consequence: the `ON` / `OFF` it shows is **Home Assistant remembering its own
+  command**, not the device answering — it resets to `unknown` on restart and
+  cannot tell you whether the unit is running. The card therefore says *last
+  sent: on / off (the device does not report its switch state)* or *nothing sent
+  yet — the device does not report its switch state, see the live read-back
+  below.* To check whether the unit is actually up, use the PV / grid / load
+  figures in the read-back row: **non-zero readings prove it is awake and
+  producing even while the switch row reads off.**
 - The layout follows the iOS settings idiom: rounded groups, small grey section
   headers (**Power & mode / Power settings / Plan & maintenance**), rows of
   icon + name + right-aligned control, and hairlines that stop short of the card
@@ -656,6 +700,14 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   worth knowing: two browsers cannot fight over it (there is one beat per
   device), and the row is honest right after a reload because it reads the
   entity's attributes rather than a local flag.
+- **The re-send period is capped at 60 s by the card.** The input declares
+  `min=5 max=60`, and anything above 60 — or unparsable, zero or negative — is
+  clamped: `120 → 60`, `9999 → 60`, blank → 30, `0 → 30`. The clamped value is
+  then **written back into the field**, because otherwise typing 120 into a box
+  already reading 60 would leave 120 on screen while only 60 was in effect,
+  making the ceiling look broken. **The backend service still accepts 5–3600 s**
+  (`services.py`, `vol.Range(min=5,max=3600)`); that is deliberate, so existing
+  automations keep working — the ceiling is enforced only in this card's UI.
 - **"Switch EMS to mqtt_ctrl first" can appear while the EMS row still reads
   `mqtt_ctrl`.** The select's state topic is a retained value that the firmware
   only refreshes on its own slow schedule, so it can lag behind the mode the

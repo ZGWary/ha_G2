@@ -109,7 +109,12 @@ function _hmControlRegister() {
 
   /* Order in which the firmware publishes its `number` discovery configs. HA
    * decorates the duplicate entity ids with `_2`, `_3`, ... so this order is
-   * what maps `number.<dev>_2` back to `output_power`. */
+   * what maps `number.<dev>_2` back to a protocol key.
+   *
+   * Measured, the order is NOT stable across firmware: `power_ctrl` is the base
+   * entity on a storage unit and on a single-input HiFlow, but `_2` on a
+   * two-input HiFlow Pro. `_resolve()` therefore tests the declared `min` first
+   * and only falls back to this index, so treat this as a last resort. */
   const NUMBER_ORDER = ["power_ctrl", "output_power", "phase_output_power"];
 
   /* Domains where the firmware publishes exactly one entity, so "the only one on
@@ -134,7 +139,12 @@ function _hmControlRegister() {
    * page changes nothing.
    */
   const TIMER_MIN_S = 5;
-  const TIMER_MAX_S = 3600;
+  /* 60 s is both the ceiling and the reason the timer exists: the firmware only
+     holds a `power_ctrl` value for about a minute (`TIMER_LEASE_S`), so a longer
+     period leaves the tail of every cycle uncontrolled. Asking for more is
+     therefore meaningless, and the input clamps it back to 60 instead of
+     accepting a value the device cannot honour. */
+  const TIMER_MAX_S = 60;
   const TIMER_DEFAULT_S = 30;
   const TIMER_LEASE_S = 60; // the firmware's own hold time, for the hint text
 
@@ -435,6 +445,23 @@ function _hmControlRegister() {
                  white-space: nowrap; }
         .state.live { color: var(--primary-color); font-weight: 500; }
 
+        /* Device read-back chips: label + value pairs, wrapped so a narrow
+           column stacks them instead of clipping the last one. */
+        .chip {
+          display: inline-flex; align-items: baseline; gap: 5px;
+          font-size: 13px; line-height: 1.6;
+          padding: 2px 9px; border-radius: 999px;
+          font-variant-numeric: tabular-nums;
+          background: var(--secondary-background-color, rgba(120,120,128,.14));
+          color: var(--primary-text-color);
+        }
+        .chip b { font-size: 11px; font-weight: 500; letter-spacing: .02em;
+                  color: var(--secondary-text-color); text-transform: uppercase; }
+        .chip.pv { background: rgba(34,197,94,.16); }
+        .chip.grid { background: rgba(34,211,238,.16); }
+        .chip.load { background: rgba(245,166,35,.16); }
+        .chip.mode { background: rgba(120,120,128,.22); }
+
         /* MQTT log. It sits inside the "Plan & maintenance" group, directly
            under its own row, and grows downwards - the panel itself is the
            scroll container so the card never jumps. */
@@ -655,9 +682,20 @@ function _hmControlRegister() {
       // phase_output_power) but HA names all three after the device, so their
       // entity ids collapse to `number.<dev>`, `number.<dev>_2`, `_3 ...` and
       // neither the friendly name nor the registry snapshot distinguishes them
-      // (HA does not expose unique_id to the frontend). They are published in a
-      // fixed order, so fall back to the index. `entities` in the card config
-      // overrides this when a deployment ever differs.
+      // (HA does not expose unique_id to the frontend).
+      //
+      // The duplicate suffix order is *not* stable across firmware: measured,
+      // `power_ctrl` is the base entity on a storage unit (min -2500, step 0.1)
+      // and on a single-input HiFlow (min 0, cap 132), but `_2` on a two-input
+      // HiFlow Pro (min 0, step 0.1) - whose base is `output_power` (min 100).
+      // So a fixed index picks the wrong entity on two of the three models.
+      //
+      // What *is* stable is the declared range: the firmware gives `power_ctrl`
+      // a floor at or below zero (it can curtail to nothing, and on a storage
+      // unit also charge/export negative), while `output_power` starts at the
+      // hardware minimum, 100 W on every model measured. Resolve by bounds when
+      // exactly one candidate fits and only fall back to the index otherwise.
+      // `entities` in the card config overrides all of this.
       if (!found && domain === "number") {
         const index = NUMBER_ORDER.indexOf(key);
         if (index >= 0) {
@@ -676,7 +714,31 @@ function _hmControlRegister() {
             return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
           };
           numbered.sort((a, b) => order(a) - order(b));
-          if (numbered[index]) found = numbered[index];
+
+          const declaredMin = (entityId) => {
+            const state = hass.states[entityId];
+            const value = state && state.attributes ? state.attributes.min : null;
+            return value == null ? null : num(value);
+          };
+          let picked = null;
+          if (key === "power_ctrl") {
+            // `min <= 0` is `power_ctrl` and nothing else.
+            const zeroFloor = numbered.filter((entityId) => {
+              const lo = declaredMin(entityId);
+              return lo != null && Number.isFinite(lo) && lo <= 0;
+            });
+            if (zeroFloor.length === 1) [picked] = zeroFloor;
+          } else if (key === "output_power") {
+            // `min > 0` narrows it down to the rated-output entities, which at
+            // least removes `power_ctrl` from the pool.
+            const ratedFloor = numbered.filter((entityId) => {
+              const lo = declaredMin(entityId);
+              return lo != null && Number.isFinite(lo) && lo > 0;
+            });
+            if (ratedFloor.length === 1) [picked] = ratedFloor;
+          }
+          if (!picked && numbered[index]) picked = numbered[index];
+          if (picked) found = picked;
         }
       }
 
@@ -941,10 +1003,18 @@ function _hmControlRegister() {
       }
     }
 
-    /** { on, pending, justConfirmed } for the switch row. */
+    /** { on, pending, justConfirmed, optimistic, commanded } for the switch row. */
     _switchView() {
       const target = this._switchTarget();
-      if (target) return { on: target === "on", pending: target, confirmed: false };
+      /* `optimistic` and `commanded` travel with the view because the row has to
+         word itself differently in the two cases: "已休眠" is a claim about the
+         device, and for an optimistic entity nothing about the device is known. */
+      if (target) {
+        return {
+          on: target === "on", pending: target, confirmed: false,
+          optimistic: this._switchOptimistic(), commanded: true,
+        };
+      }
       const real = this._switchReal();
       /* A command issued from this card is authoritative for an optimistic
          entity: HA only remembers the commands it sent itself, so waiting for
@@ -961,11 +1031,144 @@ function _hmControlRegister() {
       const justConfirmed = this._switchConfirmedAt > 0
         && this._now() - this._switchConfirmedAt < SWITCH_CONFIRM_MS;
       if (!justConfirmed) this._switchConfirmedAt = 0;
-      return { on, pending: null, confirmed: justConfirmed };
+      return {
+        on, pending: null, confirmed: justConfirmed,
+        optimistic: this._switchOptimistic(), commanded,
+      };
     }
 
     _isSwitchOn() {
       return this._switchView().on;
+    }
+
+    /* --------------------------- device read-back --------------------------- */
+
+    /**
+     * The device's own numbers, as opposed to what this card last commanded.
+     *
+     * This distinction is the whole reason the read-back row exists. Two of the
+     * controls above are write-only by design:
+     *
+     * * `power_ctrl` and `output_power` publish to a `command_topic` and the
+     *   firmware declares no `state_topic` for either, so Home Assistant's value
+     *   is nothing but a memory of the last command *this* Home Assistant sent
+     *   (the entities are `assumed_state` and read `unknown` after a restart).
+     * * `switch/<dev_id>` is the same: ON wakes the unit, OFF puts it to sleep,
+     *   and nothing readable comes back.
+     *
+     * The sensors below, by contrast, are decoded from the device's own
+     * `device/state` / `system/state` payloads, so they are the honest answer to
+     * "what is it doing right now". They are read-only here - just displayed.
+     *
+     * `pv1_power` / `pv2_power` describe the PV ports, so they are summed for the
+     * production figure; the storage models that report `sys_pv_p` answer through
+     * `system_pv_power` instead, and whichever of the two exists is used.
+     */
+    _readback() {
+      const read = (key, domain = "sensor") => {
+        const state = this._state(key, domain);
+        if (!state) return null;
+        const value = num(state.state);
+        const unit = (state.attributes && state.attributes.unit_of_measurement) || "";
+        const ok = state.state !== "unknown" && state.state !== "unavailable"
+          && Number.isFinite(value);
+        return ok ? { value, unit, text: `${value}${unit ? ` ${unit}` : ""}` } : null;
+      };
+
+      /* A word, not a number: the EMS mode entity state is `general` /
+         `mqtt_ctrl` / ..., and `num()` turns that into `0`. Text states are
+         therefore read raw instead of through `read()`. */
+      const readText = (key, domain = "sensor") => {
+        const state = this._state(key, domain);
+        if (!state) return null;
+        const text = String(state.state).trim();
+        return text && text !== "unknown" && text !== "unavailable" ? text : null;
+      };
+
+      const pv1 = read("pv1_power");
+      const pv2 = read("pv2_power");
+      let pvTotal = null;
+      if (pv1 || pv2) {
+        // Summed here rather than read from an entity, so it has no state of its
+        // own to copy - the `text` field is what `_readChip()` prints.
+        const value = (pv1 ? pv1.value : 0) + (pv2 ? pv2.value : 0);
+        pvTotal = { value, unit: "W", text: `${value} W` };
+      } else {
+        pvTotal = read("system_pv_power");
+      }
+      const grid = read("system_grid_power") || read("grid_on_power");
+      const load = read("system_load_power") || read("system_plug_power");
+
+      /* The mode the device itself reports. `select.*_mqtt_select` is the value
+         Home Assistant last wrote (the integration keeps it retained precisely
+         because the firmware has no state topic for it), so it is shown next to
+         the device's own reading rather than instead of it.
+         The sensor's protocol key is `ems_mode_running` but its entity is named
+         "EMS Mode (Device)", so the id is matched through `_state_regex`-free
+         candidate lookup: `ems_mode_device` is what the slug actually produces. */
+      const deviceMode = readText("ems_mode_running") || readText("ems_mode_device");
+      const selectMode = this._emsMode();
+
+      return { pv1, pv2, pvTotal, grid, load, deviceMode, selectMode };
+    }
+
+    /** One "label: value" fragment, dropped when the device reports nothing. */
+    _readChip(label, item, cls = "") {
+      if (!item) return "";
+      const text = typeof item === "object" && item.text ? item.text : item;
+      return html`<span class="chip ${cls}"><b>${label}</b>${text}</span>`;
+    }
+
+    /**
+     * Read-back of the device's real measurement, plus the honest status of the
+     * two write-only controls.
+     *
+     * The user-facing question this answers is "did my command take effect, and
+     * what is the unit doing?" - which the entity states of `power_ctrl`,
+     * `output_power` and the power switch cannot answer, since none of the three
+     * has a state topic. The PV / grid / load figures do come from the device,
+     * so they double as proof that it is awake and producing even while the
+     * switch entity says OFF.
+     */
+    _readbackItem() {
+      const rb = this._readback();
+      /* The device's own mode wins; the select is the fallback because its state
+         is the integration's retained echo. Either way only the text is shown,
+         so both shapes are collapsed to a string here. */
+      const modeSource = rb.deviceMode || rb.selectMode;
+      const modeText = modeSource
+        ? String(typeof modeSource === "object" ? modeSource.text : modeSource)
+        : "";
+      const nothing = !rb.pvTotal && !rb.grid && !rb.load && !modeText;
+
+      const sub = nothing
+        ? this._t(
+          "The device reports no measurement yet.",
+          "设备尚未上报任何测量值。",
+        )
+        : this._t(
+          "Live values decoded from the device's own state messages. "
+            + "Power control and output power have no state topic, so their "
+            + "boxes above only remember the last command.",
+          "以下数值来自设备自身上报的状态消息。功率控制与输出功率没有状态话题，"
+            + "上方输入框只代表本机最后一次下发的值。",
+        );
+
+      return this._item({
+        icon: "📊",
+        name: this._t("Device read-back", "设备回读"),
+        sub,
+        stack: true,
+        ctrl: nothing ? html`<span class="state">—</span>` : html`
+          ${this._readChip(this._t("PV", "光伏"), rb.pvTotal, "pv")}
+          ${this._readChip("PV1", rb.pv1)}
+          ${this._readChip("PV2", rb.pv2)}
+          ${this._readChip(this._t("Grid", "并网"), rb.grid, "grid")}
+          ${this._readChip(this._t("Load", "负载"), rb.load, "load")}
+          ${modeText
+            ? html`<span class="chip mode"><b>${this._t("EMS", "EMS")}</b>${modeText}</span>`
+            : ""}`,
+      });
     }
 
     _setEmsMode(mode) {
@@ -1185,8 +1388,19 @@ function _hmControlRegister() {
       return text;
     }
 
-    async _setTimerPeriod(raw) {
-      this._timerPeriod = String(this._clampPeriod(raw));
+    async _setTimerPeriod(raw, input) {
+      const clamped = this._clampPeriod(raw);
+      this._timerPeriod = String(clamped);
+      /* Write the clamped value back to the field by hand.
+       *
+       * Lit only rewrites a bound property when the *previous committed value*
+       * differs, so typing 120 into a field already holding 60 leaves "120" on
+       * screen after the clamp - the value silently became 60 while the box
+       * kept showing the rejected number. Overwriting here is what makes the
+       * 60 s ceiling visible instead of merely effective. */
+      if (input && String(input.value) !== String(clamped)) {
+        input.value = String(clamped);
+      }
       this.requestUpdate();
       /* A new period must reach the integration, not just this element: the
          beat is scheduled server side. Restarting retunes it so the change
@@ -1569,6 +1783,7 @@ function _hmControlRegister() {
           </div>
           ${this._group(this._t("Power & mode", "电源与模式"), [
             this._switchItem(),
+            this._readbackItem(),
             this._emsItem(),
           ])}
           ${this._group(this._t("Power settings", "功率设置"), [
@@ -1720,20 +1935,38 @@ function _hmControlRegister() {
     _switchItem() {
       const view = this._switchView();
       /* The sub-line is where the feedback lands: the button already flips the
-         instant it is pressed, and this explains the wait / confirms it. */
+         instant it is pressed, and this explains the wait / confirms it.
+
+         An optimistic switch is a different story. The firmware publishes no
+         readable ON/OFF (its discovery state topic is a nested JSON document),
+         so Home Assistant only remembers the last command *it* sent - which is
+         why the row said "已休眠" on a device that was plainly producing. Saying
+         "last commanded" instead of claiming a device state is the honest
+         wording, and the power read-out row below is what actually shows the
+         device is alive. */
       const sub = view.pending
         ? this._t(
           `Powering ${view.pending === "on" ? "up" : "down"}…`,
           `${view.pending === "on" ? "正在开机" : "正在关机"}…`,
         )
-        : view.confirmed
-          ? this._t(
-            view.on ? "Powered on ✓" : "Powered off ✓",
-            view.on ? "已开机 ✓" : "已关机 ✓",
-          )
-          : view.on
-            ? this._t("running", "运行中")
-            : this._t("standby", "已休眠");
+        : view.optimistic
+          ? (view.commanded
+            ? this._t(
+              `Last command: ${view.on ? "on" : "off"} (the device does not report its switch state)`,
+              `上次下发：${view.on ? "开机" : "关机"}（设备不上报开关状态）`,
+            )
+            : this._t(
+              "No command sent yet - the device does not report its switch state. See the power read-out below.",
+              "尚未下发指令——设备不上报开关状态，请看下方的实时回读。",
+            ))
+          : view.confirmed
+            ? this._t(
+              view.on ? "Powered on ✓" : "Powered off ✓",
+              view.on ? "已开机 ✓" : "已关机 ✓",
+            )
+            : view.on
+              ? this._t("running", "运行中")
+              : this._t("standby", "已休眠");
       const subClass = view.pending ? "busy" : view.confirmed ? "done" : "";
       return this._item({
         icon: "⚡",
@@ -1892,6 +2125,13 @@ function _hmControlRegister() {
         name: this._t("Re-send timer", "定时下发"),
         sub,
         subClass: on ? "ticking" : "",
+        /* The row is stacked for the same reason the two sliders are: the
+           segment plus the number box plus the unit do not fit beside the name
+           at every width. Unstacked they wrapped onto a second line, the row
+           grew taller than `.item` allows and `.group { overflow: hidden }`
+           clipped the sub-line away entirely - which is why turning the timer
+           on showed nothing but the word 定时下发. */
+        stack: true,
         ctrl: html`
           ${this._segment(
             [
@@ -1903,7 +2143,7 @@ function _hmControlRegister() {
           )}
           <input type="number" class="narrow" min=${TIMER_MIN_S} max=${TIMER_MAX_S}
             step="1" .value=${String(period)} ?disabled=${!ready || this._timerBusy}
-            @change=${(e) => this._setTimerPeriod(e.target.value)} />
+            @change=${(e) => this._setTimerPeriod(e.target.value, e.target)} />
           <span class="state">${this._t("s", "秒")}</span>`,
       });
     }

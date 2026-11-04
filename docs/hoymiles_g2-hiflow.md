@@ -128,6 +128,20 @@ ha core restart
 
 集成本身不去改写固件声明的范围（`discovery_override.py` 里 `number/{dev}/power_ctrl` 与 `output_power` 都走 `_patch_plain`，原样透传），所以这些数字一定来自设备。步进同样跟随声明：微逆 1 W，储能机 0.1 W。
 
+### 两个 `number` 实体如何区分（别按 `_2` 后缀猜）
+
+`power_ctrl` 与 `output_power` 是两个平级的 `number` 实体，HA 会给重名的实体加 `_2` 后缀，但**哪个是基础实体随固件而变**，实测三种机型三种顺序：
+
+| 机型 | `number.<dev>` | `number.<dev>_2` |
+| --- | --- | --- |
+| RMI-4161A0209FF6（一拖二） | min 100 / max 1000 / step 1 → `output_power` | min 0 / max 1000 / step 0.1 → `power_ctrl` |
+| RMI-1650A028FC22（一拖一） | min 0 / max 132 / step 1 → `power_ctrl` | min 100 / max 800 / step 1 → `output_power` |
+| MSA 储能机 | min −2500 / step 0.1 → `power_ctrl` | min 100 / step 1 → `output_power` |
+
+所以**后缀顺序不可作为判据**（三台里有两台与「顺序表」相反）。可靠的是声明的 `min`：`power_ctrl` 的下限恒在 0 或以下（储能机还能负到充电/馈电），`output_power` 的下限是硬件最小输出，实测恒为 100 W。
+
+卡片因此先按 `min` 判定，仅在候选不唯一时退回后缀顺序，`entities:` 显式指定永远最高优先。若以后引入新机型，先在 HA 里核对这两个实体的 `min`/`step`，再决定是否需要钉住。
+
 ### 功率控制没有回执
 
 `power_ctrl` 的 discovery 只给了 `command_topic`，**没有 `state_topic`**，因此 HA 会把它标成 `assumed_state: true`——界面显示的是 HA 自己最后一次下发的值，而不是设备的真实状态。

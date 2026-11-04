@@ -204,20 +204,19 @@ function _hmHistoryRegister() {
     return parts.join(".");
   }
 
-  /** Pick a unit + divisor so the axis stays readable (W -> kW). */
+  /** Pick a unit + divisor for the axis.
+   *
+   * This used to promote W to kW once the range passed 1.5 kW, but it divided
+   * the numbers without renaming the unit: a 2 500 W axis was drawn as
+   * "2.50 W", so a 540 W reading looked like 0.54 W sitting near the zero line.
+   * The labels always carry the unit the user configured (`unit: W`), so the
+   * divisor has to stay 1 - the axis is then in the same unit as the data and
+   * every label, tooltip and reading lines up. Charts that need a coarser axis
+   * set `span` / `max` instead of relying on a silent rescale.
+   */
   function pickUnit(unit, maxValue) {
     if (!unit) return { unit: "", divisor: 1, decimals: 1 };
-    const abs = Math.abs(maxValue);
-    const prefixes = [
-      { scale: 1000, gap: 1500 },
-      { scale: 1, gap: 0 },
-    ];
-    for (const p of prefixes) {
-      if (abs >= p.gap) {
-        return { unit, divisor: p.scale, decimals: p.scale === 1 ? 0 : 1 };
-      }
-    }
-    return { unit, divisor: 1, decimals: 1 };
+    return { unit, divisor: 1, decimals: Math.abs(maxValue) >= 100 ? 0 : 1 };
   }
 
   function pad2(value) {
