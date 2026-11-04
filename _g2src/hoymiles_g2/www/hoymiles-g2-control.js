@@ -176,6 +176,47 @@ function _hmControlRegister() {
   const SWITCH_PENDING_MS = 5000;
   const SWITCH_CONFIRM_MS = 2500; // how long the tick after confirmation stays
 
+  /* ------------------------------------------------------------------ *
+   * Remembering the last command
+   *
+   * Three controls on this card are write-only by design: `power_ctrl`,
+   * `output_power` and the power switch all publish to a `command_topic` and the
+   * firmware declares no `state_topic` for any of them. Home Assistant therefore
+   * has nothing to restore - those entities read `unknown` after every restart -
+   * so the card used to come back blank on every visit and the whole set-up
+   * (wake the unit, output power, power control, timer) had to be typed in
+   * again before anything was under control.
+   *
+   * What the user expects to find is *what they last sent*, not what the device
+   * reports, because it reports nothing. That set is remembered per device in
+   * `localStorage` and restored before anything is seeded from an entity.
+   *
+   * The keep-alive is the one exception honoured over the cache: it runs in the
+   * integration, so its `enabled` / `power` / `period` are server-side truth and
+   * win over anything remembered here - see `_applyKeepalive`.
+   * ------------------------------------------------------------------ */
+  const STORE_PREFIX = "hoymiles-g2-control:";
+
+  /** `localStorage` read, guarded: private-mode browsing and quotas both throw. */
+  function storeGet(key) {
+    try {
+      const raw = window.localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** `localStorage` write, guarded: a full or disabled store only means the card
+   * forgets, which must never break the controls. */
+  function storeSet(key, value) {
+    try {
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      /* Deliberately silent - the toast area is for command failures. */
+    }
+  }
+
   function slug(id) {
     return String(id).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   }
@@ -537,6 +578,10 @@ function _hmControlRegister() {
         this._timerError = "";
         this._timerPower = NaN;
         this._timerPeriod = String(TIMER_DEFAULT_S);
+        /* The saved set is per device, so switching device must also drop the
+           restored switch / EMS command - they belonged to the previous unit. */
+        delete this._optimistic.switch;
+        delete this._optimistic.ems_mode;
       }
     }
 
@@ -854,33 +899,126 @@ function _hmControlRegister() {
      * reports `0`, which is outside e.g. output_power's `100 ~ 2000 W`. Without
      * the clamp the slider would sit at its minimum while the read-out showed the
      * out-of-range number, and the two would disagree.
+     *
+     * Order matters and is the whole point of the persisted cache:
+     *
+     * 1. what this browser last sent (`_restore`) - the write-only controls have
+     *    no entity value to speak of, so this is normally the only source;
+     * 2. what the entity reports, when it has a usable value;
+     * 3. the clamp against the entity's declared bounds either way.
+     *
+     * The earlier version returned early unless the entity had a value, and with
+     * both `number` entities permanently `unknown` that meant nothing was ever
+     * seeded and the sliders stayed at their defaults - the exact "I have to set
+     * everything again" complaint.
      */
     _seedInputs() {
       if (!this._hass || !this._hass.states) return;
+      const saved = this._restore();
       const pc = this._number("power_ctrl");
       const op = this._number("output_power");
-      if (pc != null) {
+      let any = false;
+      const pick = (live, remembered) => {
+        if (live != null) return { value: live, from: "live" };
+        if (Number.isFinite(remembered)) return { value: remembered, from: "saved" };
+        return null;
+      };
+      const pcPick = pick(pc, saved.power_ctrl);
+      if (pcPick) {
         const b = this._bounds("power_ctrl", -1000, 1000);
         const { lo, hi } = this._powerRange(b.lo, b.hi);
-        this._powerCtrl = String(this._clamp(pc, lo, hi));
+        this._powerCtrl = String(this._clamp(pcPick.value, lo, hi));
+        any = true;
       }
-      if (op != null) {
+      const opPick = pick(op, saved.output_power);
+      if (opPick) {
         const b = this._bounds("output_power", 100, 2000);
-        this._outputPower = String(this._clamp(op, b.lo, b.hi));
+        this._outputPower = String(this._clamp(opPick.value, b.lo, b.hi));
+        any = true;
+      }
+      /* Nothing was ever sent for power control: start it at the output power,
+         which is the wattage the device already holds by default. Leaving the
+         slider empty made the row read "0 W" on a unit that was producing, and
+         it is never a value anyone wants to keep. */
+      if (!pcPick && opPick) {
+        const b = this._bounds("power_ctrl", -1000, 1000);
+        const { lo, hi } = this._powerRange(b.lo, b.hi);
+        this._powerCtrl = String(this._clamp(opPick.value, lo, hi));
       }
       const phases = ["a", "b", "c"];
-      let any = false;
+      let anyPhase = false;
       for (const p of phases) {
-        const value = this._number(`phase_${p}_output_power`)
+        const live = this._number(`phase_${p}_output_power`)
           ?? this._number("phase_output_power");
-        if (value != null) {
+        const remembered = saved.phase ? Number(saved.phase[p]) : NaN;
+        const use = live != null ? live : remembered;
+        if (Number.isFinite(use)) {
           const b = this._bounds("phase_a_output_power", 100, 2500);
-          this._phase[p] = String(this._clamp(value, b.lo, b.hi));
-          any = true;
+          this._phase[p] = String(this._clamp(use, b.lo, b.hi));
+          anyPhase = true;
         }
       }
-      if (pc == null && op == null && !any) return; // nothing to seed yet
+      any = any || anyPhase;
+      /* The switch command is remembered even though the user cannot see it on
+         an entity: restoring it makes the segment show 开机 / 关机 as chosen
+         instead of falling back to "no command sent yet". */
+      if (saved.switch === "on" || saved.switch === "off") {
+        this._optimistic.switch = saved.switch;
+        any = true;
+      }
+      if (saved.ems_mode) {
+        this._optimistic.ems_mode = saved.ems_mode;
+        any = true;
+      }
+      if (Number.isFinite(saved.timer_period)) {
+        this._timerPeriod = String(this._clampPeriod(saved.timer_period));
+        any = true;
+      }
+      if (!any) return; // nothing to seed yet
       this._initialised = true;
+    }
+
+    /** The remembered command set for this device, or `{}`. */
+    _remembered() {
+      const raw = storeGet(`${STORE_PREFIX}${this._dev()}`);
+      return raw && typeof raw === "object" ? raw : {};
+    }
+
+    /**
+     * Load the remembered set into the fields this card controls.
+     *
+     * Returns only the numeric values: the date stamp and the switch value are
+     * handled separately, because the switch must not be restored as an
+     * "in-flight" command (it was sent long ago and is not awaiting anything).
+     */
+    _restore() {
+      const raw = this._remembered();
+      const out = {
+        power_ctrl: Number(raw.power_ctrl),
+        output_power: Number(raw.output_power),
+        timer_period: Number(raw.timer_period),
+        switch: raw.switch,
+        ems_mode: raw.ems_mode,
+        phase: raw.phase && typeof raw.phase === "object" ? raw.phase : null,
+      };
+      /* A remembered value outside the entity's present bounds is dropped rather
+         than clamped: the range can shrink after a firmware update, and silently
+         pinning a stale 700 W to a device now capped at 132 W would be a lie
+         about what was sent. `_seedInputs` clamps whatever survives. */
+      return out;
+    }
+
+    /**
+     * Persist the last command of one control.
+     *
+     * Called from the send paths, never from the render path: a slider drag is
+     * an input in flight, and remembering it would make the card reopen on a
+     * value that was never sent.
+     */
+    _remember(patch) {
+      const key = `${STORE_PREFIX}${this._dev()}`;
+      const prev = this._remembered();
+      storeSet(key, { ...prev, ...patch, at: Date.now() });
     }
 
     /* ------------------------------ sending ------------------------------ */
@@ -925,6 +1063,10 @@ function _hmControlRegister() {
       const target = on ? "on" : "off";
       if (this._switchTarget() === target) return; // already on the way there
       this._optimistic.switch = target;
+      /* Remembered so a reload shows 开机 / 关机 as chosen: the switch entity is
+         optimistic and no state topic exists, so there is nothing else to
+         restore from. */
+      this._remember({ switch: target });
       this._switchPending = { target, at: this._now() };
       this._switchConfirmedAt = 0;
       // Wake up once the wait is over, so the UI falls back to the real state
@@ -1149,9 +1291,9 @@ function _hmControlRegister() {
         : this._t(
           "Live values decoded from the device's own state messages. "
             + "Power control and output power have no state topic, so their "
-            + "boxes above only remember the last command.",
+            + "boxes above hold the last value sent from this browser.",
           "以下数值来自设备自身上报的状态消息。功率控制与输出功率没有状态话题，"
-            + "上方输入框只代表本机最后一次下发的值。",
+            + "上方输入框会记住本机最后一次下发的值。",
         );
 
       return this._item({
@@ -1173,6 +1315,7 @@ function _hmControlRegister() {
 
     _setEmsMode(mode) {
       this._optimistic.ems_mode = mode;
+      this._remember({ ems_mode: mode });
       /* Leaving mqtt_ctrl makes the lease meaningless: the firmware ignores
          `power_ctrl` in every other mode, so re-sending it would only add
          broker traffic. The switch reflects that instead of staying on while
@@ -1196,6 +1339,10 @@ function _hmControlRegister() {
     _sendPowerCtrl(opts) {
       const value = Number(this._powerCtrl);
       if (!Number.isFinite(value)) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
+      /* Remembered before the send, so a failed publish still leaves the card
+         showing what was attempted - that is more useful than silently going
+         back to an older value the user has since replaced. */
+      this._remember({ power_ctrl: value });
       /* While the beat is running it re-publishes its own value, so a plain
          send would be silently overwritten one period later - "I sent 200 W"
          then looks ignored a minute later, which is exactly the symptom this
@@ -1337,7 +1484,11 @@ function _hmControlRegister() {
     _applyKeepalive(payload) {
       if (!payload || typeof payload !== "object") return;
       const on = payload.enabled === true;
-      const period = payload.period != null
+      /* The sensor always reports the period of the *last* beat, even when no
+         beat is running - and an idle sensor answers with the built-in default,
+         which would silently undo a period the user had chosen earlier. The
+         stored period is only authoritative while a beat is actually running. */
+      const period = on && payload.period != null
         ? String(this._clampPeriod(payload.period))
         : this._timerPeriod;
       const count = typeof payload.count === "number" ? payload.count : 0;
@@ -1352,12 +1503,30 @@ function _hmControlRegister() {
         && error === this._timerError && power === this._timerPower) {
         return;
       }
+      const previousPower = this._timerPower;
+      const powerMoved = Number.isFinite(power) && power !== previousPower;
       this._timerOn = on;
       this._timerPeriod = period;
       this._timerCount = count;
       this._timerLastAt = lastAt;
       this._timerError = error;
       this._timerPower = power;
+      /* A running beat holds a specific wattage in the integration, which is
+         server-side truth and therefore outranks whatever this browser
+         remembered. Mirror it into the slider so a page opened while 200 W is
+         being held shows 200 W - the value the user "sent" in the first place.
+
+         Only on a *transition* of the held power, and only when the slider
+         still shows the old held value: applying it on every push would fight
+         the user, snapping a drag back before they could press 下发. */
+      if (on && powerMoved) {
+        const untouched = this._powerCtrl === "" || Number.isNaN(previousPower)
+          || num(this._powerCtrl) === power || num(this._powerCtrl) === previousPower;
+        if (untouched) this._powerCtrl = String(power);
+        /* Persist the server's value too: it is what the device is actually
+           holding, so it is the best thing to restore on the next visit. */
+        this._remember({ power_ctrl: power, timer_period: this._clampPeriod(period) });
+      }
       this.requestUpdate();
     }
 
@@ -1391,6 +1560,10 @@ function _hmControlRegister() {
     async _setTimerPeriod(raw, input) {
       const clamped = this._clampPeriod(raw);
       this._timerPeriod = String(clamped);
+      /* The period is part of the remembered set even while the beat is off: the
+         user picks 15 s once and expects to find it next time, not to retype it
+         before every start. */
+      this._remember({ timer_period: clamped });
       /* Write the clamped value back to the field by hand.
        *
        * Lit only rewrites a bound property when the *previous committed value*
@@ -1417,6 +1590,7 @@ function _hmControlRegister() {
     _sendOutputPower() {
       const value = Number(this._outputPower);
       if (!Number.isFinite(value)) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
+      this._remember({ output_power: value });
       this._publish(this._topic("number/<dev_id>/output_power/set"), String(value),
         `${this._t("Output power", "输出功率")} ${value} W`);
     }
@@ -1431,6 +1605,7 @@ function _hmControlRegister() {
         this._showToast(this._t("Invalid value", "数值无效"), true);
         return;
       }
+      this._remember({ phase: { a: payload.phase_a, b: payload.phase_b, c: payload.phase_c } });
       this._publish(this._topic("number/<dev_id>/phase_output_power/set"), payload,
         `${this._t("Phase output", "多相输出")} ${payload.phase_a}/${payload.phase_b}/${payload.phase_c} W`);
     }

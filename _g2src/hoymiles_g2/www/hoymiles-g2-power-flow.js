@@ -233,52 +233,102 @@ function _hmPowerFlowRegister() {
    * A HiFlow is a grid-tied micro inverter: it has no battery and no
    * off-grid port, so the four node schematic spends half its area on
    * branches the hardware does not have.  This layout draws what the unit
-   * actually is - PV in on the left, the grid port on the right, the
-   * product photo itself in the middle - and keeps the two powers that
-   * matter.  The 并网端口 value is the *absolute* reading: whether the
-   * energy is being drawn from the grid (取电) or fed back into it (馈电)
-   * is carried by the pearls, which run towards the unit while importing
-   * and away from it while exporting, and by the colour of the connector.
+   * actually is - the product photo in the middle, the 并网端口 above and to
+   * its right, and the PV inputs along the bottom, one on each side - and
+   * keeps the two powers that matter.  That is the arrangement the vendor app
+   * uses for a single unit, and it is what makes the three ports read as three
+   * separate endpoints: nothing shares a row, so nothing can look "missing".
    *
-   * The photo is a transparent cut-out but the unit fills almost the whole
-   * frame (measured: opaque pixels reach the left edge and both vertical
-   * extremes), so there is no transparent margin to run a line *into*.
-   * The connectors therefore stop at the image's own bounding box, which
-   * reads as touching the unit because the artwork is flush with it.
+   * The 并网端口 value is the *absolute* reading: whether the energy is being
+   * drawn from the grid (取电) or fed back into it (馈电) is carried by the
+   * pearls, which run towards the unit while importing and away from it while
+   * exporting, and by the colour of the connector.
+   *
+   * The photo is a transparent cut-out, so a connector that stops at a fixed
+   * box could end in mid-air.  The box is therefore derived from each photo's
+   * own intrinsic size (see `IV_PHOTO_ASPECT`), keeping the width fixed and
+   * letting the height follow - which leaves the left/right edges - where the
+   * connectors stop - at the same x for both models.
    * ------------------------------------------------------------------ */
   const IV_W = 700;
-  /* Taller than the storage schematic on purpose: a two-input unit needs two
-     PV nodes stacked on the left, and they have to stay clear of each other
-     *and* of the product photo. */
-  const IV_H = 300;
-  const IV_NODE_ROW = 150;
-  const IV_NODE_PV = { x: 68, y: IV_NODE_ROW };
-  const IV_NODE_GRID = { x: 632, y: IV_NODE_ROW };
-  /* Half the distance between the two PV nodes of a 一拖二 unit: 45 px keeps
-     both 34 px rings, their two text lines and a readable gap inside the
-     photo's own 140 px height. */
-  const IV_PV_GAP = 45;
-  const IV_IMG_W = 300;                        // 360x168 scaled to 300x140
-  const IV_IMG_H = IV_IMG_W * (168 / 360);
-  const IV_CENTER_X = IV_W / 2;
-  /* Vertically centred on the node row, so both connectors meet the unit at
-     the same height as the nodes they belong to. */
-  const IV_IMG_Y = IV_NODE_ROW - IV_IMG_H / 2;
-  const IV_IMG_L = IV_CENTER_X - IV_IMG_W / 2;
-  const IV_IMG_R = IV_CENTER_X + IV_IMG_W / 2;
-  /* Both connectors are written from their node towards the unit, so
-     `reverse` means "the energy runs from the unit out to this side" - see
-     the direction table in `_svgInverter`.  The PV connectors are per node
-     (their Y varies with the node count), so only the grid one is a constant. */
-  const IV_GRID_ROUTE = `M${IV_NODE_GRID.x - NODE_R} ${IV_NODE_GRID.y} H${IV_IMG_R}`;
+  /* Tall enough for the caption block under each bottom-row node (a 34 px ring
+     plus two text lines) without them touching the card's edge. */
+  const IV_H = 430;
+  const IV_PHOTO_W = 300;
+  const IV_PHOTO_MAX_H = 190;
+  const IV_PHOTO_CX = IV_W / 2;
+  const IV_PHOTO_CY = 200;
+  /* Intrinsic size of each product photo, so a connector can stop exactly on
+     the artwork: the 2-in-1 cut-out (360x168) is a wide strip that fills its
+     frame, while the single-input one (736x486) is closer to 3:2 and is
+     noticeably shorter once scaled to the same width.  A custom `image` falls
+     back to the 2-in-1 aspect, which is the shape this layout is designed
+     around. */
+  const IV_PHOTO_ASPECT = {
+    "hiflow.png": 736 / 486,
+    "hiflow-pro-2in1.png": 360 / 168,
+  };
+  const IV_PHOTO_ASPECT_FALLBACK = 360 / 168;
+  const IV_CORNER = 10;                          // rounded elbow radius
+  /* The two DC inputs sit on the bottom row, the grid port on the top row.
+     A single-input unit simply leaves the bottom-right slot empty. */
+  const IV_NODE_PV1 = { x: 95, y: 330 };
+  const IV_NODE_PV2 = { x: 605, y: 330 };
+  const IV_NODE_GRID = { x: 605, y: 90 };
+  /* Terminals sit this far inside the photo's corner rather than exactly on
+     it: a connector that ends at the very corner reads as passing the unit by,
+     not as plugging into it. */
+  const IV_TERMINAL_INSET = 22;
   /* Served by the integration itself (see const.FRONTEND_IMAGES), so no
      dashboard has to register an image resource by hand. */
   const IV_IMAGE = "/hoymiles_g2_static/hiflow-pro-2in1.png";
 
-  /** Y coordinate of the n-th (0 based) PV node in a multi-input layout. */
-  function ivPvY(index, count) {
-    if (count <= 1) return IV_NODE_ROW;
-    return IV_NODE_ROW + (index - (count - 1) / 2) * (IV_PV_GAP * 2);
+  /** Placement of one product photo: fixed width, aspect-derived height. */
+  function ivPhoto(art) {
+    const name = String(art || "").split("/").pop().split("?")[0];
+    const aspect = IV_PHOTO_ASPECT[name] > 0
+      ? IV_PHOTO_ASPECT[name]
+      : IV_PHOTO_ASPECT_FALLBACK;
+    /* Width is capped by height, not fixed: the single-input cut-out is far
+       closer to square, and at a fixed 300 px width it grew tall enough to
+       reach the grid node and leave the connector no room to turn.  Capping the
+       height narrows that photo instead and keeps the drawing's proportions. */
+    const w = Math.min(IV_PHOTO_W, IV_PHOTO_MAX_H * aspect);
+    const h = w / aspect;
+    return {
+      w,
+      h,
+      l: IV_PHOTO_CX - w / 2,
+      r: IV_PHOTO_CX + w / 2,
+      t: IV_PHOTO_CY - h / 2,
+      b: IV_PHOTO_CY + h / 2,
+    };
+  }
+
+  /**
+   * One connector: straight out of the node, one rounded elbow, straight into
+   * the unit.
+   *
+   * Written as `M / V / Q / H` so the existing `parsePath` / `reversePath`
+   * helpers understand it unchanged - the pearls then run along it and can be
+   * reversed for a charging / exporting reading without the drawing moving.
+   *
+   * `x2` is the x the connector stops at (a photo edge) and `y2` the height of
+   * its terminal there.  The vertical run starts on the node's own rim, so the
+   * line never appears to grow out of the middle of the ring.
+   */
+  function elbowRoute(node, x2, y2) {
+    const down = y2 > node.y;
+    const rim = down ? node.y + NODE_R : node.y - NODE_R;
+    const hx = node.x + (x2 > node.x ? 1 : -1) * IV_CORNER;
+    const gap = down ? y2 - rim : rim - y2;
+    /* The single-input photo is proportionally taller, so its top edge sits very
+       close to the grid node and the elbow would fold back on itself.  Shrink
+       the corner to whatever room is left instead of drawing a kink. */
+    if (gap < 2) return `M${node.x} ${rim} Q${node.x} ${y2} ${hx} ${y2} H${x2}`;
+    const r = Math.min(IV_CORNER, gap / 2);
+    const vy = down ? y2 - r : y2 + r;
+    return `M${node.x} ${rim} V${vy} Q${node.x} ${y2} ${hx} ${y2} H${x2}`;
   }
 
   /* Node artwork, baked straight out of the vendor app's icon set (see
@@ -1437,18 +1487,24 @@ function _hmPowerFlowRegister() {
     _svgInverter(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
       const pvCount = this._pvCount();
+      const photo = ivPhoto((this._config && this._config.image) || IV_IMAGE);
       const pvNodes = [];
+      /* Both PV connectors leave the bottom row upwards and turn inwards, so
+         they pick up the unit along its lower edge - the only edge PV-2 does
+         not share with the grid connector. */
+      const pvTermY = photo.b - IV_TERMINAL_INSET;
+      const pvSpec = [
+        { id: "pv1", node: IV_NODE_PV1, power: d.pvPort1, edge: photo.l },
+        { id: "pv2", node: IV_NODE_PV2, power: d.pvPort2, edge: photo.r },
+      ];
       for (let i = 0; i < pvCount; i += 1) {
-        const y = ivPvY(i, pvCount);
-        // Port 1 is the unit's own first input, port 2 the third-party input on
-        // a 一拖二 unit.  A single-input unit still draws one node on port 1.
-        const power = i === 0 ? d.pvPort1 : d.pvPort2;
+        const spec = pvSpec[i];
         pvNodes.push({
-          id: `pv${i + 1}`,
-          x: IV_NODE_PV.x,
-          y,
-          power,
-          route: `M${IV_NODE_PV.x + NODE_R} ${y} H${IV_IMG_L}`,
+          id: spec.id,
+          x: spec.node.x,
+          y: spec.node.y,
+          power: spec.power,
+          route: elbowRoute(spec.node, spec.edge, pvTermY),
         });
       }
 
@@ -1466,7 +1522,9 @@ function _hmPowerFlowRegister() {
            unit".  Exporting therefore reverses it. */
         const g = present(d.grid) ? num(d.grid) : 0;
         routes.push({
-          id: "grid", d: IV_GRID_ROUTE, power: present(d.grid) ? d.grid : null,
+          id: "grid",
+          d: elbowRoute(IV_NODE_GRID, photo.r, photo.t + IV_TERMINAL_INSET),
+          power: present(d.grid) ? d.grid : null,
           color: g < 0 ? COLORS.grid_out : COLORS.grid,
           reverse: g < 0,
         });
@@ -1492,18 +1550,17 @@ function _hmPowerFlowRegister() {
         </clipPath>
         ${edges}
         ${dots}
-        ${this._unitImage(busy)}
+        ${this._unitImage(busy, photo)}
         ${this._inverterNodes(d, { pv: pvNodes, grid: true })}
       </svg>`;
     }
 
     /** The product photo at the centre of the micro-inverter layout. */
-    _unitImage(busy) {
+    _unitImage(busy, photo) {
       const art = (this._config && this._config.image) || IV_IMAGE;
-      /* The stubs are drawn on the product photo itself, so the image is
-         placed - not merely centred - to put them on the node row. */
-      return `<image class="pf-body" x="${IV_IMG_L}" y="${IV_IMG_Y}"
-                    width="${IV_IMG_W}" height="${IV_IMG_H}"
+      const box = photo || ivPhoto(art);
+      return `<image class="pf-body" x="${box.l}" y="${box.t}"
+                    width="${box.w}" height="${box.h}"
                     preserveAspectRatio="xMidYMid meet"
                     opacity="${busy || this._config.dim_when_idle === false ? 1 : 0.55}"
                     href="${esc(art)}"/>`;
@@ -1528,15 +1585,19 @@ function _hmPowerFlowRegister() {
          while commissioning a unit. */
       const reading = (v) => (v === null || v === undefined ? "—" : fmtW(v));
 
-      const node = (x, y, icon, on, value, caption) => {
+      /* `above` puts the two text lines over the ring instead of under it; the
+         grid node needs that because its connector leaves downwards. */
+      const node = (x, y, icon, on, value, caption, above) => {
         const art = PF_ICONS[`${icon}.${on ? "on" : "off"}`] || "";
+        const vy = above ? -(NODE_R + 12) : NODE_R + 26;
+        const cy = above ? -(NODE_R + 30) : NODE_R + 46;
         parts.push(`<g class="pf-node" transform="translate(${x} ${y})">
             <image class="pf-ic" x="${-NODE_R}" y="${-NODE_R}"
                    width="${NODE_R * 2}" height="${NODE_R * 2}"
                    clip-path="url(#${NODE_CLIP_ID})" href="${art}"/>
-            <text class="pf-v" x="0" y="${NODE_R + 26}"
+            <text class="pf-v" x="0" y="${vy}"
                   text-anchor="middle">${value}</text>
-            <text class="pf-c" x="0" y="${NODE_R + 46}"
+            <text class="pf-c" x="0" y="${cy}"
                   text-anchor="middle">${esc(caption)}</text>
           </g>`);
       };
@@ -1550,7 +1611,7 @@ function _hmPowerFlowRegister() {
            direction is already drawn by the pearls, so a caption that moved
            with the sign would contradict it. */
         node(IV_NODE_GRID.x, IV_NODE_GRID.y, "grid", working(d.grid),
-          reading(d.grid), t("Grid port", "并网端口"));
+          reading(d.grid), t("Grid port", "并网端口"), true);
       }
 
       return parts.join("");

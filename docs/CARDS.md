@@ -287,9 +287,17 @@ the four-branch schematic spends half its area on branches the hardware does
 not have. With `variant: inverter` the card draws only the ends it really has:
 
 ```
-⬜ PV1 ────────── ▣ HiFlow Pro 2-in-1 ────────── ⬜ Grid port
-⬜ PV2 ──────────╯
+          ⬜ Grid port
+               │
+               └──── ▣ HiFlow Pro 2-in-1
+             ⬜ PV1 ────┘
+             ⬜ PV2 ────┘
 ```
+
+That is: **photo centred, grid port top-right, PV-1 bottom-left and PV-2
+bottom-right** — the same arrangement the vendor app uses on its device page.
+All three nodes join the photo's left and right edges through orthogonal
+connectors with rounded corners, never crossing the unit.
 
 ```yaml
 - type: custom:hoymiles-g2-power-flow
@@ -318,9 +326,18 @@ connector colour instead: `> 0` is importing (pearls run towards the unit, blue
 line), `< 0` is exporting (pearls run towards the grid, amber line). The grid
 node is **always drawn**, even at 0 W or with no reading (`—`), because "no grid
 reading" and "0 W on the grid" are entirely different facts.
-- The middle is the real product photo (replace it with `image`), centred on the
-node row so both connectors meet the unit's own sides. Match the photo to the
-model too: `hiflow-pro-2in1.png` for the 2-in-1, `hiflow.png` for the single.
+- The middle is the real product photo (replace it with `image`), centred and
+sized as `min(300, 190 × aspect)`, where the aspect ratio is looked up by file
+name in `IV_PHOTO_ASPECT` (`hiflow.png` = 736/486, `hiflow-pro-2in1.png` =
+360/168, falling back to `360/168`). Connector ends stop 22 px inside the
+photo's left/right edges (`IV_TERMINAL_INSET`) instead of touching the border.
+Match the photo to the model too: `hiflow-pro-2in1.png` for the 2-in-1,
+`hiflow.png` for the single.
+- The canvas is a fixed `700 × 430`. All coordinates live in the `IV_*` constants
+at the top of the file (`IV_NODE_PV1`, `IV_NODE_PV2`, `IV_NODE_GRID`,
+`IV_PHOTO_CX`, `IV_PHOTO_CY`, `IV_CORNER`), so nudging a node never touches the
+drawing logic. The grid port's caption is drawn *above* its ring so it cannot
+overlap the photo.
 - Below `|P| = 5 W` the photo fades to 55 %; `dim_when_idle: false` disables it.
 - No battery, load, smart-plug or off-grid node — the micro inverter has no such
 topics.
@@ -680,6 +697,35 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   below.* To check whether the unit is actually up, use the PV / grid / load
   figures in the read-back row: **non-zero readings prove it is awake and
   producing even while the switch row reads off.**
+- **The card remembers the last values you sent, so a reload no longer needs a
+  re-dial.** As said above, `power_ctrl`, `output_power` and the power switch
+  have no usable state topic, so their entities read back as `unknown`. Seeding
+  the form from entities alone meant every visit to the `control` view started
+  with empty sliders and the default period — the user had to power the unit on,
+  re-set both wattages and re-enter the period every single time. The card
+  therefore also stores **the last values sent from this browser** in
+  `localStorage`, under `hoymiles-g2-control:<dev_id>`:
+
+  ```json
+  { "switch": "on", "ems_mode": "power_ctrl", "power_ctrl": 200,
+    "output_power": 300, "timer_period": 45, "at": 1793774422400 }
+  ```
+
+  It is written only on a real send (the power switch writes `switch`, an actual
+  dispatch writes the matching field, setting the period writes `timer_period`);
+  nothing is polled or saved in the background. Seed priority, highest first:
+  **① the wattage held by a running keep-alive** (server-side truth from the
+  integration — it overrides the browser's memory and writes back to it) →
+  **② the current HA entity value** (only when not `unknown` / `unavailable`) →
+  **③ the `localStorage` memory** → **④ `power_ctrl` falls back to
+  `output_power`**. Remembered values only **refill the form**: opening the page
+  never re-sends anything and produces no MQTT traffic. Two limits: the memory is
+  **per browser** (a different browser, a private window or clearing site data
+  loses it — expected, not a bug), and the keep-alive period reported by the
+  sensor is trusted **only while a beat is actually running**; when idle that
+  sensor reports the built-in default, and taking it at face value would silently
+  undo a period the user had chosen earlier.
+
 - The layout follows the iOS settings idiom: rounded groups, small grey section
   headers (**Power & mode / Power settings / Plan & maintenance**), rows of
   icon + name + right-aligned control, and hairlines that stop short of the card
