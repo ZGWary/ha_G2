@@ -54,12 +54,17 @@
  *                                 # system view of a storage device is
  *                                 # unaffected.
  *   image: /local/photo.png       # optional product photo for that layout;
- *                                 # defaults to the HiFlow Pro 2-in-1 cut-out
+ *                                 # omit to take the one that matches the
+ *                                 # unit's SKU (see `IV_IMAGE_BY_CODE`), which
+ *                                 # is what makes the ports on the photo agree
+ *                                 # with the number of nodes drawn below it.
  *   pv_count: 2                   # optional; number of PV inputs drawn in
- *                                 # the inverter layout (1 = single-input
- *                                 # HiFlow, 2 = two-input HiFlow Pro). Omit to
- *                                 # auto-detect: a live pv2 reading, else the
- *                                 # device registry's model name decides.
+ *                                 # the inverter layout, 1 to 4 (1 = the
+ *                                 # single-input 1650 / 4160, 2 = the 4161
+ *                                 # 2-in-1, 4 = the 4162 4-in-1). Omit to
+ *                                 # auto-detect: the SKU in the serial first,
+ *                                 # then the highest port that reports a
+ *                                 # reading, then the registry's model name.
  *   dim_when_idle: true           # optional; fade the photo when nothing flows
  *   entities:                     # optional entity id overrides, keyed by the
  *                                 # suffix the card looks up
@@ -234,10 +239,15 @@ function _hmPowerFlowRegister() {
    * off-grid port, so the four node schematic spends half its area on
    * branches the hardware does not have.  This layout draws what the unit
    * actually is - the product photo in the middle, the 并网端口 above and to
-   * its right, and the PV inputs along the bottom, one on each side - and
-   * keeps the two powers that matter.  That is the arrangement the vendor app
-   * uses for a single unit, and it is what makes the three ports read as three
-   * separate endpoints: nothing shares a row, so nothing can look "missing".
+   * its right, and the PV inputs along the bottom - and keeps the two powers
+   * that matter.  That is the arrangement the vendor app uses for a single
+   * unit, and it is what makes the ports read as separate endpoints: nothing
+   * shares a row, so nothing can look "missing".
+   *
+   * The bottom row carries one node per DC input, laid out per input count (see
+   * `IV_NODE_X`): one on the left for a 一拖一, both corners for a 一拖二, and a
+   * spread row for the 4-input 4162 - whose two middle nodes have no side edge
+   * to reach and therefore rise straight into the photo's bottom edge.
    *
    * The 并网端口 value is the *absolute* reading: whether the energy is being
    * drawn from the grid (取电) or fed back into it (馈电) is carried by the
@@ -266,22 +276,66 @@ function _hmPowerFlowRegister() {
      around. */
   const IV_PHOTO_ASPECT = {
     "hiflow.png": 736 / 486,
+    "hiflow-800.png": 189 / 168,
+    "hiflow-pro-1in1.png": 237 / 168,
     "hiflow-pro-2in1.png": 360 / 168,
+    "hiflow-pro-4in1.png": 366 / 168,
   };
   const IV_PHOTO_ASPECT_FALLBACK = 360 / 168;
   const IV_CORNER = 10;                          // rounded elbow radius
-  /* The two DC inputs sit on the bottom row, the grid port on the top row.
-     A single-input unit simply leaves the bottom-right slot empty. */
-  const IV_NODE_PV1 = { x: 95, y: 330 };
-  const IV_NODE_PV2 = { x: 605, y: 330 };
+  /* The DC inputs share one bottom row, the grid port sits on the top row.
+     The row is laid out per input count rather than incrementally: a
+     single-input unit keeps its one node on the far left (where the storage
+     schematic's PV1 also is) and a four-input one spreads across the whole row
+     instead of piling up on one side.  The two middle slots of a 4-input unit
+     plug into the photo's bottom edge, the outer two into its side edges - see
+     `elbowRoute`. */
+  const IV_PV_MAX = 4;
+  const IV_NODE_ROW_Y = 330;
+  const IV_NODE_X = {
+    1: [95],
+    2: [95, 605],
+    3: [95, 350, 605],
+    4: [95, 235, 465, 605],
+  };
   const IV_NODE_GRID = { x: 605, y: 90 };
+  /* PV input count by product code, i.e. the first four digits of the serial
+     (`RMI-4161A0209FF6` -> `4161`).  The firmware's model string names a whole
+     family - `HiFlow` covers both the 1-input 1650 and the 1-input 4160 - so
+     the code is the finer discriminator and the one a new SKU is added to.
+     Keep this table in sync with `docs/hoymiles_g2-hiflow.md`. */
+  const IV_PV_COUNT_BY_CODE = {
+    1650: 1,   // HiFlow, single input
+    4160: 1,   // HiFlow, single input
+    4161: 2,   // HiFlow Pro 2-in-1
+    4162: 4,   // HiFlow Pro 4-in-1
+  };
   /* Terminals sit this far inside the photo's corner rather than exactly on
      it: a connector that ends at the very corner reads as passing the unit by,
      not as plugging into it. */
   const IV_TERMINAL_INSET = 22;
-  /* Served by the integration itself (see const.FRONTEND_IMAGES), so no
-     dashboard has to register an image resource by hand. */
-  const IV_IMAGE = "/hoymiles_g2_static/hiflow-pro-2in1.png";
+  /* One cut-out per SKU, matched to the port count the drawing shows.  The
+     photo is part of the diagram rather than decoration: every connector stops
+     on its edge, so a 4-input unit has to show a 4-input body or the two middle
+     risers appear to end in mid-air.  The firmware's model string names a whole
+     family (`HiFlow` covers both 1650 and 4160), so the SKU — the first four
+     digits of the serial — is what selects the artwork. */
+  const IV_IMAGE_DEFAULT = "/hoymiles_g2_static/hiflow-pro-2in1.png";
+  const IV_IMAGE_BY_CODE = {
+    1650: "/hoymiles_g2_static/hiflow-800.png",
+    4160: "/hoymiles_g2_static/hiflow-pro-1in1.png",
+    4161: "/hoymiles_g2_static/hiflow-pro-2in1.png",
+    4162: "/hoymiles_g2_static/hiflow-pro-4in1.png",
+  };
+  /* Used when the SKU is not in the table at all — a unit that predates this
+     list, or one configured through `dev_id` alone.  Matching the art to the
+     resolved port count keeps the geometry sane even then. */
+  const IV_IMAGE_BY_COUNT = {
+    1: "/hoymiles_g2_static/hiflow-pro-1in1.png",
+    2: "/hoymiles_g2_static/hiflow-pro-2in1.png",
+    3: "/hoymiles_g2_static/hiflow-pro-2in1.png",
+    4: "/hoymiles_g2_static/hiflow-pro-4in1.png",
+  };
 
   /** Placement of one product photo: fixed width, aspect-derived height. */
   function ivPhoto(art) {
@@ -329,6 +383,21 @@ function _hmPowerFlowRegister() {
     const r = Math.min(IV_CORNER, gap / 2);
     const vy = down ? y2 - r : y2 + r;
     return `M${node.x} ${rim} V${vy} Q${node.x} ${y2} ${hx} ${y2} H${x2}`;
+  }
+
+  /**
+   * A connector that runs straight up into the unit's bottom edge.
+   *
+   * A four-input unit has two nodes sitting *under* the photo, so their
+   * connector cannot turn sideways to reach a side edge - it has to go up into
+   * the lower edge.  No elbow, so the path is a plain `M / V`: `parsePath` and
+   * `reversePath` already handle it.  The path is written node -> unit, which
+   * is the same direction every other connector uses.
+   */
+  function riserRoute(node, y2) {
+    const up = y2 < node.y;
+    const rim = up ? node.y - NODE_R : node.y + NODE_R;
+    return `M${node.x} ${rim} V${y2}`;
   }
 
   /* Node artwork, baked straight out of the vendor app's icon set (see
@@ -976,9 +1045,11 @@ function _hmPowerFlowRegister() {
         this._config.flow_speed,
         /* Which of the two drawings is shown, and what the unit looks like:
            both are part of the visual result, so a changed `variant` or
-           `image` must rebuild the SVG. */
+           `image` must rebuild the SVG.  The resolved photo — not the raw
+           config value — is the key, because with no `image` configured the
+           artwork follows the SKU, and two SKUs can share a port count. */
         this._isMicroInverter() ? "inv" : "sys",
-        this._config.image, this._config.dim_when_idle,
+        this._productImage(), this._config.dim_when_idle,
         /* How many PV inputs the unit has decides how many nodes are drawn,
            and it is resolved from the readings / the device registry rather
            than from a config field alone - so it has to be part of the key or a
@@ -995,8 +1066,9 @@ function _hmPowerFlowRegister() {
         wkey(d.pv), wkey(d.pv2), wkey(d.grid), wkey(d.load), wkey(d.smartPlug),
         wkey(d.battery),
         /* The micro-inverter layout prints the per-port readings, not the
-           system totals, so they are part of the key as well. */
-        wkey(d.pvPort1), wkey(d.pvPort2),
+           system totals, so they are part of the key as well - all of them, so
+           a 4-input unit redraws when its third or fourth port starts. */
+        d.pvPorts.map(wkey).join(","),
         d.soc === null || d.soc === undefined ? "x" : num(d.soc).toFixed(2),
         d.status, d.rssi, d.packs,
       ].join("\u0001");
@@ -1238,9 +1310,14 @@ function _hmPowerFlowRegister() {
       /* The micro-inverter layout labels one node per *physical* PV input, so
          it needs the per-port readings (`pvs[]`), not the system totals: pv1 is
          the unit's own first input and pv2 its second.  They are `null` on a
-         one-input unit, which is exactly what decides how many nodes to draw. */
-      const pvPort1 = this._read("pv1_power", null);
-      const pvPort2 = this._read("pv2_power", null);
+         one-input unit, which is exactly what decides how many nodes to draw.
+         A 4-input unit (`RMI-4162`) adds `pv3` / `pv4`, so all four are read -
+         the two extra entities exist on every model and simply stay `unknown`
+         where the port is absent. */
+      const pvPorts = [];
+      for (let i = 1; i <= IV_PV_MAX; i += 1) {
+        pvPorts.push(this._read(`pv${i}_power`, null));
+      }
       const load = this._read("system_load_power", null);
       const smartPlug = this._read("system_smart_plug_power", null);
 
@@ -1292,40 +1369,72 @@ function _hmPowerFlowRegister() {
       packs = Math.max(1, Math.min(declared > 0 ? declared : packs, STACK_MAX_PACKS));
 
       return {
-        pv, pv2, pvPort1, pvPort2, grid, load, smartPlug, battery, soc,
+        pv, pv2, pvPorts, grid, load, smartPlug, battery, soc,
         status: status.toLowerCase(), rssi, packs,
       };
     }
 
     /**
-     * How many PV inputs the micro inverter has: 1 (一拖一) or 2 (一拖二).
+     * How many PV inputs the micro inverter has: 1 (一拖一) to 4 (一拖四).
      *
      * Resolved in this order, first hit wins:
      *
-     *  1. `pv_count: 1|2` in the card config - explicit, always wins, and the
-     *     only way to force it when every entity is still `unknown`.
-     *  2. A LIVE `pv2_power` / `system_pv2_power` reading.  Both RMI models
-     *     *create* the `pv2_*` entities (the description table is shared), so
-     *     existence proves nothing; a value does.  `unknown` / `unavailable`
-     *     means the unit never published a second input.
-     *  3. The model name from the device registry - `HiFlow Pro` is the
-     *     two-input unit, `HiFlow` the single-input one.  The G2 integration's
-     *     own device entry has `model: null`, so the parallel `mqtt` device
-     *     (same serial, no `RMI-` prefix) is the one that carries it.
+     *  1. `pv_count: 1|2|3|4` in the card config - explicit, always wins, and
+     *     the only way to force it when every entity is still `unknown`.
+     *  2. The product code in the serial - see `IV_PV_COUNT_BY_CODE`.  Every
+     *     RMI serial starts with the four digit SKU (`RMI-4161A0209FF6`), which
+     *     identifies the port count exactly.  This is checked before any live
+     *     reading because a 4-input unit at night publishes `pv3` / `pv4` as
+     *     `0`, and "no live second reading" must not demote it to 1.
+     *  3. A live per-port reading.  The highest `pvN_power` that reports a value
+     *     decides, so a unit whose code is unknown still draws what it
+     *     publishes.  All models *create* the `pvN_*` entities (the
+     *     description table is shared), so existence proves nothing; a value
+     *     does, and `unknown` / `unavailable` means the input is absent.
+     *  4. The model name from the device registry - `HiFlow Pro` is the
+     *     multi-input family, `HiFlow` the single-input one.  The G2
+     *     integration's own device entry has `model: null`, so the parallel
+     *     `mqtt` device (same serial, no `RMI-` prefix) is the one that carries
+     *     it.  Only reached when the serial carries no known code.
      *
      * Falls back to 1, so a unit with nothing reported draws the simpler
-     * single-input layout instead of inventing a second connector.
+     * single-input layout instead of inventing extra connectors.
      */
     _pvCount() {
-      const forced = Number(this._config && this._config.pv_count);
-      if (forced === 1 || forced === 2) return forced;
+      const forced = Math.round(Number(this._config && this._config.pv_count));
+      if (forced >= 1 && forced <= IV_PV_MAX) return forced;
 
-      if (this._stateOf("pv2_power") || this._stateOf("system_pv2_power")) return 2;
+      const code = this._productCode();
+      if (code && IV_PV_COUNT_BY_CODE[code]) return IV_PV_COUNT_BY_CODE[code];
+
+      /* Highest port that actually reports a value.  `_stateOf` returns null for
+         `unknown` / `unavailable`, which is what an absent input looks like. */
+      let reported = 0;
+      for (let i = 1; i <= IV_PV_MAX; i += 1) {
+        if (this._stateOf(`pv${i}_power`)) reported = i;
+      }
+      if (reported > 0) return reported;
 
       const model = this._deviceModel();
       if (/pro/i.test(model)) return 2;
       if (/hiflow/i.test(model)) return 1;
       return 1;
+    }
+
+    /**
+     * The four digit product code from the serial, or `""`.
+     *
+     * `RMI-4161A0209FF6` -> `"4161"`, `4161A0209FF6` -> `"4161"`.  The code is
+     * the leading four digits of the serial *without* the `RMI-` prefix - which
+     * is why the last `-` separated segment is used rather than the whole
+     * string.  Anything that does not look like a Hoymiles serial yields `""`
+     * and the caller falls through to the reading / model heuristics.
+     */
+    _productCode() {
+      const dev = String(this._dev() || "");
+      const body = dev.split("-").pop().replace(/[^0-9A-Za-z]/g, "");
+      const match = body.match(/^(\d{4})/);
+      return match ? match[1] : "";
     }
 
     /** Model string of this device, from whichever registry entry has one. */
@@ -1350,6 +1459,23 @@ function _hmPowerFlowRegister() {
     }
 
     /* ----------------------------- render ----------------------------- */
+
+    /**
+     * The product photo this unit should be drawn with.
+     *
+     * An explicit `image` in the card config always wins - that is what lets a
+     * dashboard override the artwork without a code change.  Otherwise the SKU
+     * picks the cut-out, so the body shows the same number of DC inputs as the
+     * nodes drawn below it; a code the table does not know falls back to the
+     * resolved port count, and a unit with neither keeps the 2-in-1 default.
+     */
+    _productImage() {
+      const forced = String((this._config && this._config.image) || "").trim();
+      if (forced) return forced;
+      const code = this._productCode();
+      if (code && IV_IMAGE_BY_CODE[code]) return IV_IMAGE_BY_CODE[code];
+      return IV_IMAGE_BY_COUNT[this._pvCount()] || IV_IMAGE_DEFAULT;
+    }
 
     render() {
       if (!this._config) return html``;
@@ -1487,24 +1613,25 @@ function _hmPowerFlowRegister() {
     _svgInverter(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
       const pvCount = this._pvCount();
-      const photo = ivPhoto((this._config && this._config.image) || IV_IMAGE);
+      const photo = ivPhoto(this._productImage());
       const pvNodes = [];
-      /* Both PV connectors leave the bottom row upwards and turn inwards, so
-         they pick up the unit along its lower edge - the only edge PV-2 does
-         not share with the grid connector. */
+      /* The connectors run from their node towards the unit, so each slot has
+         to know where it may plug in.  A node on the outer end of the row turns
+         sideways into the photo's side edge; a node underneath the photo has no
+         room to turn and rises straight into its bottom edge instead. */
       const pvTermY = photo.b - IV_TERMINAL_INSET;
-      const pvSpec = [
-        { id: "pv1", node: IV_NODE_PV1, power: d.pvPort1, edge: photo.l },
-        { id: "pv2", node: IV_NODE_PV2, power: d.pvPort2, edge: photo.r },
-      ];
+      const rowX = IV_NODE_X[pvCount] || IV_NODE_X[1];
       for (let i = 0; i < pvCount; i += 1) {
-        const spec = pvSpec[i];
+        const x = rowX[Math.min(i, rowX.length - 1)];
+        const under = x > photo.l && x < photo.r;
         pvNodes.push({
-          id: spec.id,
-          x: spec.node.x,
-          y: spec.node.y,
-          power: spec.power,
-          route: elbowRoute(spec.node, spec.edge, pvTermY),
+          id: `pv${i + 1}`,
+          x,
+          y: IV_NODE_ROW_Y,
+          power: d.pvPorts[i],
+          route: under
+            ? riserRoute({ x, y: IV_NODE_ROW_Y }, pvTermY)
+            : elbowRoute({ x, y: IV_NODE_ROW_Y }, x < photo.l ? photo.l : photo.r, pvTermY),
         });
       }
 
@@ -1537,7 +1664,7 @@ function _hmPowerFlowRegister() {
         ? routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("")
         : "";
 
-      const busy = [d.pvPort1, d.pvPort2, d.grid]
+      const busy = [...d.pvPorts, d.grid]
         .some((v) => present(v) && Math.abs(num(v)) >= MIN_FLOW);
 
       return `<svg viewBox="0 0 ${IV_W} ${IV_H}" preserveAspectRatio="xMidYMid meet"
@@ -1557,7 +1684,7 @@ function _hmPowerFlowRegister() {
 
     /** The product photo at the centre of the micro-inverter layout. */
     _unitImage(busy, photo) {
-      const art = (this._config && this._config.image) || IV_IMAGE;
+      const art = this._productImage();
       const box = photo || ivPhoto(art);
       return `<image class="pf-body" x="${box.l}" y="${box.t}"
                     width="${box.w}" height="${box.h}"
@@ -1916,11 +2043,11 @@ function _hmPowerFlowRegister() {
             label="variant (auto|inverter - 'inverter' draws the HiFlow PV + grid port layout)"
             .value=${config.variant || ""} @change=${this._changed("variant")}></ha-textfield>
           <ha-textfield
-            label="pv_count (1|2 - PV inputs of a micro inverter, empty = auto)"
+            label="pv_count (1-4 - PV inputs of a micro inverter, empty = auto)"
             .value=${config.pv_count === undefined ? "" : String(config.pv_count)}
             @change=${this._changed("pv_count")}></ha-textfield>
           <ha-textfield
-            label="image (product photo URL, default the HiFlow Pro 2-in-1)"
+            label="image (product photo URL, empty = follow the SKU)"
             .value=${config.image || ""} @change=${this._changed("image")}></ha-textfield>
           <label class="sw">
             <ha-switch .checked=${config.show_title !== false}

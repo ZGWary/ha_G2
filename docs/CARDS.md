@@ -200,10 +200,8 @@ language: zh
 | `max_width` | number (px) | `620` | Maximum width of the illustration; it stays centred. |
 | `flow_speed` | number | `1` | Speed multiplier for the moving pearls. `0.5` is calmer, `2` is faster. |
 | `variant` | `inverter` | — | Set to `inverter` for the **micro-inverter layout** (see below). Empty keeps the four-branch storage schematic. |
-| `image` | URL | HiFlow Pro 2-in-1 product photo | Product photo in the middle of the micro-inverter layout; needs a transparent-backed crop. |
-| `pv_count` | number | *auto* | DC inputs to draw in the micro-inverter layout: `1` gives a single `PV1`, `2` gives `PV1` + `PV2`. Omit to infer (see below). |
-| `dim_when_idle` | bool | `true` | In the micro-inverter layout, fade the photo to 55 % when nothing is flowing. |
-| `image` | URL | HiFlow Pro 2-in-1 photo | Product photo drawn in the middle of the micro-inverter layout; must be a transparent cut-out. |
+| `image` | URL | *picked by SKU* | Product photo in the middle of the micro-inverter layout; must be a transparent cut-out. **Leave it out** — the card picks the cut-out from the serial's model code (see below) and an explicit value is only for overriding it. |
+| `pv_count` | number | *auto* | DC inputs to draw in the micro-inverter layout, `1`–`4`: `1` gives a single `PV1`, `2` gives `PV1` + `PV2`, `4` draws through to `PV4` (a 4-in-1, whose middle two inputs rise into the photo's bottom edge). Omit to infer (see below). |
 | `dim_when_idle` | bool | `true` | In the micro-inverter layout the photo fades to 55 % when nothing flows. `false` keeps it fully opaque. |
 | `entities` | map | — | Entity overrides, keyed by suffix (see below). |
 
@@ -296,14 +294,32 @@ not have. With `variant: inverter` the card draws only the ends it really has:
 
 That is: **photo centred, grid port top-right, PV-1 bottom-left and PV-2
 bottom-right** — the same arrangement the vendor app uses on its device page.
-All three nodes join the photo's left and right edges through orthogonal
-connectors with rounded corners, never crossing the unit.
+Every node joins the photo's left and right edges through orthogonal connectors
+with rounded corners, never crossing the unit.
+
+A 4-in-1 unit (`pv_count: 4`) spreads the PV nodes into one row rather than
+stacking them in the corners, so each input owns a position:
+
+```
+                          ⬜ Grid port
+                               │
+                          ▣ photo
+                        ┌──┴─┬─┴──┐
+       ⬜ PV1 ──────────┘    │    └────────── ⬜ PV4
+                      ⬜ PV2 ┘    └ ⬜ PV3
+```
+
+The outer pair (`PV1` / `PV4`) takes the elbow down the left and right edge; the
+inner pair (`PV2` / `PV3`) has no side edge left to use, so it **rises straight
+into the photo's bottom edge**. Giving every input its own position is what
+stops the row from reading as "one is missing". Three inputs (`pv_count: 3`) is
+the middle form: one elbow each side, one riser in the centre.
 
 ```yaml
 - type: custom:hoymiles-g2-power-flow
   dev_id: RMI-4161A0209FF6
   variant: inverter
-  image: /hoymiles_g2_static/hiflow-pro-2in1.png
+  # image is left out on purpose: the card picks the cut-out from the SKU
   pv_count: 2                 # 2-in-1: PV1 + PV2. Set 1 for a single-input unit.
   title: My home
   show_title: false
@@ -326,13 +342,29 @@ connector colour instead: `> 0` is importing (pearls run towards the unit, blue
 line), `< 0` is exporting (pearls run towards the grid, amber line). The grid
 node is **always drawn**, even at 0 W or with no reading (`—`), because "no grid
 reading" and "0 W on the grid" are entirely different facts.
-- The middle is the real product photo (replace it with `image`), centred and
-sized as `min(300, 190 × aspect)`, where the aspect ratio is looked up by file
-name in `IV_PHOTO_ASPECT` (`hiflow.png` = 736/486, `hiflow-pro-2in1.png` =
-360/168, falling back to `360/168`). Connector ends stop 22 px inside the
-photo's left/right edges (`IV_TERMINAL_INSET`) instead of touching the border.
-Match the photo to the model too: `hiflow-pro-2in1.png` for the 2-in-1,
-`hiflow.png` for the single.
+- The middle is the real product photo, centred and sized as
+  `min(300, 190 × aspect)`, where the aspect ratio is looked up by file name in
+  `IV_PHOTO_ASPECT` (`hiflow.png` = 736/486, `hiflow-800.png` = 189/168,
+  `hiflow-pro-1in1.png` = 237/168, `hiflow-pro-2in1.png` = 360/168,
+  `hiflow-pro-4in1.png` = 366/168, falling back to `360/168`). Connector ends
+  stop 22 px inside the photo's left/right edges (`IV_TERMINAL_INSET`) instead
+  of touching the border.
+- **The artwork follows the SKU — do not set `image` just to pick a photo.** The
+  photo is part of the diagram rather than decoration (every connector stops on
+  its edge), so a 4-input unit has to show a 4-input body or the two middle
+  risers appear to end in mid-air. `IV_IMAGE_BY_CODE` therefore maps the first
+  four digits of the serial to the matching cut-out:
+
+  | SKU | Model | Photo |
+  | --- | --- | --- |
+  | `1650` | HiFlow | `hiflow-800.png` |
+  | `4160` | HiFlow Pro 1-in-1 | `hiflow-pro-1in1.png` |
+  | `4161` | HiFlow Pro 2-in-1 | `hiflow-pro-2in1.png` |
+  | `4162` | HiFlow Pro 4-in-1 | `hiflow-pro-4in1.png` |
+
+  An unknown SKU falls back to `IV_IMAGE_BY_COUNT` (the resolved port count),
+  then to the 2-in-1 default. An explicit `image:` still wins over both, which
+  is what lets a dashboard override the artwork without a code change.
 - The canvas is a fixed `700 × 430`. All coordinates live in the `IV_*` constants
 at the top of the file (`IV_NODE_PV1`, `IV_NODE_PV2`, `IV_NODE_GRID`,
 `IV_PHOTO_CX`, `IV_PHOTO_CY`, `IV_CORNER`), so nudging a node never touches the

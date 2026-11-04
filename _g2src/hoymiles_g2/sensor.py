@@ -589,6 +589,13 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
         requires=CAP_SYSTEM_STATE, **_ENERGY
     ),
     # ---------------- device/state : PV ports ----------------
+    # All four ports are created on every model, exactly like ``pv1`` / ``pv2``
+    # always were.  The ``pvs[]`` array is what actually carries the readings and
+    # its length varies per SKU - a 4161 2-in-1 reports two entries, a 4162
+    # 4-in-1 reports four - so gating a port on a model string would hide a
+    # genuine input.  A port the unit does not have simply stays ``unknown``,
+    # which is the same "this input does not exist" signal the card already uses
+    # to decide how many connectors to draw.
     HoymilesSensorDescription(
         key="pv1_power", name="PV1 Power", value_fn=pv(0), **_POWER
     ),
@@ -596,12 +603,10 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
         key="pv2_power", name="PV2 Power", value_fn=pv(1), **_POWER
     ),
     HoymilesSensorDescription(
-        key="pv3_power", name="PV3 Power", value_fn=pv(2),
-        requires=CAP_SYSTEM_STATE, **_POWER
+        key="pv3_power", name="PV3 Power", value_fn=pv(2), **_POWER
     ),
     HoymilesSensorDescription(
-        key="pv4_power", name="PV4 Power", value_fn=pv(3),
-        requires=CAP_SYSTEM_STATE, **_POWER
+        key="pv4_power", name="PV4 Power", value_fn=pv(3), **_POWER
     ),
     # ---------------- device/state : per port PV energy (micro inverter) -------
     # Only the micro inverter firmware puts ``ed`` / ``et`` inside ``pvs[]``; a
@@ -622,6 +627,16 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
     HoymilesSensorDescription(
         key="pv2_energy_today", name="PV2 Energy Today",
         value_fn=pv_energy(1, "ed"),
+        requires_absent=CAP_SYSTEM_STATE, **_ENERGY
+    ),
+    HoymilesSensorDescription(
+        key="pv3_energy_today", name="PV3 Energy Today",
+        value_fn=pv_energy(2, "ed"),
+        requires_absent=CAP_SYSTEM_STATE, **_ENERGY
+    ),
+    HoymilesSensorDescription(
+        key="pv4_energy_today", name="PV4 Energy Today",
+        value_fn=pv_energy(3, "ed"),
         requires_absent=CAP_SYSTEM_STATE, **_ENERGY
     ),
     # ---------------- device/state : packs ----------------

@@ -8,12 +8,15 @@
 
 | 文件 | 改动 |
 | --- | --- |
-| `const.py` | 新增 `HIFLOW_IMAGE_FILENAME` / `HIFLOW_PRO_IMAGE_FILENAME`、`FRONTEND_IMAGES`、`HIFLOW_IMAGE_URL` / `HIFLOW_PRO_IMAGE_URL` |
+| `const.py` | 新增 `HIFLOW_IMAGE_FILENAME` / `HIFLOW_PRO_IMAGE_FILENAME` / `HIFLOW_800_IMAGE_FILENAME` / `HIFLOW_PRO_1IN1_IMAGE_FILENAME` / `HIFLOW_PRO_4IN1_IMAGE_FILENAME`、`FRONTEND_IMAGES` 及对应 `*_IMAGE_URL` |
 | `__init__.py` | `_collect_assets()` 同时把 `FRONTEND_IMAGES` 注册为静态路由；`add_extra_js_url` 跳过非 `.js` 资源 |
 | `www/hoymiles-g2-battery.js` | 微逆模式：设备识别、`_isMicroInverter()`、`_microInverterBody()`、样式 |
 | `www/hoymiles-g2-power-flow.js` | 微逆布局 `variant: inverter`：只画光伏 + 并网端口，中间放产品图 |
 | `www/hiflow.png` | 产品图（27087 B，736×486），随卡片一起由集成提供 |
-| `www/hiflow-pro-2in1.png` | HiFlow Pro 2-in-1 产品图（38150 B，360×168 透明裁切），供电网卡片微逆布局使用 |
+| `www/hiflow-800.png` | HiFlow（型号代码 `1650`）产品图（18178 B，189×168 透明裁切） |
+| `www/hiflow-pro-1in1.png` | HiFlow Pro 1-in-1（`4160`）产品图（25252 B，237×168 透明裁切） |
+| `www/hiflow-pro-2in1.png` | HiFlow Pro 2-in-1（`4161`）产品图（38150 B，360×168 透明裁切） |
+| `www/hiflow-pro-4in1.png` | HiFlow Pro 4-in-1（`4162`）产品图（54518 B，366×168 透明裁切） |
 
 ## 应用方式
 
@@ -27,7 +30,10 @@ patch -p1 < ha_G2/docs/hoymiles_g2-hiflow.patch
 然后复制产品图并把预压缩副本删掉（旧 `.js.gz` 会被 aiohttp 优先返回，导致改动看不到）：
 
 ```bash
-cp /config/www/hiflow.png /config/custom_components/hoymiles_g2/www/hiflow.png
+cd /config/custom_components/hoymiles_g2/www
+cp /config/www/hiflow.png /config/www/hiflow-800.png \
+   /config/www/hiflow-pro-1in1.png /config/www/hiflow-pro-2in1.png \
+   /config/www/hiflow-pro-4in1.png .
 rm -f /config/custom_components/hoymiles_g2/www/*.js.gz
 ha core restart
 ```
@@ -54,7 +60,7 @@ ha core restart
 - type: custom:hoymiles-g2-power-flow
   dev_id: RMI-4161A0209FF6
   variant: inverter
-  image: /hoymiles_g2_static/hiflow-pro-2in1.png   # 默认即此图，可省略
+  # image 留空：按序列号前四位的型号代码自动选图（4161 → hiflow-pro-2in1.png）
   title: 我的家
   show_title: false
   max_width: 700
@@ -81,10 +87,20 @@ ha core restart
 | `IV_TERMINAL_INSET` | 22 | 连线终点距产品图边缘的内缩量 |
 | `IV_CORNER` | 10 | 折线圆角半径 |
 
-- 产品图按 `IV_PHOTO_ASPECT` 里登记的宽高比计算包围盒（`hiflow.png` = 736/486，`hiflow-pro-2in1.png` = 360/168）；未登记的图按 `360/168` 兜底。
+- 产品图按 `IV_PHOTO_ASPECT` 里登记的宽高比计算包围盒（`hiflow.png` = 736/486，`hiflow-800.png` = 189/168，`hiflow-pro-1in1.png` = 237/168，`hiflow-pro-2in1.png` = 360/168，`hiflow-pro-4in1.png` = 366/168）；未登记的图按 `360/168` 兜底。
+- 选图顺序：显式 `image` → `IV_IMAGE_BY_CODE`（按序列号前四位，见下）→ `IV_IMAGE_BY_COUNT`（按解析出的 PV 路数）→ 兜底 `hiflow-pro-2in1.png`。产品图是示意图的一部分而不是装饰（每条连线都停在它的边缘上），所以**必须**让机身输入路数与画出来的节点数一致，一拖四画在二输入机身上会让中间两条竖线看起来断在半空中。
 - 三条连线都用 `elbowRoute()` 生成正交折线（`M / V|H / Q / H`），终点落在产品图左右边缘、纵向内缩 22 px 处；PV 段从下方节点向上接入，并网段从右上节点向下接入。
 - 左侧标签在圆圈下方，并网端口标签在圆圈**上方**（`above: true`），避免压到产品图。
 - 并网端口的数值正文用绝对值，方向只由珠子与线色表达（见下）。
+
+型号代码与产品图的对应：
+
+| 型号代码（序列号第 5–8 位） | 机型 | 产品图 |
+| --- | --- | --- |
+| `1650` | HiFlow | `hiflow-800.png` |
+| `4160` | HiFlow Pro 1-in-1 | `hiflow-pro-1in1.png` |
+| `4161` | HiFlow Pro 2-in-1 | `hiflow-pro-2in1.png` |
+| `4162` | HiFlow Pro 4-in-1 | `hiflow-pro-4in1.png` |
 
 ### 控制卡片（`hoymiles-g2-control`）会记住上一次下发的值
 
