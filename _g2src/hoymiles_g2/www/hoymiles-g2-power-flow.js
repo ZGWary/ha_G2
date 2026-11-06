@@ -1746,6 +1746,10 @@ function _hmPowerFlowRegister() {
 
     _svgSystem(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
+      /* A missing reading prints a dash, not "0.0 W".  Until a unit reports for
+         the first time every `system_*` entity is `unknown`, and rendering that
+         as zero made a silent device look like an idle one. */
+      const reading = (v) => (v === null || v === undefined ? "—" : fmtW(v));
 
       /* The wiring diagram: PV1 / storage run into the inverter's left side, the
          inverter's right side meets a junction on the right edge, and the
@@ -1769,6 +1773,14 @@ function _hmPowerFlowRegister() {
       const hasBattery = present(d.battery);
       const trunk = num(d.pv) + num(d.pv2) + (hasBattery ? num(d.battery) : 0); // W into the junction
 
+      /* Which branches are *hardware*, not data.
+       *
+       * pv1, the grid and the load exist on every unit this card draws, so
+       * their connectors are always laid out - a device that has not reported
+       * yet still has to look like the same machine as a reporting one, with
+       * the readings left blank.  Only battery (storage units) and pv2 (a
+       * second DC input) are genuinely optional, so only those two decide
+       * whether a connector exists at all. */
       const routes = [
         { id: "pv", d: "M104 142 V190 Q104 200 114 200 H283", power: d.pv,
           color: COLORS.pv, reverse: num(d.pv) < 0 },
@@ -1779,18 +1791,14 @@ function _hmPowerFlowRegister() {
         { id: "grid", d: `M600 142 V${JUNCTION.y - 6}`, power: d.grid,
           color: num(d.grid) > 0 ? COLORS.grid : COLORS.grid_out,
           reverse: num(d.grid) < 0 },
+        { id: "load", d: LAMP_ROUTE, power: d.load,
+          color: COLORS.load, reverse: num(d.load) >= 0 },
+        { id: "plug", d: `M600 322 V${JUNCTION.y + 6}`,
+          power: d.smartPlug, color: COLORS.sp, reverse: num(d.smartPlug) >= 0 },
       ];
       if (present(d.pv2)) {
         routes.push({ id: "pv2", d: PV2_ROUTE, power: d.pv2,
           color: COLORS.pv6, reverse: num(d.pv2) < 0 });
-      }
-      if (present(d.load)) {
-        routes.push({ id: "load", d: LAMP_ROUTE, power: d.load,
-          color: COLORS.load, reverse: num(d.load) >= 0 });
-      }
-      if (present(d.smartPlug)) {
-        routes.push({ id: "plug", d: `M600 322 V${JUNCTION.y + 6}`,
-          power: d.smartPlug, color: COLORS.sp, reverse: num(d.smartPlug) >= 0 });
       }
 
       const edges = routes.map((r) => `
@@ -1799,15 +1807,18 @@ function _hmPowerFlowRegister() {
 
       const dots = routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("");
 
-      /* One icon per node and the unit in the middle.  A branch whose entity is
-         absent is dropped (and its connector with it); a branch that exists but
-         reads zero is still drawn, in its dim variant - exactly like the app. */
+      /* One icon per node and the unit in the middle.  The same rule as the
+         connectors: the branches the hardware has are always drawn, dim and
+         dashed-value until the unit reports, so the schematic keeps its shape
+         instead of collapsing to a single stray node.  A branch that exists but
+         reads zero is still drawn in its dim variant - exactly like the app. */
       const nodes = this._nodes(d, {
         pv2: present(d.pv2),
         battery: hasBattery,
-        plug: present(d.smartPlug),
-        lamp: present(d.load),
-        grid: present(d.grid),
+        plug: true,
+        lamp: true,
+        grid: true,
+        reading,
       });
 
       /* The unit in the middle works as soon as *anything* flows through it, so
@@ -1868,6 +1879,9 @@ function _hmPowerFlowRegister() {
     _nodes(d, opts) {
       const t = (en, zh) => this._t(en, zh);
       const working = (v) => Math.abs(num(v)) >= MIN_FLOW;
+      /* `—` for a reading that does not exist yet, so "not reported" and
+         "reported 0 W" stay distinguishable. */
+      const reading = opts.reading || ((v) => fmtW(v));
       const parts = [];
 
       const node = (x, y, icon, on, value, caption) => {
@@ -1884,16 +1898,16 @@ function _hmPowerFlowRegister() {
       };
 
       node(NODE_COL_L, NODE_ROW_TOP, "pv", working(d.pv),
-        fmtW(d.pv), t("PV1", "光伏1"));
+        reading(d.pv), t("PV1", "光伏1"));
       if (opts.battery) {
         node(NODE_COL_L, NODE_ROW_BOT, "battery", working(d.battery),
-          `${fmtW(d.battery)}${d.soc === null ? "" : `　${num(d.soc).toFixed(2)}%`}`,
+          `${reading(d.battery)}${d.soc === null ? "" : `　${num(d.soc).toFixed(2)}%`}`,
           t("Storage", "微储"));
       }
 
       if (opts.pv2) {
         node(NODE_COL_M, NODE_ROW_TOP, "pv", working(d.pv2),
-          fmtW(d.pv2), t("PV2", "光伏2"));
+          reading(d.pv2), t("PV2", "光伏2"));
       }
       if (opts.grid) {
         const g = num(d.grid);
@@ -1903,15 +1917,15 @@ function _hmPowerFlowRegister() {
           ? t("Grid", "电网")
           : (importing ? t("Grid in", "电网输入") : t("Grid out", "电网输出"));
         node(NODE_COL_R, NODE_ROW_TOP, "grid", working(d.grid),
-          fmtW(d.grid), caption);
+          reading(d.grid), caption);
       }
       if (opts.lamp) {
         node(NODE_COL_M, NODE_ROW_BOT, "load", working(d.load),
-          fmtW(d.load), t("Load", "负载"));
+          reading(d.load), t("Load", "负载"));
       }
       if (opts.plug) {
         node(NODE_COL_R, NODE_ROW_BOT, "plug", working(d.smartPlug),
-          fmtW(d.smartPlug), t("Smart plug", "智能插座"));
+          reading(d.smartPlug), t("Smart plug", "智能插座"));
       }
 
       return parts.join("");

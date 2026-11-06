@@ -181,6 +181,13 @@ are the app's own artwork, embedded in the card.
 
 - **The unit in the middle works as soon as anything flows through it**, so its
   artwork is the coloured one then and the dim one when the whole system is idle.
+- **A silent unit still draws the whole schematic.** PV1, the grid, the load and
+  the smart plug are *hardware*, not data, so their icons and connectors are laid
+  out whether or not the unit has ever reported — the readings simply print `—`
+  and the branches stay in their dim, unlit state. Only storage (storage units)
+  and PV2 (a second DC input) are genuinely optional and decide for themselves
+  whether they exist. A branch that reports `0 W` shows `0.0 W`; a branch that
+  reports nothing shows `—`, so "idle" and "not there yet" never look the same.
 ```yaml
 type: custom:hoymiles-power-flow
 dev_id: MSA-280520260806
