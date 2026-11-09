@@ -200,6 +200,61 @@ CAPABILITIES_ALL: Final = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# PV input count
+# ---------------------------------------------------------------------------
+# The firmware's model string names a whole family ("HiFlow" covers both the
+# 1-input 1650 and the 1-input 4160), so it cannot tell a 2-input from a
+# 4-input unit.  The four digit SKU at the start of the serial can - and unlike
+# ``device/state["pv_num"]`` it is known *before* the first payload arrives,
+# which matters because entities are created during setup.
+#
+# Mirrors ``IV_PV_COUNT_BY_CODE`` in ``www/hoymiles-g2-power-flow.js``; keep
+# both tables in sync (see ``docs/hoymiles_g2-hiflow.md``).
+PV_COUNT_BY_CODE: Final[dict[str, int]] = {
+    "1650": 1,  # HiFlow, single input
+    "4160": 1,  # HiFlow Pro 1-in-1
+    "4161": 2,  # HiFlow Pro 2-in-1
+    "4162": 4,  # HiFlow Pro 4-in-1
+}
+# Storage units (MSA-) do not publish a fixed port count in their serial; the
+# firmware reports ``pv_num`` instead.  Four is the documented maximum, so it is
+# used as the default whenever the count cannot be derived up front.
+PV_COUNT_MAX: Final = 4
+
+
+def pv_count_from_dev_id(dev_id: str) -> int | None:
+    """Return how many PV inputs this unit has, or ``None`` when unknown.
+
+    ``RMI-4161A0209FF6`` -> ``"4161"`` -> ``2``.  A serial that is not a known
+    SKU returns ``None`` so the caller can fall back to the firmware's own
+    ``pv_num`` or to the maximum.
+    """
+    body = dev_id.split("-")[-1]
+    digits = "".join(ch for ch in body[:4] if ch.isdigit())
+    if len(digits) != 4:
+        return None
+    return PV_COUNT_BY_CODE.get(digits)
+
+
+# ---------------------------------------------------------------------------
+# Product family
+# ---------------------------------------------------------------------------
+# The serial prefix names the product family: ``RMI-`` is the grid-tied micro
+# inverter line and ``MSA-`` the micro storage one.  Only a fallback - the
+# firmware's own discovery carries a precise model string (``HiFlow Pro``) which
+# the coordinator prefers when it can find one.
+MODEL_BY_PREFIX: Final[dict[str, str]] = {"RMI-": "HiFlow", "MSA-": "HiBattery"}
+
+
+def model_from_dev_id(dev_id: str) -> str | None:
+    """Return the product family implied by the serial prefix, if known."""
+    upper = dev_id.upper()
+    for prefix, name in MODEL_BY_PREFIX.items():
+        if upper.startswith(prefix):
+            return name
+    return None
+
+# ---------------------------------------------------------------------------
 # Availability / staleness (protocol §22 pushes every 1 s, §23/§24 every 5 min)
 # ---------------------------------------------------------------------------
 # How often the availability watchdog re-evaluates source freshness.

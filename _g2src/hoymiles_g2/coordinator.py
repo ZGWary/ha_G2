@@ -28,6 +28,7 @@ from .const import (
     PAYLOAD_NOT_AVAILABLE,
     PHASE_POWER_MIN,
     PHASES,
+    PV_COUNT_MAX,
     SOURCE_STALE_SECONDS,
     SRC_ALARM,
     SRC_DEVICE,
@@ -49,6 +50,8 @@ from .const import (
     T_TOU_DAY_ACK,
     T_TOU_STATUS,
     T_TOU_WEEK_ACK,
+    model_from_dev_id,
+    pv_count_from_dev_id,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -102,6 +105,9 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # device that merely had not been heard from yet.
         self._capabilities: frozenset[str] | None = None
         self._capabilities_ready = asyncio.Event()
+        # Cached product name.  ``None`` = not resolved yet, ``""`` = resolved to
+        # nothing (so the registry is not scanned again on every access).
+        self._model: str | None = None
 
     # ------------------------------------------------------------------
     # availability
@@ -143,6 +149,93 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def capabilities(self) -> frozenset[str]:
         """Topics the firmware declared, or "all" while nothing was received."""
         return self._capabilities if self._capabilities is not None else CAPABILITIES_ALL
+
+    @property
+    def pv_count(self) -> int:
+        """How many PV inputs this unit has.
+
+        Three sources, most reliable first:
+
+        1. The firmware's own ``device/state["pv_num"]`` - authoritative once a
+           payload has arrived, because it describes the hardware directly.
+        2. The SKU at the start of the serial (``RMI-4161`` -> 2 inputs).  Used
+           before any payload exists, which is what matters during setup: the
+           entities are created then, long before the first 5 minute report.
+        3. ``PV_COUNT_MAX`` - the documented maximum, so a device that declares
+           nothing still gets every port rather than silently losing readings.
+        """
+        payload = self.data.get(SRC_DEVICE)
+        if isinstance(payload, dict):
+            declared = payload.get("pv_num")
+            if isinstance(declared, int) and not isinstance(declared, bool):
+                if 1 <= declared <= PV_COUNT_MAX:
+                    return declared
+
+        known = pv_count_from_dev_id(self.dev_id)
+        if known is not None:
+            return known
+
+        return PV_COUNT_MAX
+
+    @property
+    def device_model(self) -> str | None:
+        """Product name for this unit, e.g. ``HiFlow Pro``.
+
+        The firmware publishes its own MQTT discovery under the bare serial and
+        that device registry entry carries a precise ``model``; this
+        integration's own entry has none.  Reading it here lets every entity
+        populate ``DeviceInfo.model`` from one place, which in turn means the
+        dashboard title no longer depends on another integration being installed.
+
+        Falls back to the serial prefix (``RMI-`` -> ``HiFlow``), then to
+        ``None`` - a missing model only costs a less descriptive title.
+        """
+        if self._model is not None:
+            return self._model or None
+
+        resolved = ""
+        try:
+            from homeassistant.helpers import device_registry as dr  # noqa: PLC0415
+
+            registry = dr.async_get(self.hass)
+        except Exception:  # noqa: BLE001 - a label is never worth breaking setup
+            registry = None
+
+        if registry is not None:
+            # Every spelling the registry may use for this one serial: this
+            # integration's ``(DOMAIN, "RMI-<SN>")`` and the firmware's
+            # ``("mqtt", "<SN>")``.
+            wanted = {
+                self.dev_id.lower(),
+                self.dev_id.lower().replace("-", ""),
+            }
+            if "-" in self.dev_id:
+                wanted.add(self.dev_id.rsplit("-", 1)[-1].lower())
+
+            for device in list(registry.devices.values()):
+                for pair in device.identifiers:
+                    if not pair or pair[1] is None:
+                        continue
+                    candidate = str(pair[1]).lower()
+                    if candidate not in wanted and candidate.replace("-", "") not in wanted:
+                        continue
+                    for attr in ("model", "model_id"):
+                        value = getattr(device, attr, None)
+                        if value:
+                            resolved = str(value)
+                            break
+                    if resolved:
+                        break
+                if resolved:
+                    break
+
+        if not resolved:
+            resolved = model_from_dev_id(self.dev_id) or ""
+
+        # Cached - including the empty result - because the registry is only read
+        # during setup and a per-property lookup on every state write is wasteful.
+        self._model = resolved
+        return resolved or None
 
     def has_capability(self, capability: str) -> bool:
         """Return True when the firmware declared this capability."""

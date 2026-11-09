@@ -132,6 +132,7 @@ class HoymilesBinarySensor(CoordinatorEntity[HoymilesCoordinator], BinarySensorE
             identifiers={(DOMAIN, dev_id)},
             name=dev_id,
             manufacturer=MANUFACTURER,
+            model=coordinator.device_model,
         )
 
     @property

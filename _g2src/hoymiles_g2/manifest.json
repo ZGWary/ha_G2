@@ -3,7 +3,7 @@
   "name": "Hoymiles MS-G2",
   "codeowners": ["@hoymiles-ha"],
   "config_flow": true,
-  "dependencies": ["mqtt", "http", "frontend"],
+  "dependencies": ["mqtt", "http", "frontend", "lovelace"],
   "documentation": "https://github.com/hoymiles-ha/ha_G2",
   "integration_type": "hub",
   "iot_class": "local_push",

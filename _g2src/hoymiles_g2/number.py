@@ -139,6 +139,7 @@ class HoymilesPhaseNumber(
             identifiers={(DOMAIN, dev_id)},
             name=dev_id,
             manufacturer=MANUFACTURER,
+            model=coordinator.device_model,
         )
 
     @property

@@ -75,6 +75,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await _async_register_frontend(hass)
     await async_setup_services(hass)
+
+    # Best-effort: materialise the device's Lovelace dashboard on first setup,
+    # mirroring the official integration's auto-generated panel.  Never raises.
+    # ``pv_count`` is resolved from the product code even before the first
+    # ``device/state`` arrives, so a fresh install picks the right layout.
+    from . import lovelace  # noqa: PLC0415
+
+    await lovelace.async_ensure_dashboard(hass, dev_id, coordinator.pv_count)
+
     return True
 
 

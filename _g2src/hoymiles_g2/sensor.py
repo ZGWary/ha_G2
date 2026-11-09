@@ -10,6 +10,7 @@ firmware already registers them through MQTT discovery.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Final
 
@@ -30,7 +31,7 @@ from homeassistant.const import (
     UnitOfPower,
     UnitOfTemperature,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -43,6 +44,7 @@ from .const import (
     CAP_TOU,
     DOMAIN,
     MANUFACTURER,
+    PV_COUNT_MAX,
     SRC_DEVICE,
     SRC_KEEPALIVE,
     SRC_QUICK,
@@ -55,6 +57,8 @@ from .const import (
     TOU_WEEK_ACK_STATUS,
 )
 from .coordinator import HoymilesCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # value_fn helpers
@@ -363,6 +367,10 @@ class HoymilesSensorDescription(SensorEntityDescription):
     # the keep-alive state unreadable, because the card uses it to decide whether
     # the lease is being held - exactly when that matters most.
     ignores_device_availability: bool = False
+    # 1-based PV input this entity belongs to.  A port the unit does not have is
+    # never created, so a 2-input HiFlow Pro no longer gets two permanently
+    # ``unknown`` sensors.  ``None`` means "not a per-port entity".
+    pv_port: int | None = None
 
 
 _POWER = {
@@ -589,24 +597,22 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
         requires=CAP_SYSTEM_STATE, **_ENERGY
     ),
     # ---------------- device/state : PV ports ----------------
-    # All four ports are created on every model, exactly like ``pv1`` / ``pv2``
-    # always were.  The ``pvs[]`` array is what actually carries the readings and
-    # its length varies per SKU - a 4161 2-in-1 reports two entries, a 4162
-    # 4-in-1 reports four - so gating a port on a model string would hide a
-    # genuine input.  A port the unit does not have simply stays ``unknown``,
-    # which is the same "this input does not exist" signal the card already uses
-    # to decide how many connectors to draw.
+    # One entity per *physical* input.  How many a unit has is derived from the
+    # SKU in its serial (``pv_count_from_dev_id``) and refined by the firmware's
+    # own ``pv_num``, so a 2-input HiFlow Pro creates only PV1 / PV2.  The card
+    # keeps working either way: it decides its layout from the serial's product
+    # code as well, so removing the phantom ports does not change the drawing.
     HoymilesSensorDescription(
-        key="pv1_power", name="PV1 Power", value_fn=pv(0), **_POWER
+        key="pv1_power", name="PV1 Power", value_fn=pv(0), pv_port=1, **_POWER
     ),
     HoymilesSensorDescription(
-        key="pv2_power", name="PV2 Power", value_fn=pv(1), **_POWER
+        key="pv2_power", name="PV2 Power", value_fn=pv(1), pv_port=2, **_POWER
     ),
     HoymilesSensorDescription(
-        key="pv3_power", name="PV3 Power", value_fn=pv(2), **_POWER
+        key="pv3_power", name="PV3 Power", value_fn=pv(2), pv_port=3, **_POWER
     ),
     HoymilesSensorDescription(
-        key="pv4_power", name="PV4 Power", value_fn=pv(3), **_POWER
+        key="pv4_power", name="PV4 Power", value_fn=pv(3), pv_port=4, **_POWER
     ),
     # ---------------- device/state : per port PV energy (micro inverter) -------
     # Only the micro inverter firmware puts ``ed`` / ``et`` inside ``pvs[]``; a
@@ -622,22 +628,22 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
     HoymilesSensorDescription(
         key="pv1_energy_today", name="PV1 Energy Today",
         value_fn=pv_energy(0, "ed"),
-        requires_absent=CAP_SYSTEM_STATE, **_ENERGY
+        requires_absent=CAP_SYSTEM_STATE, pv_port=1, **_ENERGY
     ),
     HoymilesSensorDescription(
         key="pv2_energy_today", name="PV2 Energy Today",
         value_fn=pv_energy(1, "ed"),
-        requires_absent=CAP_SYSTEM_STATE, **_ENERGY
+        requires_absent=CAP_SYSTEM_STATE, pv_port=2, **_ENERGY
     ),
     HoymilesSensorDescription(
         key="pv3_energy_today", name="PV3 Energy Today",
         value_fn=pv_energy(2, "ed"),
-        requires_absent=CAP_SYSTEM_STATE, **_ENERGY
+        requires_absent=CAP_SYSTEM_STATE, pv_port=3, **_ENERGY
     ),
     HoymilesSensorDescription(
         key="pv4_energy_today", name="PV4 Energy Today",
         value_fn=pv_energy(3, "ed"),
-        requires_absent=CAP_SYSTEM_STATE, **_ENERGY
+        requires_absent=CAP_SYSTEM_STATE, pv_port=4, **_ENERGY
     ),
     # ---------------- device/state : packs ----------------
     HoymilesSensorDescription(
@@ -769,14 +775,56 @@ async def async_setup_entry(
     # retained inventory usually arrives within milliseconds.
     await coordinator.async_wait_for_capabilities()
 
+    pv_ports = coordinator.pv_count
+
+    def _wanted(description: HoymilesSensorDescription) -> bool:
+        if (description.requires is not None
+                and not coordinator.has_capability(description.requires)):
+            return False
+        if (description.requires_absent is not None
+                and coordinator.has_capability(description.requires_absent)):
+            return False
+        # A per-port entity is only created for an input the unit actually has.
+        if description.pv_port is not None and description.pv_port > pv_ports:
+            return False
+        return True
+
     async_add_entities(
         HoymilesSensor(coordinator, dev_id, description)
         for description in SENSOR_DESCRIPTIONS
-        if (description.requires is None
-            or coordinator.has_capability(description.requires))
-        and (description.requires_absent is None
-             or not coordinator.has_capability(description.requires_absent))
+        if _wanted(description)
     )
+
+    # Ports the device turned out not to have must not keep a stale registry
+    # entry from an earlier version, otherwise they stay ``unknown`` forever even
+    # though nothing creates them any more.
+    _async_prune_stale_pv_entities(hass, entry, dev_id, pv_ports)
+
+
+@callback
+def _async_prune_stale_pv_entities(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    dev_id: str,
+    pv_ports: int,
+) -> None:
+    """Remove registry entries of PV ports beyond what this unit reports."""
+    from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
+
+    registry = er.async_get(hass)
+    for port in range(pv_ports + 1, PV_COUNT_MAX + 1):
+        for key in (f"pv{port}_power", f"pv{port}_energy_today"):
+            unique_id = f"{DOMAIN}_{dev_id}_{key}"
+            entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+            if entity_id is None:
+                continue
+            _LOGGER.info(
+                "Removing PV%d entity %s: this unit reports only %d input(s)",
+                port,
+                entity_id,
+                pv_ports,
+            )
+            registry.async_remove(entity_id)
 
 
 class HoymilesSensor(CoordinatorEntity[HoymilesCoordinator], SensorEntity):
@@ -799,6 +847,7 @@ class HoymilesSensor(CoordinatorEntity[HoymilesCoordinator], SensorEntity):
             identifiers={(DOMAIN, dev_id)},
             name=dev_id,
             manufacturer=MANUFACTURER,
+            model=coordinator.device_model,
         )
 
     @property

@@ -113,11 +113,25 @@ def _patch_switch(dev_id: str, payload: dict[str, Any]) -> bool:
 
 
 def _patch_ems_mode(dev_id: str, payload: dict[str, Any]) -> bool:
-    """Make the EMS mode select keep its value across restarts (P1-1)."""
-    if payload.get("state_topic") or payload.get("value_template"):
+    """Point the EMS mode select at a topic that is actually published (P1-1).
+
+    The firmware's retained discovery ships
+    ``state_topic: hoymiles/<SN>/ems_mode/state`` but never publishes on it, so
+    the select renders as ``unknown`` forever - the presence of a ``state_topic``
+    is therefore *not* a reason to skip the patch.  Only the integration's own
+    topic carries the mode, so the topic is rewritten unless it already is ours,
+    which keeps the patch idempotent.
+    """
+    if payload.get("value_template"):
+        # A template means the firmware extracts the mode from a payload it
+        # really does send; leave that alone.
         return False
 
-    payload["state_topic"] = T_EMS_MODE_STATE.format(dev_id=dev_id)
+    wanted = T_EMS_MODE_STATE.format(dev_id=dev_id)
+    if payload.get("state_topic") == wanted:
+        return False
+
+    payload["state_topic"] = wanted
     return True
 
 
