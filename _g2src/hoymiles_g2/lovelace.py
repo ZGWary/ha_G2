@@ -49,6 +49,23 @@ _TITLE_CHECKED: set[str] = set()
 # read per device per process, and nothing to do once upgraded.
 _LAYOUT_CHECKED: set[str] = set()
 
+# Layout revision, stored next to ``views`` in ``.storage/lovelace.<url_path>``.
+#
+# It exists because the *structural* fingerprint below cannot notice a change
+# that only touches card options: once a dashboard has the current view titles
+# and view-level keys, ``_is_legacy_layout`` is False forever, so a release that
+# only fixes axis scaling (removes the fixed ``span``) would never reach an
+# existing install.  The marker lets such a release be applied while still
+# leaving every user edit - renames, reordering, added cards - in place: the
+# migration in ``_migrate_axis_cards`` rewrites individual card keys instead of
+# replacing the whole layout.
+#
+#   1 (or absent)  charts carried a fixed `span`, so every axis was drawn at
+#                  2 000 W / 2 500 W regardless of the measured maximum
+#   2              axes scale to the data; `symmetric` / `stack` set per chart
+_LAYOUT_KEY = "g2_layout"
+_LAYOUT_VERSION = 2
+
 # The view titles an earlier release wrote.  Used together with the absence of
 # ``icon`` / ``max_columns`` as the fingerprint of an untouched old dashboard, so
 # a layout upgrade can never overwrite a dashboard the user has edited.
@@ -57,6 +74,9 @@ _LEGACY_VIEW_TITLES: tuple[str, ...] = (
     "设备 / Device",
     "控制 / Control",
 )
+
+# The history chart card type, referenced by the axis migration below.
+HISTORY_CARD = "custom:hoymiles-g2-history-chart"
 
 # Serial prefixes, used only when no registry entry carries a model string yet.
 # ``RMI-`` is the grid-tied micro inverter family, ``MSA-`` the micro storage one.
@@ -341,7 +361,9 @@ async def async_ensure_dashboard(
     # Persist the views into ``.storage/lovelace.<id>``.
     try:
         store = dashboard.LovelaceStorage(hass, item)
-        await store.async_save({"views": _build_views(dev_id, pv_count, model)})
+        await store.async_save(
+            {"views": _build_views(dev_id, pv_count, model), _LAYOUT_KEY: _LAYOUT_VERSION}
+        )
     except Exception:  # noqa: BLE001
         _LOGGER.warning("Could not save dashboard views for %s", dev_id, exc_info=True)
         try:
@@ -440,12 +462,23 @@ async def _async_upgrade_layout(
     pv_count: int | None,
     model: str,
 ) -> None:
-    """Rewrite a dashboard that still carries the old generated layout.
+    """Bring a dashboard written by an older release up to ``_LAYOUT_VERSION``.
 
-    Upgrades are why :func:`_is_legacy_layout` exists: only a dashboard that is
-    byte-for-byte what an earlier release produced is replaced, so a dashboard
-    the user has touched is never overwritten.  Verified once per device per
-    process, because ``LovelaceStorage`` caches its config in memory.
+    Two mechanisms, tried in order, because they protect different things:
+
+    1. :func:`_is_legacy_layout` - the dashboard is byte-for-byte what an early
+       release produced, so it is safe to rebuild it wholesale.
+    2. :func:`_migrate_axis_cards` - the dashboard has been touched by the user
+       (renamed views, extra cards), so only the *card options* this release
+       changed are rewritten, one key at a time.  Renames, ordering and added
+       cards are all preserved.
+
+    Both are gated on the stored ``_LAYOUT_KEY`` marker, so a dashboard is
+    migrated at most once and a user who deliberately re-adds a fixed ``span``
+    afterwards keeps it.
+
+    Verified once per device per process, because ``LovelaceStorage`` caches its
+    config in memory.
     """
     if url_path in _LAYOUT_CHECKED:
         return
@@ -457,16 +490,158 @@ async def _async_upgrade_layout(
         _LOGGER.warning("Could not read dashboard %s", url_path, exc_info=True)
         return
 
-    if not _is_legacy_layout(config):
+    if not isinstance(config, dict):
         return
 
+    # Already at this revision: nothing to do, now or after a restart.
+    if config.get(_LAYOUT_KEY) == _LAYOUT_VERSION:
+        return
+
+    if _is_legacy_layout(config):
+        try:
+            await store.async_save(
+                {
+                    "views": _build_views(dev_id, pv_count, model),
+                    _LAYOUT_KEY: _LAYOUT_VERSION,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Could not upgrade dashboard %s", url_path, exc_info=True)
+            return
+        _LOGGER.info("Rebuilt dashboard %s at layout revision %s", url_path, _LAYOUT_VERSION)
+        return
+
+    # A dashboard the user has touched: patch the chart options in place.
     try:
-        await store.async_save({"views": _build_views(dev_id, pv_count, model)})
+        if not _migrate_axis_cards(config):
+            # Nothing matched, so the dashboard is not one of ours at the
+            # revision being migrated (a hand-built dashboard, or a layout from
+            # a much newer release).  Record the revision so this check does not
+            # run again, but leave the content alone.
+            await store.async_save({**config, _LAYOUT_KEY: _LAYOUT_VERSION})
+            return
+        await store.async_save({**config, _LAYOUT_KEY: _LAYOUT_VERSION})
     except Exception:  # noqa: BLE001
-        _LOGGER.debug("Could not upgrade dashboard %s", url_path, exc_info=True)
+        _LOGGER.debug("Could not patch dashboard %s", url_path, exc_info=True)
         return
 
-    _LOGGER.info("Upgraded dashboard %s to the current layout", url_path)
+    _LOGGER.info("Migrated chart axes on dashboard %s", url_path)
+
+
+def _migrate_axis_cards(config: dict[str, Any]) -> bool:
+    """Rewrite the chart config this release changed; return True if any did.
+
+    Only three things are touched, and each only when it still carries the value
+    an older release wrote:
+
+    * a fixed ``span`` on a history chart is dropped, so the y axis scales to
+      the measured maximum instead of being pinned to 2 000 W / 2 500 W;
+    * ``symmetric`` is set to ``False`` on a chart whose series are all
+      non-negative levels (voltage, energy, PV power) - a mirrored axis halves
+      the usable height for such data;
+    * ``stack`` is set to ``False`` where the series are independent
+      measurements rather than additive parts of one total.
+
+    Everything else - titles, colours, heights, series order, extra cards, view
+    names - is left exactly as found, which is what makes this safe to run on a
+    dashboard the user has edited.
+    """
+    views = config.get("views")
+    if not isinstance(views, list):
+        return False
+
+    changed = False
+    for card in _walk_cards(views):
+        if not isinstance(card, dict):
+            continue
+        if card.get("type") != HISTORY_CARD:
+            continue
+
+        # 1. A fixed half-range is what pinned every axis.  Removing it is the
+        #    whole point of this migration, so it goes unconditionally.
+        if "span" in card:
+            card.pop("span", None)
+            changed = True
+
+        # 2/3. Both are decisions about *what the numbers mean*, so they are
+        #      only applied where the card's own series say so - never by title,
+        #      which the user is free to change.
+        if _all_non_negative(card) and card.get("symmetric") is None:
+            card["symmetric"] = False
+            changed = True
+        if _is_independent_overlay(card) and card.get("stack") is None:
+            card["stack"] = False
+            changed = True
+
+    return changed
+
+
+def _walk_cards(views: list[Any]) -> list[Any]:
+    """Every card dict in the view tree, nested grid sections included."""
+    out: list[Any] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        if node.get("type") and "cards" not in node:
+            out.append(node)
+        elif node.get("type") and node.get("type") != "grid":
+            out.append(node)
+        for key in ("cards", "sections"):
+            if isinstance(node.get(key), list):
+                walk(node[key])
+
+    walk(views)
+    return out
+
+
+def _series_entities(card: dict[str, Any]) -> list[str]:
+    """The entity ids a history chart references."""
+    series = card.get("series")
+    if not isinstance(series, list):
+        return []
+    return [s["entity"] for s in series if isinstance(s, dict) and s.get("entity")]
+
+
+def _all_non_negative(card: dict[str, Any]) -> bool:
+    """True when no series of this card can go below zero.
+
+    Decided from the entity key, not from the title: a battery or grid power
+    entity is signed (charge < 0, export < 0) and keeps its mirrored axis, while
+    a PV port's power, a voltage and an ``*_energy*`` counter never are.
+    """
+    entities = _series_entities(card)
+    if not entities:
+        return False
+    for entity in entities:
+        if "battery" in entity or "grid" in entity:
+            return False
+        if not any(mark in entity for mark in ("pv", "power", "voltage", "energy")):
+            return False
+    return True
+
+
+def _is_independent_overlay(card: dict[str, Any]) -> bool:
+    """True when this card's series are separate readings, not additive parts.
+
+    Two or more ``*_power`` series that are each a whole measurement (PV, grid,
+    load) must be overlaid: stacking them drew the load curve on top of the PV
+    curve even when the load was the smaller number.  A single series has
+    nothing to stack against, so it is left alone (either setting looks the
+    same), and energy series are deliberately excluded because stacking daily
+    contributions is exactly right for them.
+    """
+    entities = _series_entities(card)
+    if len(entities) < 2:
+        return False
+    if any("energy" in entity for entity in entities):
+        return False
+    return all(entity.endswith("_power") for entity in entities)
+
 
 
 def _is_legacy_layout(config: Any) -> bool:
@@ -607,9 +782,28 @@ def _history(
     unit: str,
     height: int,
     sync_group: str | None = None,
-    span: float | None = None,
+    symmetric: bool | None = None,
+    stack: bool | None = None,
 ) -> dict[str, Any]:
-    """A ``hoymiles-g2-history-chart`` card spanning the full section width."""
+    """A ``hoymiles-g2-history-chart`` card spanning the full section width.
+
+    The y axis is left to the card: it rounds the *measured* maximum up to the
+    next 1/2/5 × 10^n step, so a 490 W peak gets a 0..500 W axis instead of
+    floating in the bottom quarter of a fixed one.  A fixed ``span`` is
+    therefore wrong here and no longer emitted - it made every generated chart
+    draw a 2 000 W / 2 500 W axis regardless of the data, which is what made a
+    490 W curve look tiny.
+
+    ``symmetric=False`` switches the axis to a bottom-up ``0..max`` scale.  The
+    default (mirrored around zero) is right for a single reading that changes
+    sign - battery charge/discharge, grid import/export - but halves the usable
+    height for an always-positive one (PV power, voltage, energy), which is the
+    other half of why those curves looked flat.  ``stack=False`` overlays the
+    curves instead of stacking them; PV power, grid power and load power are
+    three independent measurements, not additive parts of one total, so stacking
+    them drew the load curve *on top of* the PV curve even while the load was
+    the smaller of the two.
+    """
     card: dict[str, Any] = {
         "type": "custom:hoymiles-g2-history-chart",
         "title": title,
@@ -620,8 +814,10 @@ def _history(
     }
     if sync_group is not None:
         card["sync_group"] = sync_group
-    if span is not None:
-        card["span"] = span
+    if symmetric is not None:
+        card["symmetric"] = symmetric
+    if stack is not None:
+        card["stack"] = stack
     return _full_width(card)
 
 
@@ -717,6 +913,8 @@ def _build_inverter_views(
                         unit="W",
                         height=330,
                         sync_group=system_group,
+                        symmetric=False,
+                        stack=False,
                     )
                 ]
             ),
@@ -746,7 +944,8 @@ def _build_inverter_views(
                         unit="W",
                         height=280,
                         sync_group=device_group,
-                        span=2000,
+                        symmetric=False,
+                        stack=False,
                     )
                 ]
             ),
@@ -758,7 +957,8 @@ def _build_inverter_views(
                         unit="W",
                         height=300,
                         sync_group=device_group,
-                        span=2500,
+                        symmetric=False,
+                        stack=False,
                     )
                 ]
             ),
@@ -776,6 +976,7 @@ def _build_inverter_views(
                         unit="V",
                         height=240,
                         sync_group=device_group,
+                        symmetric=False,
                     ),
                     _history(
                         _t("Energy today", "今日发电量"),
@@ -789,6 +990,7 @@ def _build_inverter_views(
                         unit="Wh",
                         height=240,
                         sync_group=device_group,
+                        symmetric=False,
                     ),
                 ]
             ),
@@ -910,6 +1112,7 @@ def _build_storage_views(dev_id: str, model: str = "") -> list[dict[str, Any]]:
                         unit="W",
                         height=330,
                         sync_group=group,
+                        stack=False,
                     )
                 ]
             ),

@@ -13,8 +13,17 @@
  *     packs at 81 % would put the second curve at 81..162 % and the third at
  *     162..243 %, pushing everything but the first off a 0..100 axis. The
  *     `stack` option makes the choice explicit;
- *   - the y axis is symmetric around 0 and auto-scales (W is promoted to kW
- *     once the range exceeds 1.5 kW, Wh to kWh ...);
+ *   - the y axis auto-scales to the data (`niceMax`, so a 490 W peak gets a
+ *     0..500 axis). Whether it is mirrored around 0 is decided from the data
+ *     itself: a series that changes sign (battery / grid power) gets a ±axis,
+ *     one that never goes below zero (PV power, voltage, energy) gets a plain
+ *     bottom-up axis so it can use the full height. W is promoted to kW once
+ *     the range exceeds 1.5 kW, Wh to kWh ...;
+ *   - the x axis is likewise derived from the data, not from a fixed clock
+ *     grid: the plot spans the first..last bucket and the ticks step by a
+ *     round interval chosen from that span, so a partial day (recorder data
+ *     starting at 13:45) still fills the card instead of hugging the right
+ *     edge with a single "15:00" label;
  *   - hovering shows a guide line and the value of every series, and the same
  *     timestamp is mirrored on every card that shares a `sync_group`;
  *   - clicking a legend entry highlights that series and dims the others
@@ -33,13 +42,18 @@
  *   height: 330                     # optional svg height in px
  *   unit: W                         # optional unit label (auto-promotes to kW)
  *   zero_line: true                 # optional, draw the 0 line (default true)
- *   symmetric: true                 # optional; false draws a bottom-up axis
- *                                   # (use it for SOC: min 0 / max 100)
- *   stack: true                     # optional; false overlays the curves
+ *   symmetric: false                # optional; forces a bottom-up axis. Omit
+ *                                   # it and the card picks per render from the
+ *                                   # data (mirrored only when a series is
+ *                                   # negative), which is also what makes
+ *                                   # dashboards written before this option
+ *                                   # existed come out right.
+ *   stack: false                    # optional; false overlays the curves
  *                                   # instead of stacking them. Defaults to
  *                                   # the value of `symmetric`, so a bottom-up
  *                                   # axis (SOC, temperature) overlays - a
- *                                   # level must never stack.
+ *                                   # level must never stack - and so does an
+ *                                   # automatically resolved one.
  *   min / max: 0 / 100              # optional fixed axis limits
  *   span: 2500                      # optional fixed half-range when symmetric
  *   sync_group: living-room         # optional; cards sharing a group share
@@ -184,6 +198,25 @@ function _hmHistoryRegister() {
     const mantissa = value / exp;
     const step = mantissa <= 1 ? 1 : mantissa <= 2 ? 2
       : mantissa <= 5 ? 5 : 10;
+    return step * exp;
+  }
+
+  /** Round `value` up to a readable tick spacing: 1 / 2 / 2.5 / 5 × 10^n.
+   *
+   * This is for the *step* of a bottom-up axis, where the labels are the four
+   * quarters of the domain. Rounding the step instead of the domain keeps a
+   * 587 W peak on a 0..600 axis rather than pushing `niceMax` up to 1000 and
+   * leaving half the height empty - which is exactly the complaint the fixed
+   * `span` used to cause.
+   */
+  function niceStep(value) {
+    if (!(value > 0)) return 1;
+    const exp = Math.pow(10, Math.floor(Math.log10(value)));
+    const mantissa = value / exp;
+    const step = mantissa <= 1 ? 1
+      : mantissa <= 2 ? 2
+        : mantissa <= 2.5 ? 2.5
+          : mantissa <= 5 ? 5 : 10;
     return step * exp;
   }
 
@@ -649,7 +682,11 @@ function _hmHistoryRegister() {
             end_time: end.toISOString(),
             statistic_ids: ids,
             period: candidate,
-            types: ["mean"],
+            /* `mean` for a measured quantity (W, V, A), `state` for a running
+               total. An energy sensor is total_increasing, so its statistics
+               carry `state` / `sum` / `change` and leave `mean` null - asking
+               for `mean` alone drew every energy card as a flat zero line. */
+            types: ["mean", "state"],
           });
           if (token !== this._token) return; // a newer request won
           period = candidate;
@@ -682,7 +719,14 @@ function _hmHistoryRegister() {
         const map = new Map();
         for (const row of (result[s.entity] || [])) {
           const t = num(row.start);
-          map.set(t, row.mean == null ? null : num(row.mean));
+          /* `mean` first, then `state`: a measured quantity reports `mean`,
+             a total_increasing counter (energy) only reports `state`. Never
+             fall through to `sum`, which is a lifetime running total and would
+             plot an ever-climbing diagonal. */
+          const v = row.mean != null ? num(row.mean)
+            : row.state != null ? num(row.state)
+              : null;
+          map.set(t, v);
           timeSet.add(t);
         }
         return map;
@@ -701,14 +745,29 @@ function _hmHistoryRegister() {
         });
       });
 
-      const symmetric = this._config.symmetric !== false;
+      /* Whether the axis is mirrored is a property of the *data*, not of the
+         card: a battery or grid power reading changes sign, so it belongs on a
+         ±axis, while PV power, a voltage or an energy counter never go below
+         zero and would waste half the height on an empty negative half.  An
+         explicit `symmetric:` still wins, but leaving it out now resolves per
+         render, which also repairs dashboards written before the option
+         existed. */
+      const dataMin = values.length
+        ? values.reduce((acc, vals) => vals.reduce((a, v) => (v < a ? v : a), acc), 0)
+        : 0;
+      const symmetric = this._config.symmetric != null
+        ? this._config.symmetric !== false
+        : dataMin < 0;
       /* Stacking depends on what the numbers *mean*, not on the axis. Power
          and energy series that add up (charge + discharge, per-phase power)
          stack; a level must never stack - with three packs at 81 % the second
          curve would be drawn at 81..162 % and the third at 162..243 %, so on a
          0..100 axis only the first stays visible, which reads as "Battery 2
-         and 3 are wrong". `symmetric: false` is only ever used for such a
-         level, so it defaults to overlay; `stack` overrides either way. */
+         and 3 are wrong".  Independent measurements - PV, grid and load power -
+         must not stack either: drawing the load on top of the PV made a 204 W
+         load look larger than the 216 W PV feeding it.  So the default follows
+         `symmetric` (a mirrored axis means signed, additive energy) and an
+         explicit `stack:` overrides either way. */
       const stacked = this._config.stack != null
         ? this._config.stack !== false
         : symmetric;
@@ -793,7 +852,7 @@ function _hmHistoryRegister() {
         }));
       }
 
-      return { times, period, layers, max, min, values };
+      return { times, period, layers, max, min, values, symmetric };
     }
 
     /* ----------------------------- rendering ----------------------------- */
@@ -876,7 +935,10 @@ function _hmHistoryRegister() {
       const H = num(this._config.height) || DEFAULT_H;
       const W = this._width();
       const { times, layers, max, min } = data;
-      const symmetric = this._config.symmetric !== false;
+      /* `_build` resolves this per render from the data (unless the config
+         pins it), so the axis is mirrored exactly when the series actually
+         crosses zero. */
+      const symmetric = data.symmetric !== false;
       const x0 = PAD_L;
       const x1 = W - PAD_R;
       const yTop = PAD_T;
@@ -895,9 +957,16 @@ function _hmHistoryRegister() {
         domainMin = -nice;
         ticks = [nice, nice / 2, 0, -nice / 2, -nice];
       } else {
-        domainMax = this._config.max != null
-          ? num(this._config.max)
-          : niceMax(Math.max(max, 1e-9));
+        /* Bottom-up axis: pick a round *step* and derive the top from it, so
+           the highest curve fills most of the height. `niceMax(max)` alone
+           jumps 587 -> 1000, i.e. the data would only reach 59 % of the plot -
+           the same "the card looks tiny" symptom the fixed `span` produced. */
+        if (this._config.max != null) {
+          domainMax = num(this._config.max);
+        } else {
+          const quarters = 4;
+          domainMax = niceStep(Math.max(max, 1e-9) / quarters) * quarters;
+        }
         domainMin = this._config.min != null ? num(this._config.min) : 0;
         if (domainMax <= domainMin) domainMax = domainMin + 1;
         ticks = [0, 1, 2, 3, 4].map((k) => domainMax - ((domainMax - domainMin) * k) / 4);
@@ -914,9 +983,28 @@ function _hmHistoryRegister() {
         + ((domainMax - Math.min(Math.max(num(v), domainMin), domainMax))
           / (domainMax - domainMin)) * (yBot - yTop);
       const yZero = toY(0);
-      const toX = (i) => (times.length === 1
-        ? (x0 + x1) / 2
-        : x0 + (x1 - x0) * (i / (times.length - 1)));
+      /* Map by *timestamp*, not by bucket index. Statistic buckets are not
+         evenly spaced - an offline device leaves a hole, and the first bucket
+         of a window can be a partial one - so an index-based scale stretches
+         those gaps to look like continuous data. The query window already
+         follows the recorder's data, so this spreads whatever exists across the
+         full plot width. A fractional index (a cross-group hover can land
+         between buckets) is linearly interpolated between its neighbours. */
+      const tFirst = times.length ? num(times[0]) : 0;
+      const tLast = times.length ? num(times[times.length - 1]) : 0;
+      const tSpan = tLast - tFirst;
+      const toX = (i) => {
+        if (times.length <= 1 || tSpan <= 0) return (x0 + x1) / 2;
+        const k = Math.min(Math.max(num(i), 0), times.length - 1);
+        const lo = Math.floor(k);
+        const frac = k - lo;
+        const tLo = num(times[lo]);
+        const t = frac > 0 && lo + 1 < times.length
+          ? tLo + (num(times[lo + 1]) - tLo) * frac
+          : tLo;
+        const ratio = Math.min(Math.max((t - tFirst) / tSpan, 0), 1);
+        return x0 + (x1 - x0) * ratio;
+      };
 
       let grid = "";
       ticks.forEach((t, index) => {
@@ -992,34 +1080,94 @@ function _hmHistoryRegister() {
       const y = H - PAD_B + 18;
       const W = this._width();
       const picks = [];
-      const seen = new Set();
 
-      if (this._range === "day") {
-        const want = new Set([0, 3, 6, 9, 12, 15, 18, 21, 23]);
-        times.forEach((t, i) => {
-          const d = new Date(num(t));
-          const h = d.getHours();
-          if (!want.has(h) || seen.has(h) || d.getMinutes() > 6) return;
-          seen.add(h);
-          picks.push({ i, text: `${pad2(h)}:00` });
-        });
-      } else if (this._range === "month") {
-        times.forEach((t, i) => {
-          const d = new Date(num(t));
-          const day = d.getDate();
-          if (d.getHours() !== 0 || seen.has(day)) return;
-          if (day !== 1 && day % 5 !== 0) return;
-          seen.add(day);
-          picks.push({ i, text: String(day) });
-        });
-      } else {
-        times.forEach((t, i) => {
-          const m = new Date(num(t)).getMonth();
-          if (seen.has(m)) return;
-          seen.add(m);
-          picks.push({ i, text: String(m + 1) });
-        });
+      /* The labels follow the *data's own* time span on a round step, instead of
+         a fixed hour-of-day grid.
+         The old version only accepted whole hours in {0,3,6,9,12,15,18,21,23}
+         (`getMinutes() > 6` rejected everything else), so a window whose data
+         starts at 13:45 - which is what the recorder holds after a restart -
+         produced a single "15:00" label while the curve filled the whole card,
+         which read as "the axis is stuck on the right".
+         Now the step is chosen from the span: the smallest candidate that keeps
+         the label count under what the width can carry, aligned to a round
+         wall-clock boundary so the ticks read 13:45, 14:15, 14:45 rather than
+         arbitrary fractions of an index. */
+      if (!times.length) return "";
+      const first = num(times[0]);
+      const last = num(times[times.length - 1]);
+      const spanMs = Math.max(last - first, 0);
+      if (spanMs <= 0) {
+        return `<text class="axis" x="${((PAD_L + W - PAD_R) / 2).toFixed(1)}" y="${y}"
+          text-anchor="middle">${esc(this._label(times[0]))}</text>`;
       }
+
+      /* One label per ~110 px of plot, clamped to 2..8 - tied to the measured
+         width so a wide card gets more ticks and a narrow one fewer. */
+      const plotW = W - PAD_L - PAD_R;
+      const maxLabels = Math.min(8, Math.max(2, Math.round(plotW / 110)));
+
+      /* Round steps per range, in milliseconds. A day view steps by minutes /
+         hours, a month by days, a year by months. */
+      const minute = 60 * 1000;
+      const hour = 60 * minute;
+      const day = 24 * hour;
+      const candidates = this._range === "year"
+        ? [30 * day, 61 * day, 92 * day, 183 * day]
+        : this._range === "month"
+          ? [day, 2 * day, 3 * day, 5 * day, 7 * day, 10 * day, 14 * day]
+          : [5 * minute, 10 * minute, 15 * minute, 30 * minute,
+            hour, 2 * hour, 3 * hour, 4 * hour, 6 * hour, 12 * hour];
+
+      let step = candidates[candidates.length - 1];
+      for (const c of candidates) {
+        if (spanMs / c <= maxLabels - 1) { step = c; break; }
+      }
+
+      /* Align the first tick to a round boundary at that step, in *local* time.
+         For a month / year step this lands on midnight of the day, which is what
+         makes "1/5" sit under a real bucket rather than a fractional one. */
+      const align = (ms) => {
+        const d = new Date(ms);
+        d.setSeconds(0, 0);
+        if (step >= day) {
+          d.setHours(0, 0, 0, 0);
+        } else {
+          const stepMin = Math.round(step / minute);
+          d.setMinutes(Math.floor(d.getMinutes() / stepMin) * stepMin, 0, 0);
+        }
+        return d.getTime();
+      };
+
+      /* Nearest bucket to `target`, so a tick lands on a timestamp the series
+         actually has (statistic buckets are not perfectly regular). */
+      const nearest = (target) => {
+        let best = 0;
+        let bestDiff = Infinity;
+        for (let i = 0; i < times.length; i += 1) {
+          const diff = Math.abs(num(times[i]) - target);
+          if (diff < bestDiff) { bestDiff = diff; best = i; }
+        }
+        return best;
+      };
+
+      const seen = new Set();
+      const pushAt = (ms) => {
+        const i = nearest(ms);
+        const label = this._label(times[i]);
+        if (seen.has(label)) return;
+        seen.add(label);
+        picks.push({ i, text: label });
+      };
+
+      pushAt(first);
+      for (let t = align(first) + step; t <= last; t += step) {
+        /* Keep the first/last labels from colliding with the edges of the data:
+           a tick that falls within half a step of either end would just repeat
+           it. */
+        if (t - first < step * 0.5 || last - t < step * 0.5) continue;
+        pushAt(t);
+      }
+      pushAt(last);
 
       return picks.map((p) => {
         const x = toX(p.i);
@@ -1027,6 +1175,20 @@ function _hmHistoryRegister() {
         return `<text class="axis" x="${x.toFixed(1)}" y="${y}"
           text-anchor="${anchor}">${esc(p.text)}</text>`;
       }).join("");
+    }
+
+    /** Axis label for a timestamp, in the resolution the range calls for. */
+    _label(ms) {
+      const d = new Date(num(ms));
+      if (this._range === "year") {
+        // A month number is all that fits under a 12-month axis; the tooltip
+        // carries the full date.
+        return String(d.getMonth() + 1);
+      }
+      if (this._range === "month") {
+        return `${d.getMonth() + 1}/${d.getDate()}`;
+      }
+      return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
     }
 
     _hoverLayer(data, toX, yTop, yBot, div, axDecimals) {
@@ -1157,8 +1319,22 @@ function _hmHistoryRegister() {
       if (!rect.width) return;
       // The svg is stretched by CSS, so map through the viewBox coordinates.
       const vbX = ((event.clientX - rect.left) / rect.width) * this._width();
-      const ratio = (vbX - PAD_L) / (this._width() - PAD_R - PAD_L);
-      const index = Math.round(Math.min(Math.max(ratio, 0), 1) * (data.times.length - 1));
+      const x0 = PAD_L;
+      const x1 = this._width() - PAD_R;
+      const ratio = Math.min(Math.max((vbX - x0) / (x1 - x0), 0), 1);
+      // `toX` is timestamp-based, so invert it the same way: the pointer picks
+      // an instant, and the nearest bucket to that instant is hovered. Using an
+      // index ratio here would land on the wrong point wherever the series has
+      // a gap.
+      const tFirst = num(data.times[0]);
+      const tLast = num(data.times[data.times.length - 1]);
+      const target = tFirst + (tLast - tFirst) * ratio;
+      let index = 0;
+      let bestDiff = Infinity;
+      for (let i = 0; i < data.times.length; i += 1) {
+        const diff = Math.abs(num(data.times[i]) - target);
+        if (diff < bestDiff) { bestDiff = diff; index = i; }
+      }
       this._setHover(index);
     }
 
@@ -1224,14 +1400,22 @@ function _hmHistoryRegister() {
           <ha-textfield label="sync_group" .value=${config.sync_group || ""}
             @change=${this._changed("sync_group")}></ha-textfield>
           <label class="sw">
-            <ha-switch .checked=${config.symmetric !== false}
-              @change=${this._toggle("symmetric")}></ha-switch>
-            <span>symmetric (off = bottom-up axis, for SOC / temperature)</span>
+            <span>symmetric axis</span>
+            <select .value=${this._triValue(config.symmetric)}
+              @change=${this._tri("symmetric")}>
+              <option value="auto">auto (mirrored only when the data crosses 0)</option>
+              <option value="on">on (always mirrored)</option>
+              <option value="off">off (bottom-up, for SOC / temperature)</option>
+            </select>
           </label>
           <label class="sw">
-            <ha-switch .checked=${config.stack === true}
-              @change=${this._toggle("stack")}></ha-switch>
-            <span>stack (power and energy series only - never a level like SOC)</span>
+            <span>stack the curves</span>
+            <select .value=${this._triValue(config.stack)}
+              @change=${this._tri("stack")}>
+              <option value="auto">auto (follow the axis type)</option>
+              <option value="on">on (additive series, e.g. per-pack charge)</option>
+              <option value="off">off (independent readings, e.g. PV / grid / load)</option>
+            </select>
           </label>
           <label class="sw">
             <ha-switch .checked=${config.show_toolbar !== false}

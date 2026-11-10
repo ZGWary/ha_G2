@@ -48,11 +48,23 @@
  *   flow_speed: 1                 # optional multiplier for the moving pearls;
  *                                 # 0.5 = half speed (calmer), 2 = faster
  *   variant: inverter             # optional; 'inverter' draws the HiFlow
- *                                 # micro-inverter layout (PV + grid port
- *                                 # only) instead of the four-branch storage
- *                                 # schematic.  Never auto-detected, so the
- *                                 # system view of a storage device is
- *                                 # unaffected.
+ *                                 # micro-inverter layout (the PV inputs and
+ *                                 # the product photo) instead of the
+ *                                 # four-branch storage schematic.  Never
+ *                                 # auto-detected, so the system view of a
+ *                                 # storage device is unaffected.
+ *   show_grid: true               # optional, inverter layout only.  The
+ *                                 # 并网端口 node is the AC output of the unit -
+ *                                 # the branch the PV energy actually leaves
+ *                                 # through - so it is drawn by default, the
+ *                                 # same way the storage schematic always
+ *                                 # draws its grid side.  Set false to hide
+ *                                 # it on an install that does not want the
+ *                                 # node.  The reading is the unit's own AC
+ *                                 # output: `grid_on_power`, falling back to
+ *                                 # `grid_on_power_5_min` (the one a micro
+ *                                 # inverter actually publishes), and finally
+ *                                 # to `system_grid_power` (see `_data`).
  *   image: /local/photo.png       # optional product photo for that layout;
  *                                 # omit to take the one that matches the
  *                                 # unit's SKU (see `IV_IMAGE_BY_CODE`), which
@@ -262,12 +274,14 @@ function _hmPowerFlowRegister() {
    * ------------------------------------------------------------------ */
   const IV_W = 700;
   /* Tall enough for the caption block under each bottom-row node (a 34 px ring
-     plus two text lines) without them touching the card's edge. */
-  const IV_H = 430;
+     plus two text lines) and for the 并网端口 row above the photo: the drawing
+     has PV inputs along the bottom and the AC output on the right, the same
+     three-branch shape the storage schematic shows. */
+  const IV_H = 370;
   const IV_PHOTO_W = 300;
   const IV_PHOTO_MAX_H = 190;
   const IV_PHOTO_CX = IV_W / 2;
-  const IV_PHOTO_CY = 200;
+  const IV_PHOTO_CY = 130;
   /* Intrinsic size of each product photo, so a connector can stop exactly on
      the artwork: the 2-in-1 cut-out (360x168) is a wide strip that fills its
      frame, while the single-input one (736x486) is closer to 3:2 and is
@@ -283,21 +297,24 @@ function _hmPowerFlowRegister() {
   };
   const IV_PHOTO_ASPECT_FALLBACK = 360 / 168;
   const IV_CORNER = 10;                          // rounded elbow radius
-  /* The DC inputs share one bottom row, the grid port sits on the top row.
-     The row is laid out per input count rather than incrementally: a
-     single-input unit keeps its one node on the far left (where the storage
-     schematic's PV1 also is) and a four-input one spreads across the whole row
-     instead of piling up on one side.  The two middle slots of a 4-input unit
-     plug into the photo's bottom edge, the outer two into its side edges - see
-     `elbowRoute`. */
+  /* The DC inputs share one bottom row.  The row is laid out per input count
+     rather than incrementally: a single-input unit keeps its one node on the
+     far left (where the storage schematic's PV1 also is) and a four-input one
+     spreads across the whole row instead of piling up on one side.  The two
+     middle slots of a 4-input unit plug into the photo's bottom edge, the outer
+     two into its side edges - see `elbowRoute`. */
   const IV_PV_MAX = 4;
-  const IV_NODE_ROW_Y = 330;
+  const IV_NODE_ROW_Y = 275;
   const IV_NODE_X = {
     1: [95],
     2: [95, 605],
     3: [95, 350, 605],
     4: [95, 235, 465, 605],
   };
+  /* The 并网端口 node: the AC output of the unit.  It takes the unit's own
+     on-grid port power, which is where a micro inverter's energy actually
+     leaves - the PV inputs feed it, and it feeds the house.  Its placement is
+     defined again below, over the photo, now that the node is permanent. */
   const IV_NODE_GRID = { x: 605, y: 90 };
   /* PV input count by product code, i.e. the first four digits of the serial
      (`RMI-4161A0209FF6` -> `4161`).  The firmware's model string names a whole
@@ -1050,6 +1067,10 @@ function _hmPowerFlowRegister() {
            artwork follows the SKU, and two SKUs can share a port count. */
         this._isMicroInverter() ? "inv" : "sys",
         this._productImage(), this._config.dim_when_idle,
+        /* Whether the inverter layout draws the 并网端口 node is a config
+           decision, so toggling it has to rebuild the SVG.  The node is on
+           unless it is explicitly disabled. */
+        this._config.show_grid !== false,
         /* How many PV inputs the unit has decides how many nodes are drawn,
            and it is resolved from the readings / the device registry rather
            than from a config field alone - so it has to be part of the key or a
@@ -1065,6 +1086,10 @@ function _hmPowerFlowRegister() {
            of the key: otherwise a branch could stay grey at exactly MIN_FLOW. */
         wkey(d.pv), wkey(d.pv2), wkey(d.grid), wkey(d.load), wkey(d.smartPlug),
         wkey(d.battery),
+        /* The micro-inverter layout prints the unit's own AC port reading
+           instead of the system balance, so that one has to be in the key too
+           or the 并网端口 number would freeze at its first value. */
+        wkey(d.gridPort),
         /* The micro-inverter layout prints the per-port readings, not the
            system totals, so they are part of the key as well - all of them, so
            a 4-input unit redraws when its third or fourth port starts. */
@@ -1321,19 +1346,40 @@ function _hmPowerFlowRegister() {
       const load = this._read("system_load_power", null);
       const smartPlug = this._read("system_smart_plug_power", null);
 
-      /* 并网端口. `system_grid_power` is the system level reading and the one
-         the caption belongs to; `grid_on_power` is the device's own on-grid
-         port and is used as a fallback so a unit that only reports the latter
-         still gets a number.  Either may be missing entirely (the device has
-         not published yet), and then the node is still drawn without a value -
-         see `_inverterNodes`.
-         NOTE: `grid_on_p` uses the opposite sign (negative = drawing from the
-         grid), so it is negated to keep one convention in the drawing. */
+      /* 并网端口, two separate readings with two separate conventions - they
+         must not be conflated, because the storage schematic and the inverter
+         layout read the port from opposite ends of the same wire.
+
+         `grid` - the *system* grid balance, i.e. the house's side of the
+         meter.  Positive = importing, negative = feeding back.  This is the
+         one `_svgSystem` / `_gridNode` have always drawn, so its sign is
+         fixed in stone.  `system_grid_power` is primary; `grid_on_p` uses the
+         opposite sign (negative = drawing from the grid), so the fallback is
+         negated to keep the convention.
+
+         `gridPort` - the *unit's own* AC output, positive = energy leaving
+         the unit into the house.  Only the inverter layout draws it, and it
+         is what the 并网端口 node on a micro inverter should show.  The 1 s
+         `grid_on_p` only exists on units that declare the `system_state`
+         capability (storage), so a micro inverter has it permanently
+         `unknown`; the same field in the 5 min payload is NOT capability
+         gated and is what such a unit actually publishes - measured live,
+         `system_pv_power` 539.7 W against `grid_on_power_5_min` 509.9 W, i.e.
+         PV minus the unit's own consumption, which is exactly the outflow the
+         AC port carries. */
       let grid = this._read("system_grid_power", null);
       if (grid === null) {
         const onGrid = this._read("grid_on_power", null);
         if (onGrid !== null) grid = -onGrid;
       }
+
+      const neg = (v) => (v === null || v === undefined ? null : -v);
+      const onGrid5 = this._read("grid_on_power_5_min", null);
+      const onGrid1s = this._read("grid_on_power", null);
+      let gridPort;
+      if (onGrid1s !== null) gridPort = onGrid1s;
+      else if (onGrid5 !== null) gridPort = onGrid5;
+      else gridPort = neg(this._read("system_grid_power", null));
 
       // Battery is the one node without a `sys_` counterpart at the system
       // level, so it keeps the usual system → device fallback. A pure micro
@@ -1369,7 +1415,7 @@ function _hmPowerFlowRegister() {
       packs = Math.max(1, Math.min(declared > 0 ? declared : packs, STACK_MAX_PACKS));
 
       return {
-        pv, pv2, pvPorts, grid, load, smartPlug, battery, soc,
+        pv, pv2, pvPorts, grid, gridPort, load, smartPlug, battery, soc,
         status: status.toLowerCase(), rssi, packs,
       };
     }
@@ -1595,20 +1641,26 @@ function _hmPowerFlowRegister() {
     }
 
     /**
-     * The micro-inverter drawing: PV on the left, the 并网端口 on the right,
-     * the product photo in the middle, and nothing else.
+     * The micro-inverter drawing: the PV inputs along the bottom, the product
+     * photo in the middle, and the 并网端口 above it on the right - the AC
+     * output, which is the path the energy takes out of the unit and into the
+     * house.
      *
-     * The 并网端口 reading is printed as an absolute value - the user asked for
-     * the number to stay unsigned and to be seen at a glance - so the direction
-     * of the energy is carried by the pearls instead: they run towards the unit
-     * while it is drawing from the grid (取电) and away from it while it is
-     * feeding back (馈电).  That is why the grid route is reversed for a
-     * *positive* reading rather than a negative one; see the table below.
+     * That is the same three-branch shape the storage schematic uses (PV in,
+     * unit, output out), so the two views read alike.  The pearls carry the
+     * direction: they run from the PV ports into the unit, and from the unit
+     * out through the 并网端口 while it is producing.  At night the unit draws
+     * a standby current, so both reverse.
+     *
+     * The port reading here is `d.gridPort` - the unit's *own* AC output,
+     * positive = energy leaving the unit - and not `d.grid`, which is the
+     * system's grid balance with the opposite convention (positive =
+     * importing) and belongs to the storage schematic.
      *
      *   pv     producing            node -> unit
      *          consuming (night)    unit -> node    (reverse)
-     *   grid   取电 / importing      node -> unit    (> 0)
-     *          馈电 / exporting      unit -> node    (reverse, < 0)
+     *   grid   exporting (> 0)      unit -> node    (reverse)
+     *          importing (< 0)      node -> unit
      */
     _svgInverter(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
@@ -1639,32 +1691,55 @@ function _hmPowerFlowRegister() {
         id: n.id, d: n.route, power: n.power, color: COLORS.pv,
         reverse: num(n.power) < 0,
       }));
-      /* The grid port is always drawn: a reading of 0 W is meaningful (the
-         unit is idle, not absent), and dropping the node left the right half of
-         the drawing empty with no explanation.  Only a genuinely missing value
-         makes it show a dash, and never removes it. */
-      {
-        /* Importing is the mirrored case: the connector is written from the
-           node towards the unit, so a *forward* run already means "into the
-           unit".  Exporting therefore reverses it. */
-        const g = present(d.grid) ? num(d.grid) : 0;
+      /* The AC output.  Drawn unless explicitly disabled - it is a port of the
+         hardware, not an optional reading - and a missing value shows a dash
+         rather than removing the branch.
+
+         This layout draws the unit's *own* AC port (`d.gridPort`, positive =
+         energy leaving the unit - see `_data`), not the system grid balance
+         `d.grid` that the storage schematic uses.  The connector is authored
+         from the node towards the unit, so a forward run reads as "into the
+         unit"; producing therefore has to be reversed to read as "out of the
+         unit", which is the direction the PV energy actually travels. */
+      const showGrid = this._config.show_grid !== false;
+      const g = present(d.gridPort) ? num(d.gridPort) : 0;
+      if (showGrid) {
+        /* The grid connector plugs into the photo's *right* edge, higher up
+           than the DC terminals: the right-most PV input uses that same edge,
+           so sharing one height made the two paths coincide exactly and read
+           as a single line.  Half way between the node's own bottom rim and
+           the DC terminal height gives the AC output its own port with a full
+           elbow, which is also how the hardware's terminal block is laid out.
+           The lower clamp keeps a few pixels of vertical run when the photo is
+           tall enough to put that midpoint right under the ring. */
+        const dcTermY = photo.b - IV_TERMINAL_INSET;
+        const gridTermY = Math.max(
+          (IV_NODE_GRID.y + NODE_R + dcTermY) / 2,
+          IV_NODE_GRID.y + NODE_R + 8,
+        );
         routes.push({
           id: "grid",
-          d: elbowRoute(IV_NODE_GRID, photo.r, photo.t + IV_TERMINAL_INSET),
-          power: present(d.grid) ? d.grid : null,
-          color: g < 0 ? COLORS.grid_out : COLORS.grid,
-          reverse: g < 0,
+          d: elbowRoute(IV_NODE_GRID, photo.r, gridTermY),
+          power: present(d.gridPort) ? d.gridPort : null,
+          /* Amber while the unit is producing (the same colour the PV flow and
+             the storage schematic's trunk use, because it *is* the PV energy
+             leaving), blue while it draws standby power back from the grid -
+             the same blue the storage schematic's grid branch uses.  At a
+             standstill neither direction applies, so nothing moves. */
+          color: g > 0 ? COLORS.grid_out : COLORS.grid,
+          reverse: g > 0,
         });
       }
 
       const edges = routes.map((r) => `
         <path class="pf-edge" d="${r.d}" fill="none"
               vector-effect="non-scaling-stroke"/>`).join("");
-      const dots = present(d.grid) || pvNodes.some((n) => present(n.power))
+      const dots = pvNodes.some((n) => present(n.power))
+        || (showGrid && present(d.gridPort))
         ? routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("")
         : "";
 
-      const busy = [...d.pvPorts, d.grid]
+      const busy = [...d.pvPorts, d.gridPort]
         .some((v) => present(v) && Math.abs(num(v)) >= MIN_FLOW);
 
       return `<svg viewBox="0 0 ${IV_W} ${IV_H}" preserveAspectRatio="xMidYMid meet"
@@ -1694,8 +1769,9 @@ function _hmPowerFlowRegister() {
     }
 
     /**
-     * The nodes of the micro-inverter layout: one per PV input on the left, the
-     * 并网端口 on the right.
+     * The nodes of the micro-inverter layout: one per PV input, plus the
+     * 并网端口 - the AC output - which is drawn by default, exactly like the
+     * grid side of the storage schematic.  `show_grid: false` is the opt-out.
      *
      * The PV captions are `PV1` / `PV2` - the same wording the vendor app and
      * the firmware's own port table use - because these are physical inputs on
@@ -1736,9 +1812,10 @@ function _hmPowerFlowRegister() {
       if (opts.grid) {
         /* No 电网输入 / 电网输出 wording here: the number is absolute and the
            direction is already drawn by the pearls, so a caption that moved
-           with the sign would contradict it. */
-        node(IV_NODE_GRID.x, IV_NODE_GRID.y, "grid", working(d.grid),
-          reading(d.grid), t("Grid port", "并网端口"), true);
+           with the sign would contradict it.  The reading is the unit's own AC
+           port (`gridPort`), not the system grid balance. */
+        node(IV_NODE_GRID.x, IV_NODE_GRID.y, "grid", working(d.gridPort),
+          reading(d.gridPort), t("Grid port", "并网端口"), true);
       }
 
       return parts.join("");
@@ -2054,7 +2131,7 @@ function _hmPowerFlowRegister() {
             .value=${config.flow_speed === undefined ? "" : String(config.flow_speed)}
             @change=${this._changed("flow_speed")}></ha-textfield>
           <ha-textfield
-            label="variant (auto|inverter - 'inverter' draws the HiFlow PV + grid port layout)"
+            label="variant (auto|inverter - 'inverter' draws the HiFlow PV inputs layout)"
             .value=${config.variant || ""} @change=${this._changed("variant")}></ha-textfield>
           <ha-textfield
             label="pv_count (1-4 - PV inputs of a micro inverter, empty = auto)"
@@ -2072,6 +2149,11 @@ function _hmPowerFlowRegister() {
             <ha-switch .checked=${config.show_rssi !== false}
               @change=${this._toggle("show_rssi")}></ha-switch>
             <span>show_rssi (signal icon)</span>
+          </label>
+          <label class="sw">
+            <ha-switch .checked=${config.show_grid !== false}
+              @change=${this._toggle("show_grid")}></ha-switch>
+            <span>show_grid (inverter layout: draw the 并网端口 output node)</span>
           </label>
           <label class="sw">
             <ha-switch .checked=${config.dim_when_idle === false}
