@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CAP_SYSTEM_STATE, DOMAIN, MANUFACTURER, SRC_DEVICE, SRC_QUICK
 from .coordinator import HoymilesCoordinator
+from .entity_gate import async_add_gated_entities
 
 
 def _quick(field: str) -> Callable[[dict], Any]:
@@ -104,11 +105,35 @@ async def async_setup_entry(
 
     await coordinator.async_wait_for_capabilities()
 
-    async_add_entities(
-        HoymilesBinarySensor(coordinator, dev_id, description)
-        for description in BINARY_SENSOR_DESCRIPTIONS
-        if description.requires is None
-        or coordinator.has_capability(description.requires)
+    # All six heating sensors read a storage unit's ``quick/state`` / ``packs``,
+    # so a micro inverter gets none of them - and any that do become justified
+    # later (a device whose retained payloads arrive after this point) are added
+    # by the gate.
+    def _build() -> list[HoymilesBinarySensor]:
+        return [
+            HoymilesBinarySensor(coordinator, dev_id, description)
+            for description in BINARY_SENSOR_DESCRIPTIONS
+            if description.requires is None
+            or coordinator.has_capability(description.requires)
+        ]
+
+    def _stale() -> set[str]:
+        """Heating keys the device cannot report (no storage ``quick/state``)."""
+        return {
+            description.key
+            for description in BINARY_SENSOR_DESCRIPTIONS
+            if description.requires is not None
+            and not coordinator.has_capability(description.requires)
+        }
+
+    async_add_gated_entities(
+        coordinator,
+        async_add_entities,
+        _build,
+        entry,
+        hass=hass,
+        domain="binary_sensor",
+        stale=_stale,
     )
 
 

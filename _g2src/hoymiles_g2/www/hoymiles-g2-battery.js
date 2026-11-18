@@ -25,9 +25,9 @@
  *
  * Micro inverters (HiFlow) have no battery at all, so the same card switches to
  * the vendor's product photo with PV / grid / today's yield read under it. The
- * switch is automatic: `model` containing "HiFlow", or a `RMI-` serial prefix,
- * selects it. Use `variant: inverter` to force it or `variant: battery` to
- * force the stack.
+ * switch is automatic: `model` containing "HiFlow", or a serial whose PID (the
+ * leading four digits) is a known inverter product id, selects it. Use
+ * `variant: inverter` to force it or `variant: battery` to force the stack.
  *
  * Card config:
  *   type: custom:hoymiles-g2-battery
@@ -59,21 +59,33 @@ function _hmBatteryRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -82,28 +94,19 @@ function _hmBatteryRegister() {
    * dashboard keeps working) or a language map:
    *
    *   title:
-   *     en: HiBattery X
-   *     zh: 电池组
+   *     en: Battery packs
+   *     zh: 电池包
    *
    * That is what lets the text *you* write follow the UI language too, instead
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   /* ------------------------------------------------------------------ *
    * Drawing constants
@@ -140,6 +143,20 @@ function _hmBatteryRegister() {
      image resource. */
   const HIFLOW_IMAGE = "/hoymiles_g2_static/hiflow.png";
 
+  /* Product ids (PID): the four digits at the start of the serial.  Mirrors
+     `PID_PV_COUNT` in `const.py` and `IV_PV_COUNT_BY_CODE` in
+     `hoymiles-g2-power-flow.js`; keep all three in sync.
+
+     This is the only safe way to tell a micro inverter from a storage unit,
+     because the serial *prefix* is a user setting (the MQTT client prefix) and
+     may have been renamed to anything. */
+  const IV_PID_PV_COUNT = {
+    1650: 1,   // HiFlow, single input
+    4160: 1,   // HiFlow Pro 1-in-1
+    4161: 2,   // HiFlow Pro 2-in-1
+    4162: 4,   // HiFlow Pro 4-in-1
+  };
+
 
   const STATUS = {
     charge: { cls: "ok", en: "Charging", zh: "充电" },
@@ -147,6 +164,66 @@ function _hmBatteryRegister() {
     lock: { cls: "warn", en: "Locked", zh: "锁定" },
     standby: { cls: "", en: "Standby", zh: "待机" },
   };
+
+  /* ------------------------------------------------------------------ *
+   * Corner artwork
+   *
+   * Drawn, not pasted in.  The PV corner used to be the sun emoji, which sat
+   * next to flat single-colour status glyphs and looked like it came from
+   * another app; it is the vendor's own sun now - one colour, round-capped
+   * rays - so the corner belongs to the same family as the rest of the panel.
+   *
+   * Every builder draws inside a 24 x 24 box; `_cornerGlyph` scales and centres
+   * it on the readout, so one size table drives all of them.
+   * ------------------------------------------------------------------ */
+  const CORNER_GLYPH = {
+    /* A sun: solid disc, eight round-capped rays.  The disc is r 4.6 and the
+       rays run from r 7 to r 10, which leaves 2.4 units between the disc and
+       the ray tips - enough that the eight arms stay separate at 31 units wide
+       instead of merging into a blob. */
+    sun: (c) => `
+      <g stroke="${c}" stroke-width="1.9" stroke-linecap="round">
+        <path d="M12 2v3"/><path d="M12 19v3"/>
+        <path d="M2 12h3"/><path d="M19 12h3"/>
+        <path d="M4.93 4.93 7.05 7.05"/><path d="M16.95 16.95 19.07 19.07"/>
+        <path d="M19.07 4.93 16.95 7.05"/><path d="M7.05 16.95 4.93 19.07"/>
+      </g>
+      <circle cx="12" cy="12" r="4.6" fill="${c}"/>`,
+
+    /* The plate-and-plug drawing, unchanged: a light rounded square with the
+       dark body and stem on it.  Kept in its own two colours on purpose - it is
+       the one glyph that reads as hardware rather than as a symbol. */
+    socket: () => `
+      <rect x="0" y="0" width="24" height="24" rx="6" fill="#cfd4da"/>
+      <circle cx="12" cy="10" r="4.2" fill="#3b4149"/>
+      <rect x="10" y="14" width="4" height="7" rx="2" fill="#3b4149"/>`,
+  };
+
+  /* Colour and optical size per corner icon.  Sizes are the side of the box in
+     viewBox units - the port is deliberately larger than the sun because its
+     plate and stem have to stay apart at the size the card actually draws. */
+  const CORNER_COLORS = { sun: "#f5a623", socket: "#cfd4da" };
+  const CORNER_SIZE = { sun: 31, socket: 36 };
+
+  /* Vertical nudge per corner icon, in viewBox units.  The sun's ink is
+     symmetric but its optical weight sits high, so a geometrically centred sun
+     looks like it is floating beside a 24 px figure; the socket is a solid
+     square and needs nothing. */
+  const CORNER_DY = { sun: 2.5, socket: 0 };
+
+  /* Battery corner glyph: the drawing follows the state, the way the vendor app
+     does it - a battery that fills while charging, the two-arrow cycle while
+     discharging, a muted hourglass when idle. */
+  const CHARGE_COLOR = "#22c55e";
+  const DISCHARGE_COLOR = "#4a90d9";
+  const IDLE_COLOR = "#9aa4af";
+  // Material "sync": two arrows chasing each other round a circle.
+  const SYNC_PATH = "M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8"
+    + "l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6"
+    + " 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z";
+  // Material "hourglass_empty"
+  const HOURGLASS_PATH = "M6 2v6h.01L6 8.01 10 12l-4 4 .01.01H6V22h12v-5.99h-.01L18 16"
+    + "l-4-4 4-3.99-.01-.01H18V2H6zm10 14.5V20H8v-3.5l4-4 4 4zm-4-5l-4-4V4h8v3.5l-4 4z";
 
   /* ------------------------------------------------------------------ *
    * Helpers
@@ -510,7 +587,8 @@ function _hmBatteryRegister() {
         .hstat { display: flex; align-items: center; gap: 10px; min-width: 40px;
                  justify-content: flex-end; }
         .hstat svg { display: block; }
-        .bell { color: var(--error-color); font-size: 17px; line-height: 1; }
+        .hstat .bell { display: inline-flex; }
+        .hstat .bell svg { display: block; }
         .wrap { display: flex; justify-content: center;
                 /* max_width caps the illustration, and the dashboard column is
                    usually wider than that - without auto margins the leftover
@@ -589,6 +667,19 @@ function _hmBatteryRegister() {
       this.requestUpdate();
     }
 
+connectedCallback() {
+      super.connectedCallback();
+      /* The toolbar language switch only writes localStorage and fires
+         `hoymiles-language`; it never touches `hass.language`, so without this
+         the card would keep its old wording until a page reload. */
+      I18N.watch(this);
+    }
+
+    disconnectedCallback() {
+      I18N.unwatch(this);
+      super.disconnectedCallback();
+    }
+
     getCardSize() {
       return 12;
     }
@@ -644,13 +735,19 @@ function _hmBatteryRegister() {
 
     /* ----------------------------- lookup ----------------------------- */
 
+    /** One of the two strings the card carries, in the current language. */
     _t(en, zh) {
-      return hmLang(this._hass, this._config) === "zh" ? zh : en;
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
     }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
 
     _dev() {
@@ -718,8 +815,12 @@ function _hmBatteryRegister() {
      * they are different products: a micro inverter has no battery, so the
      * stack illustration and the pack history make no sense for it. Detection
      * is by model name first (the firmware publishes `model: "HiFlow"`) and by
-     * the `RMI-` serial prefix as a fallback, so an older firmware that omits
-     * the model still gets the right look.
+     * the serial's product id (PID) as a fallback, so an older firmware that
+     * omits the model still gets the right look.
+     *
+     * The serial *prefix* is deliberately not used: it is the MQTT client
+     * prefix, a user setting, so `RMI-` may have been renamed to anything.  The
+     * four digits at the start of the serial cannot be renamed.
      */
     _isMicroInverter() {
       if (this._config && this._config.variant) {
@@ -728,7 +829,8 @@ function _hmBatteryRegister() {
       const model = (this._model() || "").toLowerCase();
       if (model.includes("hiflow")) return true;
       if (model.includes("hibattery")) return false;
-      return String(this._dev() || "").toUpperCase().startsWith("RMI-");
+      const pid = String(this._dev() || "").split("-").pop().slice(0, 4);
+      return Object.prototype.hasOwnProperty.call(IV_PID_PV_COUNT, pid);
     }
 
     /**
@@ -770,6 +872,25 @@ function _hmBatteryRegister() {
         for (const entityId of Object.keys(hass.states)) {
           if (!entityId.startsWith(prefix)) continue;
           if (norm(entityId.slice(prefix.length + 1)) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
+      if (!found) {
+        // A renamed device.  Renaming it in Home Assistant rewrites every
+        // entity id to the new name, so the `<slug(dev_id)>_` prefix the two
+        // strategies above rely on is gone and the card would silently fall
+        // back to its placeholder values.  The serial never changes, so the
+        // normalized tail *after the serial* is compared instead: that still
+        // pins the entity to this unit and it keeps `soc` from matching
+        // `system_soc`, because only the part that follows the serial counts.
+        const marker = norm(this._dev());
+        const wanted = norm(suffix);
+        for (const entityId of Object.keys(hass.states)) {
+          const flat = norm(entityId);
+          const at = marker ? flat.indexOf(marker) : -1;
+          if (at < 0) continue;
+          if (flat.slice(at + marker.length) !== wanted) continue;
           if (!found || entityId.length < found.length) found = entityId;
         }
       }
@@ -909,7 +1030,7 @@ function _hmBatteryRegister() {
       return html`
         <ha-card>
           <div class="head">
-            <div class="hstat">${this._alarm()}</div>
+            <div class="hstat">${this._untrusted(this._alarm())}</div>
             ${this._showTitle()
               ? html`<div class="htitle">${esc(this._title())}</div>`
               : html`<div class="htitle"></div>`}
@@ -958,11 +1079,11 @@ function _hmBatteryRegister() {
           <div class="inv-stats">
             <div class="stat">
               <span class="stat-v">${esc(pvText)}</span>
-              <span class="stat-c">${esc(this._t("PV input", "光伏输入"))}</span>
+              <span class="stat-c">${esc(this._t("PV Input", "光伏输入"))}</span>
             </div>
             <div class="stat">
               <span class="stat-v">${esc(gridText)}</span>
-              <span class="stat-c">${esc(this._t("Grid output", "并网输出"))}</span>
+              <span class="stat-c">${esc(this._t("Grid Output", "并网输出"))}</span>
             </div>
             <div class="stat">
               <span class="stat-v">${esc(energyText)}</span>
@@ -972,8 +1093,28 @@ function _hmBatteryRegister() {
         </div>`;
     }
 
+    /**
+     * The alarm badge in the head band.
+     *
+     * The same red triangle the vendor's own card draws, with the count inside
+     * the tooltip rather than on the face: the glyph has to read at 22 px, and
+     * a digit in a triangle that size turns into a smudge.  Nothing is drawn
+     * when no alarm is active - a green tick would claim the card had checked,
+     * and only the alarm card can actually say that.
+     */
     _alarm() {
-      return this._alarmOn() ? html`<span class="bell">🔔</span>` : "";
+      if (!this._alarmOn()) return "";
+      const title = esc(this._t("Active alarms", "当前告警"));
+      const svg = `<svg width="22" height="22" viewBox="0 0 22 22" role="img"`
+        + ` aria-label="${title}"><title>${title}</title>`
+        // The stroke is the same colour as the fill and exists only to round
+        // the three corners; a plain path has needle-sharp ones.
+        + `<path d="M11 3.1 20 18.6H2Z" fill="var(--error-color, #db4437)"`
+        + ` stroke="var(--error-color, #db4437)" stroke-width="2.6"`
+        + ` stroke-linejoin="round"/>`
+        + `<rect x="10.05" y="8.2" width="1.9" height="5.2" rx="0.95" fill="#ffffff"/>`
+        + `<circle cx="11" cy="15.6" r="1.1" fill="#ffffff"/></svg>`;
+      return `<span class="bell">${svg}</span>`;
     }
 
     /** Wi-Fi style signal bars derived from the device's `rssi` sensor. */
@@ -1028,31 +1169,98 @@ function _hmBatteryRegister() {
           </linearGradient>
         </defs>
         ${markup}
-        ${this._row(30, 62, "☀️", fmtW(d.pv), this._t("PV", "光伏"), "start")}
+        ${this._row(30, 62, "sun", fmtW(d.pv), this._t("PV", "光伏"), "start")}
         ${this._row(VB_W - 30, VB_W - 58, "socket", fmtW(d.gridOn),
-          this._t("Grid port", "并网端口"), "end")}
-        ${this._row(30, 62, "⏳", fmtW(d.battery), d.batteryCaption, "start", bottomY)}
+          this._t("Grid Port", "并网端口"), "end")}
+        ${this._row(30, 62, `status:${d.status.key}`, fmtW(d.battery),
+          d.batteryCaption, "start", bottomY)}
         ${this._row(VB_W - 30, VB_W - 58, "dot", fmtW(d.gridOff),
-          this._t("Off-grid port", "离网端口"), "end", bottomY)}
+          this._t("Off-Grid Port", "离网端口"), "end", bottomY)}
       </svg>`;
+    }
+
+    /**
+     * The battery corner icon, which doubles as the state indicator.
+     *
+     * One fixed drawing would leave the state with nothing to say, so the glyph
+     * follows it the way the vendor app does: a battery whose segments fill
+     * while charging, the two-arrow cycle while discharging, and a muted
+     * hourglass while idle.
+     *
+     * The three drawings share one optical size - a battery 30 wide, the arrow
+     * ring 28 across, the hourglass 26 - and are all centred on the readout's
+     * power figure, which is 24 px tall.
+     */
+    _statusGlyph(iconX, y, key) {
+      const cx = iconX + 1;
+      const cy = y - 30;
+
+      if (key === "charge") {
+        const bx = cx - 15;
+        const by = cy - 9;
+        const bars = [0, 1, 2].map((i) => `<rect
+            x="${(bx + 1.5 + i * 8.5).toFixed(1)}" y="${cy - 6}"
+            width="6" height="12" rx="1.5" fill="${CHARGE_COLOR}"/>`).join("");
+        return `<rect x="${bx}" y="${by}" width="26" height="18" rx="4"
+            fill="none" stroke="${CHARGE_COLOR}" stroke-width="2.2"/>
+          <rect x="${(bx + 26.5).toFixed(1)}" y="${cy - 4}" width="4.2"
+            height="8" rx="1.6" fill="${CHARGE_COLOR}"/>
+          ${bars}`;
+      }
+
+      if (key === "discharge") {
+        /* The arrow heads have to point the way the ring reads, or the graphic
+           argues with itself.  Material's "sync" is drawn the other way round,
+           so it is mirrored - inside the group, so the mirror flips the arrows
+           without moving anything else. */
+        return `<g transform="translate(${(cx - 14).toFixed(1)} ${(cy - 14).toFixed(1)}) scale(${(28 / 24).toFixed(4)})">
+            <g transform="translate(12 12) scale(-1 1) translate(-12 -12)">
+              <path fill="${DISCHARGE_COLOR}" d="${SYNC_PATH}"/>
+              <circle cx="12" cy="12" r="2.8" fill="${DISCHARGE_COLOR}"/>
+            </g>
+          </g>`;
+      }
+
+      // standby / locked
+      return `<g opacity="0.55">
+          <g transform="translate(${(cx - 13).toFixed(1)} ${(cy - 13).toFixed(1)}) scale(${(26 / 24).toFixed(4)})">
+            <path fill="${IDLE_COLOR}" d="${HOURGLASS_PATH}"/>
+          </g>
+        </g>`;
+    }
+
+    /**
+     * One of the flat corner icons, scaled and centred on a readout.
+     *
+     * The optical centre is (`iconX` + 1, `y` - 30) - the same point the battery
+     * status glyphs and the 24 px figure are centred on, so a corner never sits
+     * off the line of its own number.
+     */
+    _cornerGlyph(iconX, y, key, size) {
+      const build = CORNER_GLYPH[key];
+      if (!build) return "";
+      const s = size / 24;
+      const x = (iconX + 1 - 12 * s).toFixed(2);
+      const yy = (y - 30 + (CORNER_DY[key] || 0) - 12 * s).toFixed(2);
+      return `<g transform="translate(${x} ${yy}) scale(${s.toFixed(4)})">`
+        + build(CORNER_COLORS[key] || "#46505c") + `</g>`;
     }
 
     /**
      * One corner readout: icon, power value and caption.
      * `anchor` is "start" (icon on the left) or "end" (icon on the right).
+     *
+     * `icon` is either a key of `CORNER_GLYPH`, `status:<charge|discharge|...>`
+     * for the battery corner that doubles as a state indicator, or "dot".
      */
     _row(iconX, textX, icon, value, caption, anchor, y = 46) {
       let glyph;
-      if (icon === "socket") {
-        glyph = `<g transform="translate(${iconX - 15},${y - 26})">
-            <rect x="0" y="0" width="24" height="24" rx="6" fill="#cfd4da"/>
-            <circle cx="12" cy="10" r="4.2" fill="#3b4149"/>
-            <rect x="10" y="14" width="4" height="7" rx="2" fill="#3b4149"/>
-          </g>`;
-      } else if (icon === "dot") {
-        glyph = `<circle cx="${iconX - 6}" cy="${y - 27}" r="5.5" fill="#f5a623"/>`;
+      if (icon.startsWith("status:")) {
+        glyph = this._statusGlyph(iconX, y, icon.slice(7));
+      } else if (icon in CORNER_GLYPH) {
+        glyph = this._cornerGlyph(iconX, y, icon, CORNER_SIZE[icon]);
       } else {
-        glyph = `<text x="${iconX - 12}" y="${y - 22}" font-size="20">${icon}</text>`;
+        glyph = `<circle cx="${iconX - 6}" cy="${y - 27}" r="5.5" fill="#f5a623"/>`;
       }
       return `${glyph}
         <text class="bat-v" x="${textX}" y="${y - 22}" text-anchor="${anchor}">${value}</text>

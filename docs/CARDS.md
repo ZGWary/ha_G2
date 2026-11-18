@@ -63,7 +63,7 @@ unloaded.
 
 | Option | Type | Description |
 |---|---|---|
-| `dev_id` | string | Device identifier, `<client_prefix>-<SN>` (e.g. `MSA-280520260806`). Required on all cards except the gauge, which is entity-driven. |
+| `dev_id` | string | Device identifier, `<client_prefix>-<SN>` (e.g. `MSA-280520260806`). The prefix is a user setting and may be renamed; recognition is always based on the serial's PID. Required on all cards except the gauge, which is entity-driven. |
 | `language` | `zh` \| `en` | **Follows Home Assistant.** Leave it out and the card uses the language of the HA user viewing it (any `zh-*` code selects Chinese). Set it only to pin one card to a language. |
 | `title` | string | Card heading. Defaults are per-card (see below). |
 | `show_title` | bool | Set `false` to hide the heading (and, on some cards, the device SN). |
@@ -204,10 +204,10 @@ language: zh
 | `temperature_entity` | entity id | — | Outdoor temperature shown next to the title. |
 | `show_rssi` | bool | `true` | Wi-Fi signal fan in the top-right corner. |
 | `gradient` | bool | `true` | Draw the plain **white** backdrop the schematic sits on. `false` leaves the card background instead — pair it with a light theme, since the diagram's text colours are fixed. |
-| `max_width` | number (px) | `620` | Maximum width of the illustration; it stays centred. |
+| `max_width` | number (px) | `620` | Maximum width of the illustration; it stays centred. `0` means no cap (fill the cell) — but when the card is spanning the whole row (the alarm card hid itself), the illustration is pinned at its *half-row* width and stays centred, so the card only gets **longer, never taller**. |
 | `flow_speed` | number | `1` | Speed multiplier for the moving pearls. `0.5` is calmer, `2` is faster. |
 | `variant` | `inverter` | — | Set to `inverter` for the **micro-inverter layout** (see below). Empty keeps the four-branch storage schematic. |
-| `image` | URL | *picked by SKU* | Product photo in the middle of the micro-inverter layout; must be a transparent cut-out. **Leave it out** — the card picks the cut-out from the serial's model code (see below) and an explicit value is only for overriding it. |
+| `image` | URL | *picked by PID* | Product photo in the middle of the micro-inverter layout; must be a transparent cut-out. **Leave it out** — the card picks the cut-out from the serial's PID (see below) and an explicit value is only for overriding it. |
 | `pv_count` | number | *auto* | DC inputs to draw in the micro-inverter layout, `1`–`4`: `1` gives a single `PV1`, `2` gives `PV1` + `PV2`, `4` draws through to `PV4` (a 4-in-1, whose middle two inputs rise into the photo's bottom edge). Omit to infer (see below). |
 | `dim_when_idle` | bool | `true` | In the micro-inverter layout the photo fades to 55 % when nothing flows. `false` keeps it fully opaque. |
 | `entities` | map | — | Entity overrides, keyed by suffix (see below). |
@@ -239,6 +239,14 @@ vendor app's system page shows:
 - The grid caption follows the flow: *Grid in* while importing, *Grid out*
   while exporting, plain *Grid* at ~0 W — it does not claim a direction it
   cannot see.
+- **`has_meter: false` merges grid and load into a single *Grid & Load* node.**
+  `has_meter` is an attribute of `sensor.<dev>_system_role` (taken from
+  `event/state`) and says whether this unit has its own grid metering point.
+  When it is `false` the two are physically the same segment, and drawing them
+  apart would invent two power readings, so the card draws one node and one
+  connector (grid-pylon + house glyph, value from `sys_grid_p`). When it is
+  `true`, or when no `event/state` has arrived yet (`null`), they stay
+  **separate** — "not stated" is not "not present".
 - The two diagonal branches (PV2 and load) are plain connectors - there is no
   direction arrow anywhere in the picture.  Which way the power goes is shown
   by the pearls, and only by them.
@@ -299,6 +307,24 @@ not have. With `variant: inverter` the card draws only the ends it really has:
              ⬜ PV2 ────┘
 ```
 
+The port count is inferred from — in order — an explicit `pv_count`, the **PID**
+at the start of the serial, the highest port that reports live data, the model
+name, and finally 1. The PID is checked *before* the live readings on purpose: a
+4-input unit reports `pv3` / `pv4` as `0` at night, and "no reading" must not be
+read as "no port".
+
+| PID (first four digits of the serial) | Model | PV inputs |
+| --- | --- | --- |
+| `1650` | HiFlow | 1 |
+| `4160` | HiFlow Pro 1-in-1 | 1 |
+| `4161` | HiFlow Pro 2-in-1 | 2 |
+| `4162` | HiFlow Pro 4-in-1 | 4 |
+
+The PID is part of the **serial**, not of the `<client_prefix>-` in front of it.
+That prefix is a user setting that may be renamed to anything (`GARAGE-4161…`),
+so it is never used for recognition. If a unit is still classified wrongly, set
+`pv_count` explicitly — no code change needed.
+
 That is: **photo centred, grid port top-right, PV-1 bottom-left and PV-2
 bottom-right** — the same arrangement the vendor app uses on its device page.
 Every node joins the photo's left and right edges through orthogonal connectors
@@ -326,7 +352,7 @@ the middle form: one elbow each side, one riser in the centre.
 - type: custom:hoymiles-g2-power-flow
   dev_id: RMI-4161A0209FF6
   variant: inverter
-  # image is left out on purpose: the card picks the cut-out from the SKU
+  # image is left out on purpose: the card picks the cut-out from the PID
   pv_count: 2                 # 2-in-1: PV1 + PV2. Set 1 for a single-input unit.
   title: My home
   show_title: false
@@ -356,20 +382,29 @@ reading" and "0 W on the grid" are entirely different facts.
   `hiflow-pro-4in1.png` = 366/168, falling back to `360/168`). Connector ends
   stop 22 px inside the photo's left/right edges (`IV_TERMINAL_INSET`) instead
   of touching the border.
+- **The 4-in-1 cut-out is the exception.** `hiflow-pro-4in1.png` is cropped much
+  wider than the body it shows (the silhouette spans only x 77..258 of the
+  366 px), so stopping at the bounding box's edges left all four connectors
+  hanging 65–90 px short in the transparent margin — it read as "not plugged
+  in". `IV_TERMINAL_BY_ART` therefore registers `pvLeftXFrac: 0.222` /
+  `pvRightXFrac: 0.696` for that file alone, which aims the runs a little way
+  *into* the silhouette. The photo is painted after the connectors and its
+  transparent pixels paint nothing, so the covered stretch simply disappears.
 - **The artwork follows the SKU — do not set `image` just to pick a photo.** The
   photo is part of the diagram rather than decoration (every connector stops on
   its edge), so a 4-input unit has to show a 4-input body or the two middle
-  risers appear to end in mid-air. `IV_IMAGE_BY_CODE` therefore maps the first
-  four digits of the serial to the matching cut-out:
+  risers appear to end in mid-air. `IV_IMAGE_BY_CODE` therefore maps the **PID**
+  (the first four digits of the serial, independent of the user-changeable client
+  prefix) to the matching cut-out:
 
-  | SKU | Model | Photo |
+  | PID | Model | Photo |
   | --- | --- | --- |
   | `1650` | HiFlow | `hiflow-800.png` |
   | `4160` | HiFlow Pro 1-in-1 | `hiflow-pro-1in1.png` |
   | `4161` | HiFlow Pro 2-in-1 | `hiflow-pro-2in1.png` |
   | `4162` | HiFlow Pro 4-in-1 | `hiflow-pro-4in1.png` |
 
-  An unknown SKU falls back to `IV_IMAGE_BY_COUNT` (the resolved port count),
+  An unknown PID falls back to `IV_IMAGE_BY_COUNT` (the resolved port count),
   then to the 2-in-1 default. An explicit `image:` still wins over both, which
   is what lets a dashboard override the artwork without a code change.
 - The canvas is a fixed `700 × 430`. All coordinates live in the `IV_*` constants
@@ -381,8 +416,9 @@ overlap the photo.
 - No battery, load, smart-plug or off-grid node — the micro inverter has no such
 topics.
 - **The variant is never auto-detected.** The same card also draws the `system`
-  view of a storage device, and sniffing the `RMI-` serial prefix would silently
-  change those views too. Only an explicit `variant: inverter` switches drawings.
+  view of a storage device, and sniffing the serial prefix would silently change
+  those views too — and the prefix is a user setting anyway, so it is not a
+  reliable discriminator. Only an explicit `variant: inverter` switches drawings.
 
 ---
 
@@ -655,6 +691,8 @@ title: 设备控制
 | `show_power_ctrl` | bool | `true` | `false` hides the *Power control* row. |
 | `show_phase` | bool | `true` | `false` hides the *Per-phase output power* row. |
 | `show_log` | bool | `true` | `false` hides the *MQTT log* row (the log itself is off by default). |
+| `show_factory_reset` | bool | *PID-based* | The *Factory reset* row. Omitted, it shows only on a product id that declares the command (protocol §29: HiFlow / HiFlow Pro, `1650` / `4160` / `4161` / `4162`), so a storage unit gets no dead button. |
+| `show_ble_pin_reset` | bool | *PID-based* | The *Reset BLE PIN* row (protocol §31), decided exactly like `show_factory_reset`. |
 | `show_topics` | bool | `false` | Show the MQTT topic under each row (debugging). |
 | `subtitle` | bool | `true` | `false` hides the grey line next to the title. |
 
@@ -670,6 +708,8 @@ title: 设备控制
 | Per-phase output power | `number/<dev_id>/phase_output_power/set` | Sent as `{"phase_a":..,"phase_b":..,"phase_c":..}` |
 | Fetch TOU plan | `sensor/<dev_id>/tou_plan/get` | The reply is published on `tou_plan/status` |
 | Reboot | `button/<dev_id>/reboot/trigger` | Sends `RESTART` after a confirmation |
+| Reset BLE PIN | `button/<dev_id>/reset_ble_pin_code/trigger` | Protocol §31. Payload is fixed: `RESET`, qos 1, retain false. Only the Bluetooth pairing PIN goes back to its default, other settings are kept. Same models as *Factory reset* |
+| Factory reset | `button/<dev_id>/factory_reset/trigger` | Protocol §29. Payload is fixed: `RESET`, qos 1, retain false. Erases the device's own configuration *including the MQTT client prefix*, so it asks for confirmation and the prompt says so. Shown on a product id that declares it (HiFlow / HiFlow Pro); a storage unit never gets the row. |
 | MQTT log | *(subscribes only, sends nothing)* | Off by default; on, it streams what the device reports and what HA sends, with retained messages labelled |
 
 ### MQTT log
@@ -825,6 +865,20 @@ on subscribes to two wildcards over the Home Assistant websocket (the
   ignored outright. When debugging, read
   `sensor.<dev_id>_ems_mode_device` (the device's own `device/state`), never
   `select.ems_mode` — the latter is the integration echoing your command back.
+- **Pressing "MQTT ctrl" snaps straight back to "General"** (firmware
+  `01.05.00` onward; fixed). The command really was published; the row was
+  being overwritten by an entity that could not see it. Two links in the echo
+  chain broke at once: the firmware added
+  `value_template: "{{ value_json.ems_mode }}"` to the `ems_mode` discovery
+  payload, so `discovery_override` steps aside by design and no longer
+  repoints `state_topic` at the integration's echo topic — and the firmware's
+  own `event/state` is an *event* topic that was measured on 9FF6 not being
+  republished for hours. The select therefore kept reading a stale `general`.
+  The card now remembers when it last commanded `ems_mode` and, for as long as
+  the entity has not *really* changed since, shows the user's pick; a device
+  report that arrives after the command still wins. The row's sub-line shows
+  both sides when they disagree (`mqtt_ctrl · device general`), so the
+  discrepancy is stated rather than hidden.
 
 ---
 

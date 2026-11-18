@@ -60,6 +60,14 @@
  *                                   # their time window (range + date)
  *   show_toolbar: false             # optional; hide this card's own toolbar
  *                                   # (use it on the followers)
+ *   since: 2026-11-13T08:30:00Z     # optional lower time bound (ISO 8601 or
+ *                                   # epoch ms). Nothing *before* it is asked
+ *                                   # of the recorder and the x axis starts
+ *                                   # there when the bound falls inside the
+ *                                   # window - which is what makes an opt-in
+ *                                   # card draw only the data recorded since
+ *                                   # the user enabled it, even though the
+ *                                   # statistics from before it still exist
  *   series:                         # required, one entry per curve
  *     - entity: sensor.x_pv_power
  *       name: 发电功率
@@ -74,21 +82,33 @@ function _hmHistoryRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -97,33 +117,19 @@ function _hmHistoryRegister() {
    * dashboard keeps working) or a language map:
    *
    *   title:
-   *     en: History
-   *     zh: 历史数据
-   *   series:
-   *     - entity: sensor.x
-   *       name:
-   *         en: PV power
-   *         zh: 发电功率
+   *     en: Battery packs
+   *     zh: 电池包
    *
    * That is what lets the text *you* write follow the UI language too, instead
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   /* ------------------------------------------------------------------ *
    * Layout / behaviour constants
@@ -141,6 +147,19 @@ function _hmHistoryRegister() {
   const CARD_PAD_X = 32;
   const DEFAULT_H = 330;
 
+  /* How often a card re-queries a window that is still open (today / this month
+   * / this year). Statistics are bucketed, so polling faster than the bucket
+   * gains nothing: the 1 s entities behind a day window are read as 5 minute
+   * means, and a fresh bucket is worth showing within half a minute of it being
+   * written. Anything shorter only adds recorder load on a dashboard showing
+   * six of these cards at once.
+   *
+   * The jitter spreads the cards of one dashboard apart so they never share a
+   * tick.
+   */
+  const AUTO_REFRESH_MS = 30000;
+  const AUTO_REFRESH_JITTER_MS = 8000;
+
   const PAD_L = 64;   // room for the y labels
   const PAD_R = 18;
   const PAD_T = 14;
@@ -153,6 +172,110 @@ function _hmHistoryRegister() {
   ];
 
   const DEFAULT_COLORS = ["#22c55e", "#4a90d9", "#22d3ee", "#f5a623", "#a78bfa"];
+
+  /* ------------------------------------------------------------------ *
+   * Zoom.
+   *
+   * The wheel narrows the x axis around the instant under the pointer, which
+   * is the only anchoring that feels right: a zoom around the centre throws
+   * the point you were looking at off screen. `_zoom` is a plain 0..1 span of
+   * the window (`null` = not zoomed), so it survives a refetch and means the
+   * same thing on a day, a month and a year.
+   *
+   * Only the curve modes zoom. A bar chart already *is* the calendar - one bar
+   * per day of a month, one per month of a year - so narrowing it shows four of
+   * thirty bars bigger, which loses the comparison it exists for; see
+   * `_zoomable()`.
+   * ------------------------------------------------------------------ */
+  const ZOOM_MIN_SPAN = 0.02;
+  const ZOOM_WHEEL = 0.0022;
+  const DOUBLE_CLICK_MS = 350;
+  /** Nominal length of one bar slot when no neighbour can supply it. */
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  /* How long one statistics bucket lasts, per `period` name. Used to decide
+     whether a bucket is entirely older than an opt-in card's `since`: a row is
+     stamped with the instant its bucket *starts*, so the bucket containing the
+     enabling instant has to survive the cut. */
+  const PERIOD_MS = {
+    "5minute": 5 * 60 * 1000,
+    hour: 60 * 60 * 1000,
+    day: DAY_MS,
+    // A month bucket is stamped with the 1st; 28 days is a safe lower bound,
+    // which only ever keeps one extra bucket, never drops a wanted one.
+    month: 28 * DAY_MS,
+  };
+
+  /** Resolve `_zoom` into a 0..1 span, clamped and normalised. */
+  function zoomWindow(zoom) {
+    if (!zoom) return { from: 0, to: 1, narrow: false };
+    const a = Math.min(Math.max(num(zoom.a), 0), 1);
+    const b = Math.min(Math.max(num(zoom.b), 0), 1);
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    if (!(hi - lo > 1e-6)) return { from: 0, to: 1, narrow: false };
+    return { from: lo, to: hi, narrow: hi - lo < 0.999 };
+  }
+
+  /**
+   * A smooth path through `pts`, as cubic segments.
+   *
+   * Monotone (Fritsch-Carlson) rather than a plain Catmull-Rom: the tangent at
+   * every point is limited by the smaller neighbouring slope, so a sharp peak
+   * is rounded *without* overshooting past the real reading. A plain
+   * interpolating spline draws a reading of 490 W up to 530 W between two
+   * samples and back, i.e. it invents power the device never produced, and on
+   * an energy curve it would draw a total that goes down and up again.
+   *
+   * `pts` is `[x, y]` pairs; the result is `M .. C ..` and can be appended to.
+   */
+  function smoothPath(pts) {
+    const n = pts.length;
+    if (!n) return "";
+    if (n < 3) {
+      return pts.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`).join("");
+    }
+    const dx = [];
+    const slope = [];
+    for (let i = 0; i < n - 1; i += 1) {
+      const h = pts[i + 1][0] - pts[i][0];
+      dx.push(h);
+      slope.push(h === 0 ? 0 : (pts[i + 1][1] - pts[i][1]) / h);
+    }
+    const tangent = new Array(n);
+    tangent[0] = slope[0];
+    tangent[n - 1] = slope[n - 2];
+    for (let i = 1; i < n - 1; i += 1) {
+      const a = slope[i - 1];
+      const b = slope[i];
+      // A flat or reversing stretch pins the tangent to zero, which is what
+      // keeps the curve monotone across a peak.
+      tangent[i] = a * b <= 0 ? 0 : (a + b) / 2;
+    }
+    for (let i = 0; i < n - 1; i += 1) {
+      const s = slope[i];
+      if (s === 0) { tangent[i] = 0; tangent[i + 1] = 0; continue; }
+      const a = tangent[i] / s;
+      const b = tangent[i + 1] / s;
+      const h = a * a + b * b;
+      if (h > 9) {
+        const k = 3 / Math.sqrt(h);
+        tangent[i] = k * a * s;
+        tangent[i + 1] = k * b * s;
+      }
+    }
+    let d = `M${pts[0][0].toFixed(1)} ${pts[0][1].toFixed(1)}`;
+    for (let i = 0; i < n - 1; i += 1) {
+      const h = dx[i] / 3;
+      const c1x = pts[i][0] + h;
+      const c1y = pts[i][1] + tangent[i] * h;
+      const c2x = pts[i + 1][0] - h;
+      const c2y = pts[i + 1][1] - tangent[i + 1] * h;
+      d += `C${c1x.toFixed(1)} ${c1y.toFixed(1)} ${c2x.toFixed(1)} ${c2y.toFixed(1)}`
+        + ` ${pts[i + 1][0].toFixed(1)} ${pts[i + 1][1].toFixed(1)}`;
+    }
+    return d;
+  }
 
   /* ------------------------------------------------------------------ *
    * Time-window sharing.
@@ -268,6 +391,45 @@ function _hmHistoryRegister() {
     return d;
   }
 
+  /** Width of bucket `i`, in milliseconds - the width of its bar.
+   *
+   * A bar runs from its own timestamp to the next bucket's, so the width comes
+   * from the gap *ahead*; the last bucket has no such neighbour and mirrors the
+   * gap behind it instead. A lone bucket falls back to whatever the caller
+   * offers (an hour of the window), which only happens while the recorder still
+   * holds a single row.
+   */
+  function barSlot(times, i, fallback) {
+    const t = num(times[i]);
+    if (i + 1 < times.length) return num(times[i + 1]) - t;
+    if (i > 0) return t - num(times[i - 1]);
+    return fallback;
+  }
+
+  /** Index of the bar covering `target`, or -1 when it falls in a hole.
+   *
+   * Bars are drawn edge to edge, so a pointer anywhere over a column belongs to
+   * that column. Nearest-timestamp matching would hand the right half of every
+   * bar to the *next* bucket, which is harmless while the guide line sits on a
+   * bar's left edge and wrong the moment it is centred: the readout would jump
+   * a day ahead while the cursor was still over the bar being read.
+   */
+  function barBucketAt(times, target) {
+    const n = times.length;
+    if (!n) return -1;
+    if (n === 1) return target >= num(times[0]) ? 0 : -1;
+    let lo = 0;
+    let hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (num(times[mid]) <= target) lo = mid;
+      else hi = mid - 1;
+    }
+    const start = num(times[lo]);
+    if (target < start) return -1;
+    return target < start + barSlot(times, lo, 1) ? lo : -1;
+  }
+
   /* ------------------------------------------------------------------ *
    * Card
    * ------------------------------------------------------------------ */
@@ -285,6 +447,8 @@ function _hmHistoryRegister() {
         _selected: { type: Number },
         _remoteTime: { type: Number },
         _vbW: { type: Number },
+        _zoom: { type: Object },
+        _totals: { type: Object },
       };
     }
 
@@ -300,23 +464,146 @@ function _hmHistoryRegister() {
       this._hover = -1;
       this._selected = -1;
       this._remoteTime = null;
+      /* Month / year / lifetime energy tiles, filled by `_fetchTotals()`. */
+      this._totals = null;
+      this._totalToken = 0;
       this._token = 0;
       /* viewBox width in CSS pixels; guarded so `_svg` works before mount. */
       this._vbW = VB_W;
       this._ro = null;
       this._syncJoined = null;
+      this._timer = null;
+      this._onVisibility = null;
+      /* `null` = the whole window. Otherwise `{a, b}` as 0..1 fractions of it.
+         Kept as a fraction so a refetch or a bucket-count change cannot move
+         the zoomed stretch out from under the user. */
+      this._zoom = null;
+      /* Set when a new data set has just been laid out: the next render draws
+         the curves flattened onto the zero line and the one after that plays
+         them up (see `_playGrow`).  `_growNext` arms it for the *next* query -
+         only a new window animates, never the 30 s refresh of the one already
+         on screen. */
+      this._pendingGrow = false;
+      this._growNext = true;
+      /* Drag-to-pan state; `null` whenever no button is held. */
+      this._drag = null;
+      /* Double-click detection state. It is timed from `mousedown`, not from
+         `click`: every render replaces the whole `<svg>` subtree (the markup
+         arrives as a fresh string), so a re-render between button-down and
+         button-up leaves the browser with no common target and it emits no
+         `click` and no `dblclick` at all. Button-down always arrives. */
+      this._lastDownAt = 0;
+      this._lastDownX = 0;
+      this._lastDownY = 0;
+      /* Kept as a second opinion for the cases where the native sequence does
+         survive (nothing re-rendered mid-click), so a fast pair of clicks still
+         resets when only one of the two paths sees it. */
+      this._lastClickAt = 0;
+      /* Set by a double-click that already reset the zoom, so the `click` that
+         belongs to the same gesture does not also clear the legend highlight. */
+      this._dblReset = false;
+      /* Per-instance id for the plot clip: `clip-path: url(#id)` resolves
+         document-wide, so two cards sharing an id would clip each other's
+         drawing to the wrong height. */
+      this._uid = `hmg2-chart-${Math.random().toString(36).slice(2, 9)}`;
     }
 
     connectedCallback() {
       super.connectedCallback();
+      I18N.watch(this);
       this._joinSync();
       this._watchWidth();
+      this._startAutoRefresh();
     }
 
     disconnectedCallback() {
+      I18N.unwatch(this);
       super.disconnectedCallback();
       this._leaveSync();
+      this._stopAutoRefresh();
       if (this._ro) { this._ro.disconnect(); this._ro = null; }
+    }
+
+    /**
+     * Poll the current window so a live day keeps growing.
+     *
+     * The recorder answer is a snapshot of the buckets that existed at query
+     * time, so without a second query the card froze on whatever it saw when
+     * the dashboard loaded - which is exactly why "PV power by port" and
+     * "Grid voltage" stayed flat through a sunny morning while the System tab
+     * was already moving.  A statistics bucket never changes once written, so
+     * re-reading the same window just appends the newer ones.
+     *
+     * Scheduled with `setTimeout` rather than `setInterval` so each tick can
+     * carry its own jitter: a dashboard stacks up to six of these cards in one
+     * sync group, and firing them all in the same millisecond would put six
+     * identical recorder queries on the wire at once, every time.
+     */
+    _startAutoRefresh() {
+      this._stopAutoRefresh();
+      this._scheduleRefresh();
+      this._onVisibility = () => {
+        // Coming back to the tab should show the current data straight away
+        // instead of whatever was on screen before it was hidden.
+        if (!document.hidden) this._maybeRefresh();
+      };
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", this._onVisibility);
+      }
+    }
+
+    _stopAutoRefresh() {
+      if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+      if (this._onVisibility) {
+        if (typeof document !== "undefined") {
+          document.removeEventListener("visibilitychange", this._onVisibility);
+        }
+        this._onVisibility = null;
+      }
+    }
+
+    _scheduleRefresh() {
+      this._timer = setTimeout(() => {
+        this._timer = null;
+        this._maybeRefresh();
+        if (this.isConnected) this._scheduleRefresh();
+      }, AUTO_REFRESH_MS + Math.round(Math.random() * AUTO_REFRESH_JITTER_MS));
+    }
+
+    _maybeRefresh() {
+      if (!this._hass || !this._config) return;
+      if (this._loading) return;
+      // A hidden tab has nobody watching it; skip the work and let the next
+      // visible tick pick up everything that accumulated in the meantime.
+      if (typeof document !== "undefined" && document.hidden) return;
+      const { end } = this._window();
+      // Only a window that still reaches into the future can gain rows. A past
+      // day, month or year is already complete and is never re-queried.
+      if (end.getTime() <= Date.now()) return;
+      this._softFetch();
+    }
+
+    /**
+     * Refetch without clearing the drawing.
+     *
+     * `_reload()` drops `_data` first, which makes `_body()` flash a spinner.
+     * An unattended refresh must not do that, and it must not reset `_hover`
+     * either: the index addresses a bucket, not a scroll position, so keeping
+     * it keeps the readout under the cursor steady while the curve extends.
+     */
+    async _softFetch() {
+      const keep = this._data;
+      const keepError = this._error;
+      await this._fetch();
+      // A failed unattended query must not blank a chart that is still
+      // perfectly valid, so the previous drawing and its last verdict win over
+      // the fresh failure. `_body()` prints the error before anything else, so
+      // both have to be restored for the chart to stay on screen.
+      if (!this._data && keep) {
+        this._data = keep;
+        this._error = keepError;
+        this.requestUpdate();
+      }
     }
 
     /**
@@ -404,8 +691,43 @@ function _hmHistoryRegister() {
           display: inline-flex; align-items: center; justify-content: center;
         }
         .navbtn:hover { background: var(--secondary-background-color, rgba(127,127,127,0.1)); }
-        .chart { margin-top: 8px; }
+        /* A chart answers the pointer - a crosshair guide line, a readout and
+           (on a curve) wheel zoom plus drag-to-pan - so it advertises that with
+           a crosshair instead of the plain arrow it used to show. Without it a
+           card looked like a static picture; the empty state below still gets
+           no cursor, because there is nothing there to point at. */
+        .chart { margin-top: 8px; position: relative; cursor: crosshair; }
         .chart svg { display: block; width: 100%; }
+        /* The reveal: a freshly loaded window grows out of the zero line
+           instead of snapping into place.  A CSS transform on the drawing group
+           is composited (no per-frame re-render, which matters on a Pi with six
+           of these cards open), and the origin is handed in as an inline style
+           because only the drawing knows where zero sits on the axis. */
+        .grow { transform-box: view-box; transform-origin: 0 0;
+                transition: transform 520ms cubic-bezier(0.22, 0.61, 0.36, 1); }
+        .grow.start { transform: scaleY(0); }
+        /* A zoomed chart is pannable, so it advertises the grab cursor; the
+           double-click reset is spelled out in the hint under it because it is
+           not discoverable otherwise. */
+        .chart.zoomed { cursor: grab; }
+        .chart.dragging { cursor: grabbing; }
+        .hint { font-size: 11px; color: var(--secondary-text-color);
+                text-align: center; opacity: 0.75; margin-top: 2px;
+                user-select: none; }
+        .total { margin-left: auto; font-size: 13px; font-weight: 600;
+                 color: var(--primary-text-color); white-space: nowrap; }
+        /* Energy tiles (month / year / lifetime). They sit above the plot like
+           the vendor app's summary row, so the number is read before the shape
+           of the curve. */
+        .tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0 4px; }
+        .tile { flex: 1 1 0; min-width: 92px; padding: 8px 10px;
+                border-radius: 12px;
+                background: var(--secondary-background-color, #f4f5f7);
+                text-align: center; }
+        .tile .tv { font-size: 17px; font-weight: 700; line-height: 1.2;
+                    color: var(--primary-text-color); }
+        .tile .tl { font-size: 11.5px; margin-top: 2px;
+                    color: var(--secondary-text-color); }
         .axis { font-size: 11.5px; fill: var(--secondary-text-color); }
         .grid { stroke: var(--divider-color); stroke-width: 1; stroke-dasharray: 3 4; }
         .zero { stroke: var(--secondary-text-color); stroke-width: 1.1; opacity: 0.55; }
@@ -453,6 +775,8 @@ function _hmHistoryRegister() {
       };
       if (config.range) this._range = config.range;
       this._data = null;
+      this._zoom = null;
+      this._growNext = true;
       this._joinSync();
       // `hass` may already be set when the dashboard is edited in place.
       if (this._hass) this._fetch();
@@ -468,19 +792,26 @@ function _hmHistoryRegister() {
     /** Re-measure after every render: the svg appears only once data arrived. */
     updated() {
       this._measure();
+      this._playGrow();
     }
 
     getCardSize() {
       return 7;
     }
 
+    /** One of the two strings the card carries, in the current language. */
     _t(en, zh) {
-      return hmLang(this._hass, this._config) === "zh" ? zh : en;
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
     }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
 
     /** A series' display name, resolved for the current language. */
@@ -491,25 +822,131 @@ function _hmHistoryRegister() {
 
     /* --------------------------- time windows --------------------------- */
 
+    /**
+     * The lower bound of an opt-in card's *data*, in ms, or ``null``.
+     *
+     * A card the user enabled from the options page carries the instant it was
+     * enabled.  The statistics from before that instant are still in the
+     * recorder - that is the whole point of the option - so the card has to
+     * exclude them itself; ``since`` accepts ISO 8601 or epoch milliseconds,
+     * whichever the generator wrote.
+     *
+     * The bound clips the *series* only, never the window: see `_window()` for
+     * why dragging the window along with it broke every axis comparison with
+     * the cards beside it.
+     */
+    _since() {
+      const raw = this._config && this._config.since;
+      if (raw == null || raw === "") return null;
+      if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+      const ms = Date.parse(String(raw));
+      return Number.isFinite(ms) ? ms : null;
+    }
+
     _window() {
       const a = this._anchor;
+      let start;
+      let end;
       if (this._range === "month") {
-        return {
-          start: startOfDay(new Date(a.getFullYear(), a.getMonth(), 1)),
-          end: endOfDay(new Date(a.getFullYear(), a.getMonth() + 1, 0)),
-        };
+        start = startOfDay(new Date(a.getFullYear(), a.getMonth(), 1));
+        end = endOfDay(new Date(a.getFullYear(), a.getMonth() + 1, 0));
+      } else if (this._range === "year") {
+        start = startOfDay(new Date(a.getFullYear(), 0, 1));
+        end = endOfDay(new Date(a.getFullYear(), 11, 31));
+      } else {
+        start = startOfDay(a);
+        end = endOfDay(a);
       }
-      if (this._range === "year") {
-        return {
-          start: startOfDay(new Date(a.getFullYear(), 0, 1)),
-          end: endOfDay(new Date(a.getFullYear(), 11, 31)),
-        };
-      }
-      return { start: startOfDay(a), end: endOfDay(a) };
+      /* The window is the calendar window, whatever ``since`` says.
+         It used to be cut at ``since``, on the reasoning that the axis should
+         begin where the card was enabled - but that gave an opt-in card an
+         axis running 10:06 -> 23:00 while the fixed cards of the same view ran
+         00:00 -> 24:00.  Two cards side by side then disagreed about what the
+         horizontal axis meant, and the vertical guide line the sync group
+         shares stopped landing on the same instant in both: the times simply
+         did not line up.  Clipping the data (in `_build`) instead of the window
+         keeps one clock under every card of the view, which is the point of
+         sharing a `sync_group` at all. */
+      return { start, end };
+    }
+
+    /**
+     * Is this card drawing bars instead of curves?
+     *
+     * `mode: auto` (the default for the energy card) draws the *day* as a
+     * curve and the month / year as one bar per day / per month, which is what
+     * makes "20.91 kWh in November" readable at a glance: a curve can only
+     * show that a value went up, a bar shows how much each day contributed.
+     * A power card keeps `mode: line` everywhere - bars of instantaneous watts
+     * would say nothing about how much energy was produced.
+     */
+    _barMode() {
+      const mode = this._config && this._config.mode;
+      if (mode === "bar") return true;
+      if (mode === "line") return false;
+      if (mode !== "auto") return false;
+      return this._range !== "day" && this._isEnergy();
+    }
+
+    /** True when the y axis carries energy rather than a rate. */
+    _isEnergy() {
+      const unit = String(
+        (this._config && this._config.unit)
+        || (this._config && this._config.series && this._config.series[0]
+          && this._config.series[0].unit)
+        || "",
+      ).trim().toLowerCase();
+      return unit === "wh" || unit === "kwh" || unit === "mwh";
+    }
+
+    /**
+     * Does this series hold its last reading across a hole in the data?
+     *
+     * A *measurement* does not: an online device reports on every tick - even
+     * a plain 0 W reading - so a bucket with no row at all means the device was
+     * not talking to the broker in it.  Drawing the last reading across that
+     * stretch claims a level nobody measured, so such a series drops to 0.
+     *
+     * A *running total* is the opposite: it is a lifetime accumulator, and the
+     * energy produced while the gateway was away is still counted - the very
+     * next bucket carries it.  Letting it fall to 0 and climb back would draw a
+     * counter resetting itself.  A level (`%`) holds for the same reason at a
+     * smaller scale: 0 % would read as an empty battery rather than as a missed
+     * reading.
+     */
+    _holdsGaps() {
+      if (this._isEnergy()) return true;
+      const unit = String(
+        (this._config && this._config.unit)
+        || (this._config && this._config.series && this._config.series[0]
+          && this._config.series[0].unit)
+        || "",
+      ).trim();
+      return unit === "%";
+    }
+
+    /**
+     * Factor that converts a statistic into the card's display unit.
+     *
+     * The recorder always answers in the sensor's own unit (Wh for every energy
+     * entity this integration creates), but 20 910 Wh on an axis is unreadable:
+     * the vendor app prints 20.91 kWh.  Rather than rescaling silently - which
+     * is what once made the W axis print "2.50 W" for 2 500 W - the factor is
+     * explicit config (`unit: kWh` + `scale: 0.001`), so the numbers, the axis
+     * label and the totals all agree.
+     */
+    _scale() {
+      const s = num(this._config && this._config.scale);
+      return s > 0 ? s : 1;
     }
 
     /** Statistics granularity: finer for short windows, coarser for long ones. */
     _periods() {
+      /* A bar is one *slot* of the window - one day of a month, one month of a
+         year - so the buckets have to be that wide. Asking for hourly means of
+         a month and then adding them up would also have been possible, but a
+         daily bucket is one recorder row instead of twenty-four. */
+      if (this._barMode()) return this._range === "year" ? ["month"] : ["day"];
       if (this._range === "month") return ["hour"];
       if (this._range === "year") return ["day"];
       // A day is best rendered from 5 minute statistics, but those are only
@@ -523,6 +960,13 @@ function _hmHistoryRegister() {
       if (this._range === "month") a.setMonth(a.getMonth() + step);
       else if (this._range === "year") a.setFullYear(a.getFullYear() + step);
       else a.setDate(a.getDate() + step);
+      /* No clamp against ``since`` here.  An opt-in card used to refuse to step
+         back past the moment it was enabled, which made it disagree with every
+         other card of its `sync_group`: the group relayed "yesterday" and this
+         one stayed on today, so the same dashboard showed two different days
+         side by side.  Navigation is the *group's*, and stepping into a window
+         that predates the card simply draws an empty one - which is truthful,
+         and it says so in as many words. */
       this._anchor = a;
       this._reload();
     }
@@ -554,6 +998,12 @@ function _hmHistoryRegister() {
     _reload() {
       this._data = null;
       this._hover = -1;
+      /* A zoom is a fraction of *one* window, so it cannot survive a move to
+         another day: the same 20..30 % would point at a different hour, which
+         reads as the chart jumping somewhere random after a date change. */
+      this._zoom = null;
+      this._drag = null;
+      this._growNext = true;
       this._fetch();
       this._pushSync();
     }
@@ -610,14 +1060,22 @@ function _hmHistoryRegister() {
     /** Follow the group's window. Never pushes back, so it cannot loop. */
     _applySync(state) {
       if (!state) return;
-      const same = this._range === state.range
-        && this._anchor.getTime() === state.anchor;
-      if (same) return;
+      const rangeChanged = this._range !== state.range;
+      /* The group relays the window every member shares, including one that
+         predates an opt-in card's ``since``: that card then clips its own data
+         (in `_build`) and renders an empty axis, rather than refusing to move
+         and leaving two cards of the same view on two different days. */
       this._range = state.range;
-      this._anchor = new Date(state.anchor);
+      const target = new Date(state.anchor);
+      /* A moved window can land on the anchor it already had while the range
+         did change, which still means a different window to fetch. */
+      if (!rangeChanged && this._anchor.getTime() === target.getTime()) return;
+      this._anchor = target;
       this._data = null;
       this._hover = -1;
       this._remoteTime = null;
+      this._zoom = null;
+      this._growNext = true;
       if (this._config && this._hass) this._fetch();
       this.requestUpdate();
     }
@@ -682,20 +1140,40 @@ function _hmHistoryRegister() {
             end_time: end.toISOString(),
             statistic_ids: ids,
             period: candidate,
-            /* `mean` for a measured quantity (W, V, A), `state` for a running
+            /* `mean` for a measured quantity (W, V, A), `states` for a running
                total. An energy sensor is total_increasing, so its statistics
                carry `state` / `sum` / `change` and leave `mean` null - asking
-               for `mean` alone drew every energy card as a flat zero line. */
-            types: ["mean", "state"],
+               for `mean` alone drew every energy card as a flat zero line.
+               `change` is the amount the counter grew *in that bucket*, which
+               is exactly the energy produced during it, and is preferred over
+               differencing `state` by hand: the recorder already handles the
+               meter reset in the middle of a bucket. */
+            types: ["mean", "state", "change"],
           });
           if (token !== this._token) return; // a newer request won
           period = candidate;
           rows = result;
           const first = rows && rows[ids[0]];
-          if (Array.isArray(first) && first.length > 6) break;
+          /* Any row at all is enough to keep the finer granularity. Requiring
+             *more* than six rows used to demote the whole day to hourly buckets
+             through the first hours of the morning - the sparse stretch is
+             precisely when the user is watching the sun come up - so a day
+             still in progress drew hour-wide steps until well past dawn.
+             An empty result still falls through, which is what keeps a range
+             whose 5 minute statistics were already purged on hourly buckets. */
+          if (Array.isArray(first) && first.length > 0) break;
         }
 
         this._data = this._build(rows || {}, period);
+        /* A new window is drawn grown-out instead of snapped-in, so opening a
+           card reads as the day filling up rather than as a diagram that was
+           simply always there.  Only a *new* window: re-querying the same open
+           month every 30 s must not replay the animation under the user. */
+        if (this._growNext) {
+          this._pendingGrow = !!this._data;
+          this._growNext = false;
+        }
+        if (this._config.show_totals === true) this._fetchTotals();
       } catch (err) {
         if (token !== this._token) return;
         this._data = null;
@@ -711,14 +1189,123 @@ function _hmHistoryRegister() {
       }
     }
 
+    /**
+     * Month / year / lifetime totals for the energy card.
+     *
+     * The vendor app prints three numbers above the history: this month, this
+     * year and since installation. The integration has no month or year
+     * sensor, but the recorder does: the growth of the lifetime counter over a
+     * window *is* the energy produced in it, so the tiles are derived from the
+     * same statistic the chart plots rather than from new entities.
+     */
+    async _fetchTotals() {
+      const series = (this._config && this._config.series) || [];
+      const id = series[0] && series[0].entity;
+      if (!id || !this._hass || typeof this._hass.callWS !== "function") return;
+      const now = new Date();
+      const monthStart = startOfDay(new Date(now.getFullYear(), now.getMonth(), 1));
+      const yearStart = startOfDay(new Date(now.getFullYear(), 0, 1));
+      /* The lifetime window starts at the epoch: the recorder simply returns
+         whatever it has, which is the whole history of the counter. */
+      const epoch = new Date(2000, 0, 1);
+      const token = ++this._totalToken;
+      /* `change` is additive across buckets, so the granularity is free to
+         follow the length of the window rather than being fixed: a day of
+         hourly rows and a year of daily rows sum to the same number, but the
+         lifetime window is a quarter of a century wide and asking for a row
+         per day would pull ten thousand of them out of the recorder on every
+         repaint of the card. */
+      const sum = async (from, to, period) => {
+        const result = await this._hass.callWS({
+          type: "recorder/statistics_during_period",
+          start_time: from.toISOString(),
+          end_time: to.toISOString(),
+          statistic_ids: [id],
+          period,
+          types: ["change"],
+        });
+        const rows = (result && result[id]) || [];
+        let total = 0;
+        for (const row of rows) total += num(row.change);
+        return total;
+      };
+      try {
+        const [month, year, life] = await Promise.all([
+          sum(monthStart, now, "day"),
+          sum(yearStart, now, "month"),
+          sum(epoch, now, "month"),
+        ]);
+        if (token !== this._totalToken) return;
+        this._totals = {
+          month: month * this._scale(),
+          year: year * this._scale(),
+          life: life * this._scale(),
+        };
+      } catch (err) {
+        if (token !== this._totalToken) return;
+        /* The chart itself is still fine, so a failed total must not surface
+           as an error banner - the tiles are simply left out. */
+        this._totals = null;
+      }
+      this.requestUpdate();
+    }
+
+    /**
+     * The three energy tiles: month, year and lifetime.
+     *
+     * Drawn from statistics rather than from entities, so they follow the same
+     * retention rules as the chart and stay correct after a meter reset. The
+     * tiles are static markup, so they go through `_untrusted()`.
+     */
+    _totalsRow() {
+      const totals = this._totals;
+      if (!totals) return "";
+      const display = pickUnit(this._config.unit, Math.max(totals.life, 1e-9));
+      const unit = this._config.unit || "";
+      const tile = (label, value) => {
+        const shown = Number.isFinite(value)
+          ? fmtNumber(value / display.divisor, Math.abs(value) >= 100 ? 1 : 2)
+          : "\u2014";
+        return `<div class="tile"><div class="tv">${esc(shown)}${unit ? ` ${esc(unit)}` : ""}</div>`
+          + `<div class="tl">${esc(label)}</div></div>`;
+      };
+      return `<div class="tiles">`
+        + tile(this._t("This month", "月发电量"), totals.month)
+        + tile(this._t("This year", "年发电量"), totals.year)
+        + tile(this._t("Lifetime", "总发电量"), totals.life)
+        + "</div>";
+    }
+
     /** Align every series on one time grid and compute the stacked layers. */
     _build(result, period) {
+      /* A bar is a *quantity*, not a level: the energy produced during that
+         day or month. That is the recorder's `change` for the bucket, and the
+         fallback when a statistics row does not carry one is the growth of
+         `state` since the previous bucket - never `state` itself, which is the
+         lifetime meter and would draw a staircase rising forever. */
+      const bars = this._barMode();
       const series = this._config.series;
+      /* Statistics arrive in the sensor's own unit (Wh); `scale` converts them
+         into the card's (`kWh` = 0.001) once, so the bars, the axis, the
+         tooltip and the tiles all speak the same unit. */
+      const scale = this._scale();
+      /* An opt-in card draws nothing from before it was enabled, so buckets
+         that ended before ``since`` are dropped here - at the data, not at the
+         window (`_window()` stays on the calendar so the x axis still matches
+         every other card of the view).
+         The comparison is against a bucket's *end*, not its start: a statistic
+         row is stamped with the instant its bucket begins, and the bucket the
+         card was ticked in began a few minutes earlier, so a plain
+         ``start < since`` test would throw that bucket away and leave a freshly
+         ticked card empty until the next one was written. */
+      const since = this._since();
+      const bucketMs = PERIOD_MS[period] || 0;
       const timeSet = new Set();
       const bySeries = series.map((s) => {
         const map = new Map();
         for (const row of (result[s.entity] || [])) {
           const t = num(row.start);
+          if (since != null && t + bucketMs <= since) continue;
           /* `mean` first, then `state`: a measured quantity reports `mean`,
              a total_increasing counter (energy) only reports `state`. Never
              fall through to `sum`, which is a lifetime running total and would
@@ -726,23 +1313,97 @@ function _hmHistoryRegister() {
           const v = row.mean != null ? num(row.mean)
             : row.state != null ? num(row.state)
               : null;
-          map.set(t, v);
+          const change = row.change != null ? num(row.change) : null;
+          map.set(t, { v, change, state: row.state != null ? num(row.state) : null });
           timeSet.add(t);
         }
         return map;
       });
 
-      const times = [...timeSet].sort((a, b) => a - b);
-      if (!times.length) return { times, period, layers: [], max: 1, min: 0 };
+      const observed = [...timeSet].sort((a, b) => a - b);
+      if (!observed.length) {
+        /* Nothing at all in the window: `_body()` prints the "no statistics"
+           line, which is clearer than an axis full of zero bars. */
+        return {
+          times: observed, period, layers: [], max: 1, min: 0, bars, holes: null,
+        };
+      }
 
-      // Forward fill so a series that started later still has a value.
+      /* In the bar modes the axis is the calendar, not the recorder's answer.
+         Only the buckets that exist used to be plotted, which had two visible
+         consequences: a day the device reported nothing for left no slot at
+         all, so the neighbouring bar spanned two days and came out twice as
+         wide as the rest; and early in the month every bar crowded into the
+         left edge of the card with the rest of it empty, because a 13-day
+         month has only 13 slots however wide the card is.
+
+         So the slots come from the window - every day of the month, every
+         month of the year - and a day without a reading contributes a zero
+         bar. That is the honest number (nothing was produced) and it makes
+         every bar the same width and the whole card carry the chart. */
+      const grid = bars ? this._barTimes(observed) : null;
+      const times = grid ? grid.times : this._filledTimes(observed, bucketMs);
+      /* The statistic bucket that feeds each drawn slot. A nominal day with no
+         reading has no entry, which is what makes it draw as zero. */
+      const bucketOf = new Map();
+      if (grid) {
+        if (grid.slotOf) {
+          for (const [slot, t] of grid.slotOf) bucketOf.set(slot, t);
+        } else {
+          for (const t of times) bucketOf.set(t, t);
+        }
+      }
+
+      // Forward fill so a series that started later still has a value. In bar
+      // mode the fill is 0 rather than the previous reading: a bucket the
+      // device did not report produced no energy, and carrying the previous
+      // bar over would draw a day of production that never happened.
+      const holds = this._holdsGaps();
       const values = bySeries.map((map) => {
         let last = 0;
+        let prevState = null;
         return times.map((t) => {
-          const v = map.get(t);
-          if (v != null) last = v;
-          return last;
+          const hit = map.get(bucketOf.has(t) ? bucketOf.get(t) : t);
+          if (bars) {
+            if (!hit) return 0;
+            if (hit.change != null) {
+              prevState = hit.state;
+              return hit.change * scale;
+            }
+            if (hit.state != null && prevState != null) {
+              const delta = hit.state - prevState;
+              prevState = hit.state;
+              // A counter that went backwards was reset; the recorder's own
+              // `change` handles that, a hand-computed difference cannot, so
+              // the bucket is dropped rather than drawn as a negative bar.
+              return delta >= 0 ? delta * scale : 0;
+            }
+            prevState = hit.state != null ? hit.state : prevState;
+            return 0;
+          }
+          if (hit && hit.v != null) {
+            last = hit.v * scale;
+            return last;
+          }
+          /* No row for this bucket.  `_filledTimes()` put a slot here on
+             purpose so the hole is drawn instead of being interpolated over,
+             and what that slot is worth depends on what the series means:
+             a missing reading is 0 W (the device was not reporting), while a
+             running total keeps the level it had reached. */
+          return holds ? last : 0;
         });
+      });
+
+      /* Which buckets the device did not report at all, so the plot can draw
+         the outage as a level of 0 (a curve) while the pointer still refuses to
+         claim a reading there - see `_hoverPosition()`.  A bucket only counts
+         as a hole when *every* series is missing from it; one series dropping
+         out while another still reports is a gap in that series, not an outage,
+         and the axis as a whole still has a measurement behind it. */
+      const holes = bars ? null : times.map((t) => {
+        const at = bucketOf.has(t) ? bucketOf.get(t) : t;
+        for (const map of bySeries) if (map.has(at)) return false;
+        return true;
       });
 
       /* Whether the axis is mirrored is a property of the *data*, not of the
@@ -852,7 +1513,146 @@ function _hmHistoryRegister() {
         }));
       }
 
-      return { times, period, layers, max, min, values, symmetric };
+      /* The sum of each series over the window, in the sensor's own unit. In
+         bar mode this is the energy produced during the period - the number
+         the vendor app prints as "发电量合计" above the chart. */
+      const totals = values.map((vals) => vals.reduce((a, v) => a + v, 0));
+
+      return {
+        times, period, layers, max, min, values, symmetric, bars, totals, holes,
+      };
+    }
+
+    /**
+     * Every bar slot of the current window, in chronological order.
+     *
+     * One slot per calendar day of the month, or per month of the year, so the
+     * bar chart always describes the *period* rather than the subset of it the
+     * recorder happened to answer for.  A day is a single slot and gets no
+     * nominal grid at all.
+     */
+    _bucketGrid() {
+      const { start } = this._window();
+      if (this._range === "day") return [];
+      const slots = [];
+      if (this._range === "year") {
+        for (let month = 0; month < 12; month += 1) {
+          slots.push(new Date(start.getFullYear(), month, 1).getTime());
+        }
+        return slots;
+      }
+      const year = start.getFullYear();
+      const month = start.getMonth();
+      // Day 0 of the next month is the last day of this one, so February and a
+      // leap year need no special case.
+      const last = new Date(year, month + 1, 0).getDate();
+      for (let day = 1; day <= last; day += 1) {
+        slots.push(new Date(year, month, day).getTime());
+      }
+      return slots;
+    }
+
+    /**
+     * Fold the recorder's buckets onto the nominal bar grid.
+     *
+     * The two grids do not have to agree exactly - a statistics bucket carries
+     * the instant the period began, which is local midnight for a day bucket
+     * only as long as the recorder and the browser share a timezone.  Matching
+     * on exact equality would then turn every bar into a zero, so a bucket is
+     * assigned to the slot that *contains* it, and a bucket that falls outside
+     * every slot is appended as a slot of its own.  A measurement is therefore
+     * never dropped, whatever the timestamps look like.
+     *
+     * Returns the slot list to draw (nominal slots first, so absent days still
+     * get an empty column) plus the slot -> bucket lookup.
+     */
+    _barTimes(observed) {
+      const nominal = this._bucketGrid();
+      if (!nominal.length) {
+        return { times: [...observed].map((ms) => num(ms)).sort((a, b) => a - b), slotOf: null };
+      }
+      const slotOf = new Map();
+      const extra = [];
+      /* Index of the last nominal slot the recorder answered for. The slot
+         list is cut after it, which is what fills the card: on the 13th of a
+         month only days 1..13 are drawn, evenly spread across the whole width,
+         instead of thirteen bars squeezed into the left two fifths with a
+         fortnight of empty axis trailing after them. Days that are in the past
+         but carry no reading are *not* cut - they stay as a zero bar. */
+      let lastSlot = -1;
+      for (const raw of observed) {
+        const t = num(raw);
+        let lo = 0;
+        let hi = nominal.length - 1;
+        let at = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (nominal[mid] <= t) { at = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        if (at < 0) { extra.push(t); continue; }
+        const start = nominal[at];
+        const next = at + 1 < nominal.length
+          ? nominal[at + 1]
+          : start + (start - nominal[at - 1] || DAY_MS);
+        if (t < next) {
+          if (!slotOf.has(start)) slotOf.set(start, t);
+          if (at > lastSlot) lastSlot = at;
+        } else {
+          extra.push(t);
+        }
+      }
+      const times = nominal.slice(0, lastSlot + 1);
+      for (const t of extra) if (!times.includes(t)) times.push(t);
+      times.sort((a, b) => a - b);
+      return { times, slotOf };
+    }
+
+    /**
+     * The axis of a curve, with the buckets the device never reported restored.
+     *
+     * A gateway that lost its MQTT connection leaves a genuine *hole* in the
+     * statistics: an entity that was `unavailable` contributes no numeric
+     * state, so the recorder writes no row for that bucket at all - not a row
+     * with a null mean, no row.  Joining the rows on either side of it drew a
+     * smooth climb from the last reading before the outage to the first one
+     * after it: a curve through sixty-five minutes that were never measured.
+     * Materialising the missing buckets is what lets `_build` give each of them
+     * a value of its own, so the plot shows the outage instead of papering over
+     * it.
+     *
+     * Only the stretch *after* the first reading is filled.  What came before
+     * it is unknown - the series may not have existed yet - and the plot lifts
+     * the line off the base with a short ramp there rather than claiming a
+     * little of something since midnight.
+     */
+    _filledTimes(observed, bucketMs) {
+      if (!(bucketMs > 0) || !observed.length) return observed;
+      /* Never fill into the future: a day window runs to 23:59:59, and buckets
+         past `now` would report 0 W for an hour that has not happened.  A
+         window entirely in the past is filled to its own end, so an outage that
+         began at 20:00 still reaches the right edge of that day. */
+      const { end } = this._window();
+      const stop = Math.min(end.getTime(), Date.now());
+      const half = bucketMs / 2;
+      const out = [];
+      for (let i = 0; i < observed.length; i += 1) {
+        if (i > 0) {
+          const prev = num(observed[i - 1]);
+          const next = num(observed[i]);
+          for (let t = prev + bucketMs; t < next - half; t += bucketMs) out.push(t);
+        }
+        out.push(num(observed[i]));
+      }
+      /* The trailing stretch only counts as an outage when it is longer than a
+         couple of buckets.  The newest bucket is written when it *closes*, so a
+         device that is talking perfectly right now always leaves the current,
+         still-open bucket missing - filling that would dip every healthy curve
+         to 0 at the right edge once per bucket. */
+      const last = num(observed[observed.length - 1]);
+      if (stop - last > bucketMs * 2) {
+        for (let t = last + bucketMs; t <= stop; t += bucketMs) out.push(t);
+      }
+      return out;
     }
 
     /* ----------------------------- rendering ----------------------------- */
@@ -861,6 +1661,10 @@ function _hmHistoryRegister() {
       if (!this._config) return html``;
       const title = this._config.title === false ? ""
         : (this._text(this._config.title) || this._t("History", "历史数据"));
+      /* The period's total, for the bar modes only: on a power chart the sum of
+         the instantaneous readings means nothing. Shows even before the first
+         paint resolves (empty string), so the head does not jump. */
+      const total = this._data && this._data.bars ? this._totalLabel(this._data) : "";
 
       // The toolbar sits first so it lands in the card's top left corner.
       return html`
@@ -868,7 +1672,9 @@ function _hmHistoryRegister() {
           <div class="head">
             ${this._config.show_toolbar === false ? "" : this._toolbar()}
             ${title === "" ? "" : html`<div class="title">${title}</div>`}
+            ${total === "" ? "" : html`<div class="total">${total}</div>`}
           </div>
+          ${this._config.show_totals === true ? this._untrusted(this._totalsRow()) : ""}
           ${this._body()}
           ${this._legend()}
         </ha-card>
@@ -907,10 +1713,30 @@ function _hmHistoryRegister() {
           "该时间段没有统计数据。",
         )}</div>`;
       }
+      /* Bars are a calendar, not a stretch of time to explore: a month of day
+         bars is already one bar per day, and zooming into it only hides the
+         days it exists to compare.  `_barMode()` is resolved per render, so the
+         gesture follows the range selector (day curve = zoomable, month / year
+         bars = not) with no extra config. */
+      const zoomable = !data.bars;
+      const cls = [
+        "chart",
+        zoomable && this._zoom ? "zoomed" : "",
+        zoomable && this._drag ? "dragging" : "",
+      ].filter(Boolean).join(" ");
       return html`
-        <div class="chart" @mousemove=${(e) => this._onMove(e)}
-             @mouseleave=${() => this._setHover(-1)} @click=${() => this._selectSeries(-1)}>
+        <div class=${cls}
+             @mousemove=${(e) => this._onMove(e)}
+             @mousedown=${(e) => this._onDragStart(e)}
+             @mouseleave=${() => this._onLeave()} @click=${() => this._onChartClick()}
+             @wheel=${(e) => this._onWheel(e)}>
           ${this._untrusted(this._svg(data))}
+          ${zoomable
+            ? html`<div class="hint">${this._t(
+              "Scroll to zoom · drag to pan · double-click to reset",
+              "滚动缩放 · 拖动平移 · 双击复位",
+            )}</div>`
+            : ""}
         </div>`;
     }
 
@@ -924,7 +1750,7 @@ function _hmHistoryRegister() {
         <div class="legend">
           ${this._config.series.map((s, i) => html`
             <span class="li ${selected < 0 ? "" : selected === i ? "on" : "off"}"
-              title=${this._t("Click to highlight", "点击高亮该曲线")}
+              title=${this._t("Click to Highlight", "点击高亮该曲线")}
               @click=${(e) => { e.stopPropagation(); this._selectSeries(i); }}>
               <i class="dot" style="background:${s.color}"></i>${this._sName(s)}
             </span>`)}
@@ -983,18 +1809,30 @@ function _hmHistoryRegister() {
         + ((domainMax - Math.min(Math.max(num(v), domainMin), domainMax))
           / (domainMax - domainMin)) * (yBot - yTop);
       const yZero = toY(0);
-      /* Map by *timestamp*, not by bucket index. Statistic buckets are not
-         evenly spaced - an offline device leaves a hole, and the first bucket
-         of a window can be a partial one - so an index-based scale stretches
-         those gaps to look like continuous data. The query window already
-         follows the recorder's data, so this spreads whatever exists across the
-         full plot width. A fractional index (a cross-group hover can land
-         between buckets) is linearly interpolated between its neighbours. */
-      const tFirst = times.length ? num(times[0]) : 0;
-      const tLast = times.length ? num(times[times.length - 1]) : 0;
+      /* Map by *timestamp* on the card's own window, not on the data.
+         Statistic buckets are not evenly spaced - an offline device leaves a
+         hole - so an index-based scale would stretch those gaps to look like
+         continuous data.  The domain is the window (00:00 -> 24:00 for a day),
+         which is what makes a day chart always start at midnight instead of at
+         whatever the first bucket happened to be; a plot squeezed into the
+         right quarter because the recorder's history began at 18:00 read as a
+         broken axis.  `_visibleDomain()` applies the wheel zoom on top.
+         Positions are deliberately *not* clamped to the plot: the drawing is
+         clipped to it instead, so a zoomed-in curve leaves the frame cleanly
+         rather than being pressed flat against the border. */
+      const domain = this._visibleDomain();
+      const tFirst = domain.first;
+      const tLast = domain.last;
       const tSpan = tLast - tFirst;
+      const midX = (x0 + x1) / 2;
+      const toXTime = (t) => {
+        if (tSpan <= 0) return midX;
+        return x0 + ((num(t) - tFirst) / tSpan) * (x1 - x0);
+      };
+      /* A fractional bucket index (a cross-group hover can land between
+         buckets) is linearly interpolated between its neighbours. */
       const toX = (i) => {
-        if (times.length <= 1 || tSpan <= 0) return (x0 + x1) / 2;
+        if (times.length <= 1) return midX;
         const k = Math.min(Math.max(num(i), 0), times.length - 1);
         const lo = Math.floor(k);
         const frac = k - lo;
@@ -1002,8 +1840,7 @@ function _hmHistoryRegister() {
         const t = frac > 0 && lo + 1 < times.length
           ? tLo + (num(times[lo + 1]) - tLo) * frac
           : tLo;
-        const ratio = Math.min(Math.max((t - tFirst) / tSpan, 0), 1);
-        return x0 + (x1 - x0) * ratio;
+        return toXTime(t);
       };
 
       let grid = "";
@@ -1024,9 +1861,56 @@ function _hmHistoryRegister() {
         grid += `<line class="zero" x1="${x0}" y1="${yZero.toFixed(1)}" x2="${x1}" y2="${yZero.toFixed(1)}"/>`;
       }
 
-      // areas + top strokes. A selected series keeps full weight, the others
-      // fade into the background so one curve can be read on its own.
+      /* A selected series keeps full weight, the others fade into the
+         background so one curve can be read on its own. */
       const sel = this._selected;
+      const isBar = !!data.bars;
+      const yBase = isBar ? toY(0) : 0;
+
+      /* Bars are drawn edge to edge, from one bucket boundary to the next, so a
+         bar's visual centre sits half a slot to the *right* of the bucket's own
+         timestamp. Everything that points at a bucket - the guide line under
+         the pointer and the date printed on the axis - belongs on that centre.
+         A label under a bar's left edge reads as belonging to the bar before it,
+         and a guide line on the left edge leaves the whole column to its right,
+         which is what made a hover look like it was sitting one day early.
+         `slotMin` is the narrowest gap between two buckets, i.e. the unit the
+         axis actually ticks in (a day, a month); a day the recorder has no
+         bucket for has no bar to centre on and borrows it as a nominal width. */
+      let slotMin = Infinity;
+      for (let i = 1; i < times.length; i += 1) {
+        const d = num(times[i]) - num(times[i - 1]);
+        if (d > 0 && d < slotMin) slotMin = d;
+      }
+      if (!Number.isFinite(slotMin)) slotMin = tSpan / 24;
+      const slotByStart = new Map();
+      for (let i = 0; i < times.length; i += 1) {
+        slotByStart.set(num(times[i]), barSlot(times, i, slotMin));
+      }
+      const centreOf = (ms) => {
+        const at = num(ms);
+        /* A tick or a hover names an instant that may sit anywhere inside a
+           bar, not necessarily on its start: a year axis steps by months and
+           asks for the 1st, while a bar that began on a day boundary covers
+           that instant whole. Snapping to the containing bar is what puts the
+           label on the column the reading belongs to. */
+        const hit = barBucketAt(times, at);
+        if (hit >= 0) {
+          const start = num(times[hit]);
+          return (toXTime(start) + toXTime(start + slotByStart.get(start))) / 2;
+        }
+        /* No bar covers it - a hole in the data. Centre on the nominal column
+           so the label still sits over a date rather than on the seam. */
+        return toXTime(at + slotMin / 2);
+      };
+      /* Where the guide line is drawn: a bar's centre in the bar modes, the
+         interpolated timestamp for a curve. A cross-group hover can arrive as a
+         fractional index, and bars have no in-between position, so it rounds. */
+      const markX = isBar
+        ? (i) => centreOf(num(times[Math.min(Math.max(Math.round(num(i)), 0),
+          times.length - 1)]))
+        : toX;
+
       let areas = "";
       layers.forEach((layer, index) => {
         const color = layer.series.color;
@@ -1035,6 +1919,39 @@ function _hmHistoryRegister() {
         const fillOp = sel < 0 ? 0.32 : isSel ? 0.45 : 0.07;
         const strokeW = isSel ? 2.4 : 1.5;
         const strokeOp = dim ? 0.25 : 1;
+        const barOp = dim ? 0.3 : 1;
+
+        if (isBar) {
+          /* One filled rectangle per slot - per day of a month, per month of a
+             year - measured from the zero line. The width comes from the gap to
+             the next bucket (so an uneven month still lines up on the calendar)
+             minus a gap, which is what makes a bar chart readable as a series
+             of separate amounts rather than as an area. */
+          for (const side of ["pos", "neg"]) {
+            const band = layer[side];
+            if (!band) continue;
+            const { top, base } = band;
+            for (let i = 0; i < times.length; i += 1) {
+              const value = top[i] - base[i];
+              if (Math.abs(value) < 1e-9) continue;
+              const t = num(times[i]);
+              const slot = barSlot(times, i, tSpan / 24);
+              const left = toXTime(t);
+              const right = toXTime(t + slot);
+              const width = Math.max(right - left, 2);
+              // 22 % of the slot becomes the gap, split evenly.
+              const gap = Math.min(width * 0.22, 10);
+              const yTopBar = Math.min(toY(top[i]), yBase);
+              const height = Math.abs(toY(top[i]) - yBase);
+              if (height < 0.4) continue;
+              areas += `<rect x="${(left + gap / 2).toFixed(1)}" y="${yTopBar.toFixed(1)}"`
+                + ` width="${(width - gap).toFixed(1)}" height="${height.toFixed(1)}"`
+                + ` rx="2" fill="${esc(color)}" fill-opacity="${barOp}" stroke="none"/>`;
+            }
+          }
+          return;
+        }
+
         for (const side of ["pos", "neg"]) {
           const band = layer[side];
           if (!band) continue;
@@ -1044,67 +1961,163 @@ function _hmHistoryRegister() {
             if (Math.abs(top[i] - base[i]) > 1e-9) { flat = false; break; }
           }
           if (flat) continue;
-          let d = "";
-          for (let i = 0; i < times.length; i += 1) {
-            d += `${i ? "L" : "M"}${toX(i).toFixed(1)} ${toY(top[i]).toFixed(1)}`;
+          /* The top edge is smoothed, the base stays straight: the base is the
+             zero line or the band of the series below, and smoothing it would
+             let one curve bleed into the next. `smoothPath()` is monotone, so a
+             peak is rounded but never overshoots the value that was actually
+             measured. */
+          const topPts = times.map((_, i) => [toX(i), toY(top[i])]);
+          /* Rise from the zero line instead of opening with a wall.
+             The first bucket is rarely at the left edge of the window - a
+             device that came online at 10:40 has nothing to draw before it -
+             so the area used to begin with a vertical edge straight up to the
+             first reading, which read as a fault rather than as "no data yet".
+             A short anchor at the height of the base (the zero line, or the
+             band below when stacked) in front of the first reading gives it
+             that lead-in, without dragging the curve all the way back to the
+             corner of the plot: the ramp is meant to lift the line off zero,
+             it is not meant to claim "production started at midnight".
+             The lead is roughly half a bucket (clamped), so it stays a slope
+             rather than the vertical wall it replaces.  The anchor is only
+             added when there is room for it, so a series that already touches
+             the left edge is untouched.
+             Only the left side gets an anchor.  The right edge needs none: a
+             stretch the device did not report is already materialised as
+             readings of 0 by `_filledTimes()`, so a curve that went quiet
+             arrives at the axis having honestly fallen to zero rather than
+             needing a decorative drop tacked onto its end. */
+          const baseAt = (i) => toY(base[i]);
+          if (topPts.length) {
+            const slot = times.length > 1
+              ? Math.abs(toX(1) - toX(0))
+              : (x1 - x0) / 24;
+            const lead = Math.max(10, Math.min(36, slot * 1.5));
+            const firstX = topPts[0][0];
+            if (firstX > x0 + 0.5) {
+              topPts.unshift([Math.max(x0, firstX - lead), baseAt(0)]);
+            }
           }
+          const basePts = [];
           for (let i = times.length - 1; i >= 0; i -= 1) {
-            d += `L${toX(i).toFixed(1)} ${toY(base[i]).toFixed(1)}`;
+            basePts.push([toX(i), baseAt(i)]);
           }
-          d += "Z";
+          const d = `${smoothPath(topPts)}`
+            + basePts.map(([bx, by]) => `L${bx.toFixed(1)} ${by.toFixed(1)}`).join("")
+            + "Z";
           areas += `<path d="${d}" fill="${esc(color)}" fill-opacity="${fillOp}" stroke="none"/>`;
           // the visible edge of the band
-          let edge = "";
-          for (let i = 0; i < times.length; i += 1) {
-            edge += `${i ? "L" : "M"}${toX(i).toFixed(1)} ${toY(top[i]).toFixed(1)}`;
-          }
-          areas += `<path d="${edge}" fill="none" stroke="${esc(color)}"`
+          areas += `<path d="${smoothPath(topPts)}" fill="none" stroke="${esc(color)}"`
             + ` stroke-width="${strokeW}" stroke-opacity="${strokeOp}"`
             + " stroke-linejoin=\"round\" stroke-linecap=\"round\"/>";
         }
       });
 
-      const xLabels = this._xLabels(times, toX, H);
+      const xLabels = this._xLabels(toXTime, H, domain, isBar ? { times, centreOf } : null);
+
+      /* The plot is clipped to its own rectangle. Without it, a curve that
+         leaves the visible window after a zoom would be drawn over the y axis
+         labels and past the right edge of the card; the timestamps themselves
+         are deliberately *not* clamped, because pressing them flat against the
+         border would draw a vertical wall of fake readings. */
+      const clipId = `${this._uid}-plot`;
+      /* The reveal origin: the zero line, so the curves rise out of the axis
+         they are measured from rather than out of the top of the plot.
+         Percentages, not pixels: the reference box of a `transform-box:
+         view-box` group is the viewBox itself, so a share of the height is
+         exact whatever `preserveAspectRatio` does to the rendered size. */
+      const growOrigin = `transform-origin:0 ${((yZero / H) * 100).toFixed(2)}%`;
 
       return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
                    style="height:${H}px"
                    xmlns="http://www.w3.org/2000/svg" role="img">
+        <defs>
+          <clipPath id="${clipId}">
+            <rect x="${x0}" y="${yTop}" width="${x1 - x0}" height="${yBot - yTop}"/>
+          </clipPath>
+        </defs>
         ${grid}
+        <g class="grow" style="${growOrigin}">
+        <g clip-path="url(#${clipId})">
         ${areas}
+        </g>
+        </g>
         ${xLabels}
-        ${this._hoverLayer(data, toX, yTop, yBot, div, axDecimals)}
+        ${this._hoverLayer(data, toX, yTop, yBot, div, axDecimals, markX)}
       </svg>`;
     }
 
-    _xLabels(times, toX, H) {
+    _xLabels(toXTime, H, domain, bars) {
       const y = H - PAD_B + 18;
       const W = this._width();
-      const picks = [];
 
-      /* The labels follow the *data's own* time span on a round step, instead of
-         a fixed hour-of-day grid.
-         The old version only accepted whole hours in {0,3,6,9,12,15,18,21,23}
-         (`getMinutes() > 6` rejected everything else), so a window whose data
-         starts at 13:45 - which is what the recorder holds after a restart -
-         produced a single "15:00" label while the curve filled the whole card,
-         which read as "the axis is stuck on the right".
-         Now the step is chosen from the span: the smallest candidate that keeps
-         the label count under what the width can carry, aligned to a round
-         wall-clock boundary so the ticks read 13:45, 14:15, 14:45 rather than
-         arbitrary fractions of an index. */
-      if (!times.length) return "";
-      const first = num(times[0]);
-      const last = num(times[times.length - 1]);
+      /* The ticks follow the *window*, not the data.
+         They used to follow the first..last bucket, which put "00:00" nowhere
+         on the axis of a day whose statistics began at 18:00 - the curve then
+         filled the whole card while the labels all crowded into its right half,
+         reading as a broken axis.  A day window now runs 00:00 -> 24:00 whether
+         or not the recorder has a bucket at midnight, so the axis is the clock.
+         The step is the smallest round candidate that keeps the label count
+         under what the width can carry. */
+      const first = domain.first;
+      const last = domain.last;
       const spanMs = Math.max(last - first, 0);
-      if (spanMs <= 0) {
-        return `<text class="axis" x="${((PAD_L + W - PAD_R) / 2).toFixed(1)}" y="${y}"
-          text-anchor="middle">${esc(this._label(times[0]))}</text>`;
-      }
+      if (spanMs <= 0) return "";
 
       /* One label per ~110 px of plot, clamped to 2..8 - tied to the measured
          width so a wide card gets more ticks and a narrow one fewer. */
       const plotW = W - PAD_L - PAD_R;
       const maxLabels = Math.min(8, Math.max(2, Math.round(plotW / 110)));
+
+      /* The bar modes bring their own ticks: a month of day bars, a year of
+         month bars. They are picked by *bucket* rather than by elapsed time, so
+         the labels land on real calendar days and months and every one of them
+         can be drawn on its own column's centre. A round millisecond step - the
+         mechanism the curve uses below - only happens to line up because a day
+         is round; 61 days is not a month, and a year axis built from it labelled
+         the bars "1, 3, 4, 6, 8, 10".
+
+         The stride is chosen from the number of bars the visible window holds so
+         the count stays under what the width can carry, and the last bar is
+         always labelled: it is the one the eye goes to first. */
+      if (bars && bars.times.length) {
+        const visible = [];
+        for (let i = 0; i < bars.times.length; i += 1) {
+          const t = num(bars.times[i]);
+          if (t >= first && t <= last) visible.push(i);
+        }
+        if (!visible.length) return "";
+        /* A bar label is one or two characters ("7", "12"), so it needs far
+           less room than the "00:00" of a curve axis: 48 px keeps a month of
+           day numbers legible where 110 px would have labelled only every
+           fourth day. */
+        const barMax = Math.min(31, Math.max(2, Math.floor(plotW / 48)));
+        const stride = Math.max(1, Math.ceil(visible.length / barMax));
+        const picksBar = [];
+        const lastIndex = visible[visible.length - 1];
+        const pushBar = (index, slot) => {
+          const t = num(bars.times[index]);
+          const text = this._label(t);
+          if (picksBar.some((p) => p.text === text)) return;
+          picksBar.push({ ms: t, text, slot });
+        };
+        visible.forEach((index, k) => {
+          if (k % stride === 0) pushBar(index, k);
+        });
+        /* `stride` rarely divides the slot count, so the last regular pick can
+           land one column before the final bar and the two labels collide on
+           the right edge. Drop it when it is closer than half a stride. */
+        const finalSlot = visible.length - 1;
+        while (picksBar.length && finalSlot - picksBar[picksBar.length - 1].slot < stride / 2) {
+          picksBar.pop();
+        }
+        pushBar(lastIndex, finalSlot);
+        return picksBar.map((p) => {
+          const x = bars.centreOf(p.ms);
+          const anchor = x < PAD_L + 8 ? "start" : x > W - PAD_R - 8 ? "end" : "middle";
+          return `<text class="axis" x="${x.toFixed(1)}" y="${y}"
+            text-anchor="${anchor}">${esc(p.text)}</text>`;
+        }).join("");
+      }
 
       /* Round steps per range, in milliseconds. A day view steps by minutes /
          hours, a month by days, a year by months. */
@@ -1112,7 +2125,7 @@ function _hmHistoryRegister() {
       const hour = 60 * minute;
       const day = 24 * hour;
       const candidates = this._range === "year"
-        ? [30 * day, 61 * day, 92 * day, 183 * day]
+        ? [day * 1, 30 * day, 61 * day, 92 * day]
         : this._range === "month"
           ? [day, 2 * day, 3 * day, 5 * day, 7 * day, 10 * day, 14 * day]
           : [5 * minute, 10 * minute, 15 * minute, 30 * minute,
@@ -1122,55 +2135,47 @@ function _hmHistoryRegister() {
       for (const c of candidates) {
         if (spanMs / c <= maxLabels - 1) { step = c; break; }
       }
+      /* A zoomed-in day can need ticks finer than five minutes ("00:12"), which
+         is why the sub-hour steps are divided down once the span is small. */
+      if (this._range === "day" && spanMs / step <= maxLabels - 1) {
+        while (step > minute && spanMs / step <= maxLabels - 1) step /= 2;
+      }
 
       /* Align the first tick to a round boundary at that step, in *local* time.
          For a month / year step this lands on midnight of the day, which is what
-         makes "1/5" sit under a real bucket rather than a fractional one. */
+         makes "1/5" sit under a real day rather than a fractional one. */
       const align = (ms) => {
         const d = new Date(ms);
         d.setSeconds(0, 0);
         if (step >= day) {
           d.setHours(0, 0, 0, 0);
         } else {
-          const stepMin = Math.round(step / minute);
+          const stepMin = Math.max(1, Math.round(step / minute));
           d.setMinutes(Math.floor(d.getMinutes() / stepMin) * stepMin, 0, 0);
         }
         return d.getTime();
       };
 
-      /* Nearest bucket to `target`, so a tick lands on a timestamp the series
-         actually has (statistic buckets are not perfectly regular). */
-      const nearest = (target) => {
-        let best = 0;
-        let bestDiff = Infinity;
-        for (let i = 0; i < times.length; i += 1) {
-          const diff = Math.abs(num(times[i]) - target);
-          if (diff < bestDiff) { bestDiff = diff; best = i; }
-        }
-        return best;
-      };
-
       const seen = new Set();
+      const picks = [];
       const pushAt = (ms) => {
-        const i = nearest(ms);
-        const label = this._label(times[i]);
+        const label = this._label(ms);
         if (seen.has(label)) return;
         seen.add(label);
-        picks.push({ i, text: label });
+        picks.push({ ms, text: label });
       };
 
+      /* The first tick is the window's own start (00:00 for a day, the 1st for
+         a month, January for a year), then every round step up to the end. */
       pushAt(first);
       for (let t = align(first) + step; t <= last; t += step) {
-        /* Keep the first/last labels from colliding with the edges of the data:
-           a tick that falls within half a step of either end would just repeat
-           it. */
-        if (t - first < step * 0.5 || last - t < step * 0.5) continue;
+        if (t - first < step * 0.5) continue;
         pushAt(t);
       }
-      pushAt(last);
+      if (picks.length < 2) pushAt(last);
 
       return picks.map((p) => {
-        const x = toX(p.i);
+        const x = toXTime(p.ms);
         const anchor = x < PAD_L + 8 ? "start" : x > W - PAD_R - 8 ? "end" : "middle";
         return `<text class="axis" x="${x.toFixed(1)}" y="${y}"
           text-anchor="${anchor}">${esc(p.text)}</text>`;
@@ -1186,12 +2191,305 @@ function _hmHistoryRegister() {
         return String(d.getMonth() + 1);
       }
       if (this._range === "month") {
-        return `${d.getMonth() + 1}/${d.getDate()}`;
+        /* Just the day of the month.  "11/3" under every bar repeated the
+           month 31 times and squeezed the number that actually differs into
+           half the width; the month is already in the toolbar's date field and
+           in the tooltip, so the axis only has to say which day it is. */
+        return String(d.getDate());
       }
       return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
     }
 
-    _hoverLayer(data, toX, yTop, yBot, div, axDecimals) {
+    /* ------------------------------ zoom ------------------------------ */
+
+    /**
+     * The visible stretch of the window, in milliseconds.
+     *
+     * The plot always spans the *window* (midnight to midnight, the 1st to the
+     * last of the month, January to December) and the wheel zoom narrows a
+     * sub-range of it. Deriving both from the same source is what keeps the
+     * guide line, the tick labels and the inverse pointer mapping in step.
+     */
+    _visibleDomain() {
+      const { start, end } = this._window();
+      /* The bar modes span their *slots*, not the calendar window. A month in
+         progress only has slots up to today, and mapping those onto the whole
+         month would crowd them into the left two fifths of the card; spanning
+         first slot -> end of last slot spreads them across the full width and
+         leaves no empty axis trailing to the right. Zoom and the pointer
+         mapping both read the domain from here, so they stay in step. */
+      const data = this._data;
+      const isBar = !!(data && data.bars && data.times && data.times.length);
+      let t0 = start.getTime();
+      let t1 = end.getTime();
+      if (isBar) {
+        const times = data.times;
+        const n = times.length;
+        t0 = num(times[0]);
+        t1 = t0 + 1;
+        const lastStart = num(times[n - 1]);
+        const lastEnd = lastStart + barSlot(times, n - 1, DAY_MS);
+        if (lastEnd > t0) t1 = lastEnd;
+      }
+      const zoom = zoomWindow(this._zoom);
+      const span = Math.max(t1 - t0, 1);
+      return {
+        first: t0 + span * zoom.from,
+        last: t0 + span * zoom.to,
+        narrow: zoom.narrow,
+      };
+    }
+
+    /** Pointer position across the plot, as a 0..1 ratio, or null. */
+    _pointerRatio(event) {
+      const root = this.renderRoot;
+      const svg = root ? root.querySelector(".chart svg") : null;
+      if (!svg) return null;
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width) return null;
+      // The svg is stretched by CSS, so map through the viewBox coordinates.
+      const vbX = ((event.clientX - rect.left) / rect.width) * this._width();
+      const x0 = PAD_L;
+      const x1 = this._width() - PAD_R;
+      if (x1 <= x0) return null;
+      return Math.min(Math.max((vbX - x0) / (x1 - x0), 0), 1);
+    }
+
+    /**
+     * Wheel = zoom the time axis around the instant under the pointer.
+     *
+     * Zooming around the centre would slide the part you were reading out of
+     * frame, so the instant under the cursor is kept fixed: the new span is
+     * placed so that the same time lands under the same pixel. Scrolling back
+     * out past the whole window simply clears the zoom, which is what makes the
+     * gesture reversible without a second control.
+     */
+    _onWheel(event) {
+      if (!this._zoomable()) return;
+      if (!this._data || !this._data.times.length) return;
+      // Ctrl+wheel is the browser's page zoom; never steal it.
+      if (event.ctrlKey) return;
+      const ratio = this._pointerRatio(event);
+      if (ratio == null) return;
+      event.preventDefault();
+
+      const current = zoomWindow(this._zoom);
+      const span0 = current.to - current.from;
+      const anchor = current.from + ratio * span0;
+      const factor = Math.exp(num(event.deltaY) * ZOOM_WHEEL);
+      const span = Math.min(Math.max(span0 * factor, ZOOM_MIN_SPAN), 1);
+
+      if (span >= 0.999) {
+        this._resetZoom();
+        return;
+      }
+      let from = anchor - ratio * span;
+      from = Math.min(Math.max(from, 0), 1 - span);
+      this._zoom = { a: from, b: from + span };
+      this.requestUpdate();
+    }
+
+    /**
+     * Button down on the plot: a second quick one resets the zoom, otherwise it
+     * starts a pan (when zoomed).
+     *
+     * `mousedown` is the only event that is guaranteed to arrive. The plot is
+     * re-rendered as a whole whenever the hover index, the pan or the zoom
+     * changes, which detaches the node the pointer went down on - and a click
+     * needs the same node under the pointer for both halves of the gesture. So
+     * the gesture is timed here, and this handler must not re-render either, or
+     * it would break its own `mouseup`.
+     */
+    _onDragStart(event) {
+      if (event.button !== 0) return;
+      if (!this._zoomable()) return;
+      const now = Date.now();
+      /* A new press starts a new gesture: whatever the previous one wanted to
+         swallow is no longer coming (a click needs the same node under the
+         pointer for both halves, and the re-render takes that away). */
+      this._dblReset = false;
+      /* A pan does not produce a click (it re-renders mid-gesture), so `_dragged`
+         would otherwise stay set and swallow the next real click. Consume it
+         here, and do not let the release of a pan count as the first half of a
+         double click. */
+      const afterPan = this._dragged;
+      this._dragged = false;
+      const steady = Math.abs(event.clientX - this._lastDownX) <= 8
+        && Math.abs(event.clientY - this._lastDownY) <= 8;
+      const dbl = !afterPan && steady && now - this._lastDownAt <= DOUBLE_CLICK_MS;
+      this._lastDownAt = dbl || afterPan ? 0 : now;
+      this._lastDownX = event.clientX;
+      this._lastDownY = event.clientY;
+      if (dbl) {
+        this._lastClickAt = 0;
+        this._dblReset = true;
+        this._resetZoom();
+        return;
+      }
+      if (!this._zoom || !this._data) return;
+      const zoom = zoomWindow(this._zoom);
+      this._drag = {
+        x: event.clientX,
+        from: zoom.from,
+        span: zoom.to - zoom.from,
+        moved: false,
+      };
+      this._dragMove = (e) => this._onDragMove(e);
+      this._dragEnd = () => this._onDragEnd();
+      window.addEventListener("mousemove", this._dragMove);
+      window.addEventListener("mouseup", this._dragEnd);
+      /* Only the cursor changes, so paint it without going through Lit: a
+         re-render here would replace the node under the pointer and eat the
+         click that follows the release. */
+      this._setChartState("dragging", true);
+    }
+
+    /** Toggle one class on the plot element without a re-render. */
+    _setChartState(name, on) {
+      const root = this.renderRoot;
+      const div = root ? root.querySelector(".chart") : null;
+      if (div) div.classList.toggle(name, !!on);
+    }
+
+    _onDragMove(event) {
+      const drag = this._drag;
+      if (!drag) return;
+      const root = this.renderRoot;
+      const svg = root ? root.querySelector(".chart svg") : null;
+      if (!svg) return;
+      const width = svg.getBoundingClientRect().width;
+      if (!width) return;
+      const shift = -((event.clientX - drag.x) / width) * drag.span;
+      if (Math.abs(event.clientX - drag.x) > 2) drag.moved = true;
+      let from = drag.from + shift;
+      from = Math.min(Math.max(from, 0), 1 - drag.span);
+      this._zoom = { a: from, b: from + drag.span };
+      // A pan is not a hover: chasing the pointer would flash a readout for a
+      // point that is sliding under the cursor at 60 fps.
+      this._hover = -1;
+      this.requestUpdate();
+    }
+
+    _onDragEnd() {
+      if (this._dragMove) {
+        window.removeEventListener("mousemove", this._dragMove);
+        window.removeEventListener("mouseup", this._dragEnd);
+      }
+      this._dragMove = null;
+      this._dragEnd = null;
+      // Same reason as `_onDragStart`: no re-render, or the release produces no
+      // click and the double-click reset becomes unreachable after a pan.
+      this._setChartState("dragging", false);
+      if (!this._drag) return;
+      // Keep `moved` for one click, so releasing a pan does not also clear the
+      // highlighted series.
+      const moved = this._drag.moved;
+      this._drag = null;
+      this._dragged = moved;
+    }
+
+    _resetZoom() {
+      const had = this._zoom != null;
+      this._zoom = null;
+      if (had) this.requestUpdate();
+    }
+
+    /**
+     * Can the time axis be zoomed right now?
+     *
+     * Not in the bar modes: those plot one bar per day (or per month) of a
+     * window that is already the calendar, so there is nothing to zoom *into* -
+     * narrowing a month of 30 bars shows four of them bigger, which loses the
+     * comparison the chart was opened for.  A day curve stays zoomable, because
+     * that is where "what happened between 13:00 and 14:00" is a real question.
+     * The answer is derived per render from the data, so switching the range
+     * selector turns the gesture on and off with it.
+     */
+    _zoomable() {
+      return !(this._data && this._data.bars);
+    }
+
+    /* --------------------------- the reveal --------------------------- */
+
+    /**
+     * Play a freshly loaded window out of the zero line.
+     *
+     * A chart that appears fully drawn reads as a picture; one that rises from
+     * zero reads as a measurement that just arrived, which is what the number
+     * on the axis actually is.  `requestAnimationFrame` on the class flip is
+     * what makes the browser interpolate instead of jumping: the same frame
+     * that inserts `.grow.start` must not also remove it, or the transition has
+     * no starting value to animate from.
+     */
+    _playGrow() {
+      if (!this._pendingGrow) return;
+      this._pendingGrow = false;
+      const root = this.renderRoot;
+      const group = root ? root.querySelector(".chart svg .grow") : null;
+      if (!group) return;
+      /* Flatten it *without* a transition first, otherwise the class that is
+         about to be removed again would animate the chart downwards before it
+         grows.  Only once the flat state is committed is the transition turned
+         back on, and that is what the second frame is for. */
+      group.style.transition = "none";
+      group.classList.add("start");
+      void group.getBoundingClientRect();
+      requestAnimationFrame(() => {
+        group.style.transition = "";
+        requestAnimationFrame(() => { group.classList.remove("start"); });
+      });
+    }
+
+
+    /**
+     * A click clears the highlight.
+     *
+     * The zoom reset is handled on `mousedown` (see `_onDragStart`); this keeps
+     * a matching fallback for the clicks that do survive to the browser, so a
+     * fast pair still resets if the button-down path somehow missed it. Both
+     * paths are idempotent: resetting an unzoomed chart does nothing.
+     */
+    _onChartClick() {
+      if (this._dragged) {
+        this._dragged = false;
+        return;
+      }
+      if (this._dblReset) {
+        this._dblReset = false;
+        return;
+      }
+      const now = Date.now();
+      const previous = this._lastClickAt;
+      this._lastClickAt = now;
+      if (previous && now - previous <= DOUBLE_CLICK_MS) {
+        this._lastClickAt = 0;
+        this._resetZoom();
+        return;
+      }
+      this._selectSeries(-1);
+    }
+
+    /** Pointer left the plot: drop the readout and end a stuck pan. */
+    _onLeave() {
+      if (this._drag) this._onDragEnd();
+      /* Two presses separated by the pointer leaving the plot are not a double
+         click, however close together they were. */
+      this._lastDownAt = 0;
+      this._setHover(-1);
+    }
+
+    /** The energy produced across the whole window, for the bar modes. */
+    _totalLabel(data) {
+      const totals = data && data.totals;
+      if (!totals || !totals.length) return "";
+      const display = pickUnit(this._config.unit, Math.max(Math.abs(totals[0]), 1e-9));
+      const value = totals[0] / display.divisor;
+      const unit = this._config.unit || display.unit || "";
+      const shown = Math.abs(value) >= 100 ? value.toFixed(1) : value.toFixed(2);
+      return `${this._t("Total", "合计")}: ${shown} ${unit}`.trim();
+    }
+
+    _hoverLayer(data, toX, yTop, yBot, div, axDecimals, markX) {
       const W = this._width();
       // A hover can come from this card (bucket index) or from another card in
       // the group (timestamp, which may sit on a different bucket grid), so the
@@ -1199,7 +2497,9 @@ function _hmHistoryRegister() {
       const pos = this._hoverPosition(data);
       if (pos == null) return "";
       const i = Math.min(Math.max(pos, 0), data.times.length - 1);
-      const x = toX(i);
+      // In the bar modes the guide line belongs on the centre of the column, not
+      // on the boundary where the bucket happens to start.
+      const x = markX ? markX(i) : toX(i);
       const when = new Date(num(data.times[i]));
       const stamp = this._range === "day"
         ? `${pad2(when.getHours())}:${pad2(when.getMinutes())}`
@@ -1262,8 +2562,15 @@ function _hmHistoryRegister() {
       const times = data.times;
       const n = times.length;
       if (!n) return null;
+      /* A hole is not a reading.  The curve falls to 0 across an outage so the
+         outage is *visible*, but letting the guide line settle on one of those
+         buckets would print "0 W at 10:45" for an instant the device never
+         measured - a number that looks as trustworthy as any other on the
+         card.  The pointer simply has nothing to say there. */
+      const hole = (index) => !!(data.holes && data.holes[index]);
       if (this._remoteTime == null) {
         if (this._hover < 0 || this._hover >= n) return null;
+        if (hole(this._hover)) return null;
         return this._hover;
       }
 
@@ -1272,8 +2579,8 @@ function _hmHistoryRegister() {
       const last = num(times[n - 1]);
       const gap = n > 1 ? (last - first) / (n - 1) : Math.max(last - first, 1);
       // Only reject a hover that belongs to a different window (e.g. the group
-      // has moved on). Inside the range the nearest bucket is always used, even
-      // when the hovered instant falls in one of this card's data gaps.
+      // has moved on). Inside the range the nearest bucket is used, unless the
+      // hovered instant falls on a bucket this card has no reading for.
       if (target < first - gap || target > last + gap) return null;
 
       let lo = 0;
@@ -1285,9 +2592,9 @@ function _hmHistoryRegister() {
       }
       if (lo > 0
         && Math.abs(num(times[lo - 1]) - target) <= Math.abs(num(times[lo]) - target)) {
-        return lo - 1;
+        lo -= 1;
       }
-      return lo;
+      return hole(lo) ? null : lo;
     }
 
     /** Select a series by legend index; `-1` clears the highlight. */
@@ -1311,29 +2618,46 @@ function _hmHistoryRegister() {
     }
 
     _onMove(event) {
+      if (this._drag) return;
       const data = this._data;
       if (!data || data.times.length < 2) return;
-      const svg = event.currentTarget.querySelector("svg");
-      if (!svg) return;
-      const rect = svg.getBoundingClientRect();
-      if (!rect.width) return;
-      // The svg is stretched by CSS, so map through the viewBox coordinates.
-      const vbX = ((event.clientX - rect.left) / rect.width) * this._width();
-      const x0 = PAD_L;
-      const x1 = this._width() - PAD_R;
-      const ratio = Math.min(Math.max((vbX - x0) / (x1 - x0), 0), 1);
-      // `toX` is timestamp-based, so invert it the same way: the pointer picks
-      // an instant, and the nearest bucket to that instant is hovered. Using an
-      // index ratio here would land on the wrong point wherever the series has
-      // a gap.
-      const tFirst = num(data.times[0]);
-      const tLast = num(data.times[data.times.length - 1]);
-      const target = tFirst + (tLast - tFirst) * ratio;
+      const ratio = this._pointerRatio(event);
+      if (ratio == null) return;
+      /* `toX` is timestamp-based, so invert it the same way: the pointer picks
+         an instant inside the *visible* window, and the nearest bucket to that
+         instant is hovered. Using an index ratio here would land on the wrong
+         point wherever the series has a gap, and would ignore the zoom. */
+      const domain = this._visibleDomain();
+      const target = domain.first + (domain.last - domain.first) * ratio;
+      /* In the bar modes a column owns every pixel between its two edges, and
+         the guide line is drawn on the column's centre. Picking the *nearest
+         timestamp* would put the cursor over the right half of a bar and report
+         the next day, because a bar's centre is half a slot away from its own
+         start. `barBucketAt()` asks which rectangle is actually under the
+         pointer, which is what the eye is reading. */
+      if (data.bars) {
+        const hit = barBucketAt(data.times, target);
+        if (hit >= 0) {
+          this._setHover(hit);
+          return;
+        }
+      }
       let index = 0;
       let bestDiff = Infinity;
       for (let i = 0; i < data.times.length; i += 1) {
         const diff = Math.abs(num(data.times[i]) - target);
         if (diff < bestDiff) { bestDiff = diff; index = i; }
+      }
+      /* The pointer is over a bucket the device never reported.  There is no
+         reading to name, and snapping to the nearest *real* bucket instead
+         would park the guide line on a moment the pointer is not at - so the
+         card says nothing at all, and the group's guide line is cleared with
+         it.  That is the difference between "0 W" and "no data": the curve
+         falls to 0 so the outage is visible, but a tooltip would dress that 0
+         up as a measurement. */
+      if (data.holes && data.holes[index]) {
+        this._setHover(-1);
+        return;
       }
       this._setHover(index);
     }
@@ -1421,6 +2745,20 @@ function _hmHistoryRegister() {
             <ha-switch .checked=${config.show_toolbar !== false}
               @change=${this._toggle("show_toolbar")}></ha-switch>
             <span>show_toolbar (this card's own time controls)</span>
+          </label>
+          <label class="sw">
+            <ha-switch .checked=${config.show_totals === true}
+              @change=${this._toggle("show_totals")}></ha-switch>
+            <span>show_totals (month / year / lifetime energy tiles)</span>
+          </label>
+          <label class="sw">
+            <span>mode</span>
+            <select .value=${config.mode || "auto"}
+              @change=${this._changed("mode")}>
+              <option value="auto">auto (bars for month / year energy, curve for a day)</option>
+              <option value="bar">bar (one bar per day / month)</option>
+              <option value="line">line (always a curve)</option>
+            </select>
           </label>
         </div>
         <div class="hint">

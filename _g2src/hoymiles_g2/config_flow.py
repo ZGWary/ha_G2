@@ -15,9 +15,19 @@ from homeassistant.helpers.selector import (
 )
 
 from . import mqtt_util
-from .const import CONF_DEV_ID, DOMAIN, NAME
+from .const import CONF_DEV_ID, DOMAIN, NAME, serial_pid
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _has_known_pid(dev_id: str) -> bool:
+    """True when the serial carries a four digit product id.
+
+    The PID is what identifies the product, so it has to be readable for the
+    entry to be useful; the *prefix* is not checked, because the user is free to
+    rename it.
+    """
+    return serial_pid(dev_id) is not None
 
 
 class HoymilesConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -46,6 +56,13 @@ class HoymilesConfigFlow(ConfigFlow, domain=DOMAIN):
             dev_id = str(user_input[CONF_DEV_ID]).strip()
             if not dev_id:
                 errors["base"] = "dev_id_required"
+            elif not _has_known_pid(dev_id):
+                # Custom values are allowed on purpose - the user may rename the
+                # client prefix to anything, and a unit with a PID newer than this
+                # release must still be installable.  But a serial whose four
+                # leading digits are not a product id at all is a typo, and
+                # accepting it would create an entry that never receives data.
+                errors["base"] = "dev_id_invalid"
             else:
                 await self.async_set_unique_id(dev_id)
                 self._abort_if_unique_id_configured()

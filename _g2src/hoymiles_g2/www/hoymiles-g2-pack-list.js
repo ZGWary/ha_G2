@@ -21,21 +21,33 @@ function _hmPackListRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -51,21 +63,12 @@ function _hmPackListRegister() {
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   const PACK_MAX = 4;
 
@@ -150,19 +153,38 @@ function _hmPackListRegister() {
       this.requestUpdate();
     }
 
+connectedCallback() {
+      super.connectedCallback();
+      /* The toolbar language switch only writes localStorage and fires
+         `hoymiles-language`; it never touches `hass.language`, so without this
+         the card would keep its old wording until a page reload. */
+      I18N.watch(this);
+    }
+
+    disconnectedCallback() {
+      I18N.unwatch(this);
+      super.disconnectedCallback();
+    }
+
     getCardSize() {
       return 4;
     }
 
     /* ----------------------------- lookups ----------------------------- */
 
+    /** One of the two strings the card carries, in the current language. */
     _t(en, zh) {
-      return hmLang(this._hass, this._config) === "zh" ? zh : en;
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
     }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
 
     _dev() {
@@ -255,7 +277,7 @@ function _hmPackListRegister() {
 
       return html`
         <ha-card>
-          <div class="title">${this._text(this._config.title) || this._t("Battery packs", "电池包")}</div>
+          <div class="title">${this._text(this._config.title) || this._t("Battery Packs", "电池包")}</div>
           ${count === 0
             ? html`<div class="none">${this._t("No pack data", "无电池包数据")}</div>`
             : html`<div class="grid" style="grid-template-columns:repeat(${columns},1fr)">${rows}</div>`}

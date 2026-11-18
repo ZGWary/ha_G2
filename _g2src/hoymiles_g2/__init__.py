@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 
 from .const import (
     CONF_DEV_ID,
@@ -47,6 +47,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     await patcher.async_setup()
 
+    # Once per connection, delete the retained discovery configs this connection
+    # never published.  A retained config outlives the connection that published
+    # it and the broker replays it to every new subscriber, so without this a
+    # feature the firmware dropped keeps its entities forever - and the entities
+    # of a retired node id (``MI-<SN>``) come back on every restart.
+    #
+    # The rule is what the device itself publishes, not the ``supported_topics``
+    # list: that list is incomplete (this unit declares four keys while publishing
+    # far more), so treating it as the keep-set deleted working entities and kept
+    # dead ones.  The patcher therefore compares against the discovery topics the
+    # device published live on this connection, and does nothing when it published
+    # none (i.e. it is offline and everything seen was a replay).
+    def _maybe_prune() -> None:
+        patcher.async_schedule_prune(lambda: coordinator.session)
+
+    entry.async_on_unload(coordinator.async_add_listener(_maybe_prune))
+    _maybe_prune()
+
     # Re-publishes `power_ctrl` so the firmware's ~60 s lease stays in force.
     # It lives here rather than in the card, because a browser timer stops the
     # moment the dashboard is closed - exactly when the lease still needs
@@ -82,9 +100,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ``device/state`` arrives, so a fresh install picks the right layout.
     from . import lovelace  # noqa: PLC0415
 
-    await lovelace.async_ensure_dashboard(hass, dev_id, coordinator.pv_count)
+    await lovelace.async_ensure_dashboard(
+        hass, dev_id, coordinator.pv_count, coordinator.role
+    )
+    # The role rides on ``event/state``, which the device publishes on its own
+    # schedule - frequently *after* this point.  The dashboard is written now
+    # because waiting for it would delay setup by an unbounded amount of time,
+    # so a late arrival is applied as it lands: each change costs one storage
+    # read and one write, and ``None`` (never heard from) leaves it alone.
+    _async_track_role(hass, entry, coordinator, dev_id, lovelace)
 
     return True
+
+
+@callback
+def _async_track_role(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: HoymilesCoordinator,
+    dev_id: str,
+    lovelace: Any,
+) -> None:
+    """Re-apply the dashboard's role gate whenever ``event/state`` changes it.
+
+    Registered as a coordinator listener rather than an MQTT subscription: every
+    payload the firmware sends already fans out through the coordinator, so this
+    adds no traffic.  The listener is removed with the config entry, and the last
+    applied role is remembered in ``lovelace`` - so this is normally a no-op.
+
+    The whole body is guarded: a Lovelace internals change must never be able to
+    raise inside a coordinator callback, which would be logged against the
+    integration on every single MQTT message.
+    """
+    last: list[Any] = [coordinator.role]
+
+    @callback
+    def _apply() -> None:
+        try:
+            role = coordinator.role
+            if role == last[0]:
+                return
+            last[0] = role
+            hass.async_create_task(lovelace.async_sync_role(hass, dev_id, role))
+        except Exception:  # noqa: BLE001 - never break the state update
+            _LOGGER.debug("Role listener failed for %s", dev_id, exc_info=True)
+
+    entry.async_on_unload(coordinator.async_add_listener(_apply))
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

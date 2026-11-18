@@ -112,18 +112,39 @@ async def async_discover_dev_ids(
 
     The firmware publishes ``homeassistant/switch/<dev_id>/config`` on connect,
     so simply subscribing for a few seconds surfaces every reachable device.
+
+    ``<dev_id>`` is ``"<client_prefix>-<SN>"``.  The prefix is a **user
+    setting** - it is the MQTT client prefix and may be renamed to anything - so
+    a device must never be recognised by it.  It is recognised by the **PID**
+    instead: the four digits at the start of the serial (``1650`` / ``4160`` /
+    ``4161`` / ``4162`` for the inverters, ``2800`` for the storage units).
+    Only serials whose PID can be read are offered, which also keeps unrelated
+    MQTT devices that publish under ``homeassistant/`` out of the picker.
+
+    The **full** id is returned, prefix included, because that prefix is part of
+    every topic the device publishes and therefore part of every topic this
+    integration has to talk to.  It is only the *recognition* that ignores it.
     """
     if mqtt is None:  # pragma: no cover
         return []
 
-    from .const import T_DISCOVERY  # noqa: PLC0415  (avoid cycles at import time)
+    from .const import KNOWN_PIDS, T_DISCOVERY, serial_pid  # noqa: PLC0415
 
     found: set[str] = set()
 
     def _message_received(msg: Any) -> None:
-        parts = msg.topic.split("/")
-        if len(parts) >= 4 and parts[2]:
-            found.add(parts[2])
+        parts = str(msg.topic).split("/")
+        # ``homeassistant/<component>/<dev_id>/config`` -> parts[2] is the id.
+        # Deeper discovery topics (``.../<dev_id>/soc/config``) still carry the
+        # same id in parts[2], and a wildcard the firmware did not expand would
+        # be rejected by the PID check below.
+        if len(parts) < 4 or not parts[2]:
+            return
+        pid = serial_pid(parts[2])
+        if pid is None or pid not in KNOWN_PIDS:
+            _LOGGER.debug("Skipping %s: product id %r not recognised", msg.topic, pid)
+            return
+        found.add(parts[2])
 
     unsub = await mqtt.async_subscribe(hass, T_DISCOVERY, _message_received, 1)
     try:

@@ -56,6 +56,7 @@ from .const import (
     PHASE_POWER_STEP,
 )
 from .coordinator import HoymilesCoordinator
+from .entity_gate import async_add_gated_entities
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,16 +97,32 @@ async def async_setup_entry(
     # micro inverter, or a single phase storage unit), and the command topic is
     # never read.  Creating the three numbers anyway would put entities in the UI
     # that silently do nothing.
-    if not coordinator.has_capability(CAP_PHASE_OUTPUT):
-        _LOGGER.debug(
-            "Hoymiles %s has no phase_output_power, skipping per phase numbers",
-            dev_id,
-        )
-        return
+    #
+    # The gate re-checks this, because the discovery object that proves the
+    # capability is a retained MQTT payload that may land after setup - that is
+    # exactly how this feature is reported (see ``discovery_override.py``).
+    def _build() -> list[HoymilesPhaseNumber]:
+        if not coordinator.has_capability(CAP_PHASE_OUTPUT):
+            return []
+        return [
+            HoymilesPhaseNumber(coordinator, dev_id, description)
+            for description in NUMBER_DESCRIPTIONS
+        ]
 
-    async_add_entities(
-        HoymilesPhaseNumber(coordinator, dev_id, description)
-        for description in NUMBER_DESCRIPTIONS
+    def _stale() -> set[str]:
+        """The three phase keys, when the unit has no multi phase stage."""
+        if coordinator.has_capability(CAP_PHASE_OUTPUT):
+            return set()
+        return {description.key for description in NUMBER_DESCRIPTIONS}
+
+    async_add_gated_entities(
+        coordinator,
+        async_add_entities,
+        _build,
+        entry,
+        hass=hass,
+        domain="number",
+        stale=_stale,
     )
 
 

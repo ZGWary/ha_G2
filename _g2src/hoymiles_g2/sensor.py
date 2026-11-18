@@ -1,8 +1,9 @@
 """Sensor entities for the Hoymiles Micro Storage integration.
 
 These entities reproduce the state fields the firmware pushes on
-``quick/state`` (1 s, all roles), ``device/state`` (5 min, all roles) and
-``system/state`` (5 min, master/single only) plus the TOU ack/status topics.
+``quick/state`` (1 s, all roles), ``device/state`` (5 min, all roles),
+``system/state`` (5 min, master/single only), ``event/state`` (on connect and
+on change, all roles) plus the TOU ack/status topics.
 
 ``soc`` and ``bat_power`` are intentionally *not* re-created here because the
 firmware already registers them through MQTT discovery.
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Callable, Final
 
 from homeassistant.components.sensor import (
@@ -34,9 +36,15 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
+    ALARM_CODE_RANGES,
+    ALARM_CODES,
+    ALARM_CODES_ZH,
+    ALARM_MAX,
     CAP_ALARM_STATE,
     CAP_DEVICE_STATE,
     CAP_QUICK_STATE,
@@ -45,7 +53,11 @@ from .const import (
     DOMAIN,
     MANUFACTURER,
     PV_COUNT_MAX,
+    ROLE_ALIASES,
+    ROLES,
+    SRC_ALARM,
     SRC_DEVICE,
+    SRC_EVENT,
     SRC_KEEPALIVE,
     SRC_QUICK,
     SRC_SYSTEM,
@@ -57,8 +69,16 @@ from .const import (
     TOU_WEEK_ACK_STATUS,
 )
 from .coordinator import HoymilesCoordinator
+from .entity_gate import async_add_gated_entities
 
 _LOGGER = logging.getLogger(__name__)
+
+# How long a restored alarm list stays trustworthy.  ``alarm/state`` is not
+# retained, so a restart leaves the entity with nothing to read until the next
+# alarm fires; the last snapshot is shown instead.  A day-old list, however,
+# would claim that alarms are still active that were cleared while Home
+# Assistant was down, which is worse than admitting we do not know.
+ALARM_RESTORE_MAX_AGE: Final = timedelta(days=1)
 
 # ---------------------------------------------------------------------------
 # value_fn helpers
@@ -95,6 +115,39 @@ def s(field: str, default: Any = None) -> Callable[[dict], Any]:
         return _payload(data, SRC_SYSTEM).get(field, default)
 
     return _fn
+
+
+def _role_value(data: dict[str, Any]) -> str | None:
+    """The unit's role in the installation, normalised, or ``None``.
+
+    §32 is the only carrier of ``role``: ``single`` (stand-alone), ``master``
+    (head of a master/slave pair) or ``slave`` (follower).  A follower is
+    published as ``servant`` by at least one build, so the alias is resolved
+    here instead of in every consumer.  An unknown spelling is reported as
+    ``None`` rather than passed through: a dash on the dashboard is honest, an
+    invented role is not.
+    """
+    value = _payload(data, SRC_EVENT).get("role")
+    if not isinstance(value, str):
+        return None
+    role = value.strip().lower()
+    role = ROLE_ALIASES.get(role, role)
+    return role if role in ROLES else None
+
+
+def _role_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    """The whole ``event/state`` snapshot as attributes.
+
+    Everything the payload carries is exposed, because the power flow card reads
+    it straight off this entity: the three capability flags decide which
+    branches exist in the drawing, and ``switch`` / ``ems_mode`` / the power
+    limits are useful on a dashboard without creating an entity for each of the
+    twenty odd fields the protocol defines.
+
+    No interpretation happens here - a flag the firmware did not send is simply
+    absent, which the card reads as "unknown" instead of ``false``.
+    """
+    return dict(_payload(data, SRC_EVENT))
 
 
 # Documented order of the ``grid`` array in device/state (protocol §23).
@@ -151,11 +204,59 @@ def _pv_entry(data: dict[str, Any], index: int) -> dict[str, Any] | None:
 
 
 def pv(index: int, default: Any = None) -> Callable[[dict], Any]:
-    """Read the power of PV port ``index`` (0-based) from device/state."""
+    """Read the power of PV port ``index`` (0-based).
+
+    ``quick/state`` is the 1 s topic and a micro inverter puts the same per port
+    readings there as ``pv1_p`` / ``pv2_p`` (``pvs[].p`` in ``device/state`` is
+    the identical number, only published every 5 minutes).  The 1 s value
+    therefore wins whenever present, which is what makes the Device tab's power
+    flow card and the port gauges move in step with the System tab instead of
+    lagging by up to five minutes.
+
+    ``pPv<n>`` is accepted as an alias: that is how the protocol document spells
+    the field, and accepting both means a unit that ever emits either spelling
+    still gets the fast reading.
+
+    A storage unit has no ``pv<n>_p`` fields at all, so it falls straight
+    through to ``pvs[]`` and keeps its previous behaviour.
+    """
+    port = index + 1
+    live_fields = (f"pv{port}_p", f"pPv{port}")
 
     def _fn(data: dict[str, Any]) -> Any:
+        live = _payload(data, SRC_QUICK)
+        for field in live_fields:
+            value = live.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value
         entry = _pv_entry(data, index)
         return default if entry is None else entry.get("p", default)
+
+    return _fn
+
+
+def grid_port(default: Any = None) -> Callable[[dict], Any]:
+    """Read the micro inverter's own AC output from the 1 s topic.
+
+    The unit reports it as ``grid_on_p`` and repeats it as ``grid[0].p`` in the
+    5 min ``device/state``.  Reading the slow copy made the 并网端口 node trail
+    the System tab by up to five minutes, and it was frequently ``unknown`` for
+    the first minutes after a reboot, which printed a dash on the diagram.
+
+    ``pAc`` is accepted as an alias (the spelling used by the protocol
+    document).  ``grid[0].p`` stays as the last resort so an older firmware that
+    sends neither field still gets a reading.
+    """
+    quick_fields = ("grid_on_p", "pAc")
+    slow = grid(0, "p", default)
+
+    def _fn(data: dict[str, Any]) -> Any:
+        live = _payload(data, SRC_QUICK)
+        for field in quick_fields:
+            value = live.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value
+        return slow(data)
 
     return _fn
 
@@ -340,6 +441,115 @@ def _tou_attrs(source: str) -> Callable[[dict], dict[str, Any]]:
         return attrs
 
     return _fn
+
+
+# ---------------------------------------------------------------------------
+# Alarms (protocol §27)
+# ---------------------------------------------------------------------------
+def alarm_name(code: int) -> str | None:
+    """Return the documented English text for one alarm code, or ``None``.
+
+    The code table is the micro inverter appendix: it is the family that
+    declares ``alarm_state`` at all.  A range the document describes as a family
+    (``400-409``: smart device offline) is resolved before giving up, and a code
+    outside every table stays unnamed rather than being guessed at.
+    """
+    if code in ALARM_CODES:
+        return ALARM_CODES[code]
+    for low, high, text, _zh in ALARM_CODE_RANGES:
+        if low <= code <= high:
+            return text
+    return None
+
+
+def alarm_name_zh(code: int) -> str | None:
+    """Return the documented Chinese text for one alarm code, or ``None``.
+
+    Parallel to :func:`alarm_name` and resolved from the same two tables.  A
+    code the Chinese table does not carry returns ``None`` so the caller can
+    fall back to the English name instead of printing a blank.
+    """
+    if code in ALARM_CODES_ZH:
+        return ALARM_CODES_ZH[code]
+    for low, high, _en, zh in ALARM_CODE_RANGES:
+        if low <= code <= high:
+            return zh
+    return None
+
+
+def _alarm_code(value: Any) -> int | None:
+    """Parse one alarm code, which the firmware sends as a string."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _alarm_items(data: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The decoded alarm list, or ``None`` when the device never published one.
+
+    ``None`` and an empty list mean two different things and the distinction is
+    the whole point of this function: an empty list is the device saying "nothing
+    is wrong right now", while ``None`` means "this device has not told us" - an
+    older firmware without the topic at all, or a unit that has not alarmed since
+    Home Assistant started, because ``alarm/state`` is not retained.  Collapsing
+    the two would let the card claim a fault-free device it knows nothing about.
+    """
+    payload = data.get(SRC_ALARM)
+    if not isinstance(payload, dict):
+        return None
+    items = payload.get("alarm")
+    if not isinstance(items, list):
+        # A report with a count but no list (or a shape change) is still a
+        # report: treat it as "no alarms listed" rather than as no data.
+        return []
+
+    decoded: list[dict[str, Any]] = []
+    for item in items[:ALARM_MAX]:
+        if not isinstance(item, dict):
+            continue
+        code = _alarm_code(item.get("code"))
+        if code is None:
+            continue
+        # Both names are always present: ``name`` stays the protocol's English
+        # text (unchanged, so an existing automation reading it keeps working)
+        # and ``name_zh`` carries the translation.  A code with no Chinese entry
+        # repeats the English one rather than going blank.
+        name = alarm_name(code)
+        name_zh = alarm_name_zh(code) or name
+        decoded.append(
+            {
+                "code": code,
+                "time": item.get("time"),
+                "name": name or f"Unknown alarm {code}",
+                "name_en": name or f"Unknown alarm {code}",
+                "name_zh": name_zh or f"未知告警 {code}",
+            }
+        )
+
+    # Newest first: the device appends in the order the alarms were raised, and
+    # the one that just happened is what the card is opened for.
+    decoded.reverse()
+    return decoded
+
+
+def _alarm_summary(items: list[dict[str, Any]]) -> str:
+    """One line naming every active alarm, in both languages.
+
+    The Chinese name comes first because the entity's friendly name and the
+    dashboard are Chinese in the target install, and the English one is kept
+    beside it so the line can be quoted straight back into the protocol
+    appendix.  When the two are identical the repetition is dropped.
+    """
+    parts = []
+    for item in items:
+        zh = item.get("name_zh")
+        en = item.get("name_en") or item.get("name")
+        if zh and en and zh != en:
+            parts.append(f"{item['code']} {zh} / {en}")
+        else:
+            parts.append(f"{item['code']} {en or zh}")
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +806,22 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
         key="inv_energy_out_total", name="Inverter Energy Out Total", value_fn=grid(2, "etout"),
         requires=CAP_SYSTEM_STATE, **_ENERGY
     ),
+    # ---------------- quick/state : micro inverter AC port (1 s) ----------
+    # A micro inverter reports its own AC output as ``grid_on_p`` on the 1 s
+    # topic and repeats it as ``grid[0].p`` in the 5 min ``device/state``.  The
+    # entity used to look for ``pAc``, which the firmware never sends, so it read
+    # the slow copy at best and stayed ``unknown`` whenever that copy was older
+    # than the availability window - which is why the 并网端口 node of the Device
+    # tab showed a dash while the System tab was live.  ``grid_port()`` reads the
+    # 1 s field first and keeps ``grid[0].p`` as the fallback.
+    #
+    # Gated on the *absence* of ``system_state`` because that field only exists
+    # on a micro inverter - a storage unit describes the same port with
+    # ``grid_on_power`` and must not get a second entity for it.
+    HoymilesSensorDescription(
+        key="grid_port_power", name="Grid Port Power", value_fn=grid_port(),
+        requires_absent=CAP_SYSTEM_STATE, **_POWER
+    ),
     # ---------------- device/state : PV ports ----------------
     # One entity per *physical* input.  How many a unit has is derived from the
     # SKU in its serial (``pv_count_from_dev_id``) and refined by the firmware's
@@ -726,6 +952,22 @@ SENSOR_DESCRIPTIONS: tuple[HoymilesSensorDescription, ...] = (
     HoymilesSensorDescription(
         key="ems_mode_running", name="EMS Mode (Device)", value_fn=_ems_mode_value
     ),
+    # ---------------- event/state : role in the installation (protocol §32) ----
+    # Deliberately NOT capability gated: ``event_state`` is not a key of the
+    # retained ``supported_topics`` inventory (verified live on an RMI-4161,
+    # whose inventory lists only quick_state, device_state, alarm_state,
+    # switch_ctrl, output_power, power_ctrl, ems_mode and reboot), so gating on
+    # it would hide the entity on exactly the models that do publish the topic.
+    # The whole snapshot rides along as attributes - that is what the power flow
+    # card reads to decide which branches the drawing has.
+    HoymilesSensorDescription(
+        key="system_role",
+        name="System Role",
+        icon="mdi:account-supervisor",
+        value_fn=_role_value,
+        attrs_fn=_role_attrs,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
     # ---------------- TOU ----------------
     HoymilesSensorDescription(
         key="tou_plan_status",
@@ -789,42 +1031,66 @@ async def async_setup_entry(
             return False
         return True
 
-    async_add_entities(
-        HoymilesSensor(coordinator, dev_id, description)
-        for description in SENSOR_DESCRIPTIONS
-        if _wanted(description)
+    def _build() -> list[HoymilesSensor]:
+        """Every sensor the capability set justifies *right now*.
+
+        Re-evaluated whenever a topic arrives for the first time, so a device
+        that was silent (or that only publishes a reduced topic set over MQTTS)
+        ends up with exactly the entities its own payloads prove - and grows
+        them the moment it publishes something new.
+        """
+        return [
+            HoymilesSensor(coordinator, dev_id, description)
+            for description in SENSOR_DESCRIPTIONS
+            if _wanted(description)
+        ]
+
+    # The alarm list cannot be a plain :class:`HoymilesSensor` because
+    # ``alarm/state`` is not retained: after a restart the topic is silent until
+    # the next alarm, so the entity has to restore its last snapshot instead of
+    # sitting at ``unknown`` for days.  Gated on the declared capability, which
+    # only a micro inverter carries.
+    def _build_with_alarm() -> list[Any]:
+        entities: list[Any] = list(_build())
+        if coordinator.has_capability(CAP_ALARM_STATE):
+            entities.append(HoymilesAlarmSensor(coordinator, dev_id))
+        return entities
+
+    def _stale() -> set[str]:
+        """Sensor keys this device does not publish the topic for.
+
+        Returns the keys whose ``requires`` capability is missing, plus the ones
+        whose ``requires_absent`` capability *is* present, plus every PV port
+        beyond what the unit reports.  Called by the gate once a capability is
+        known, so a merely-offline device is left alone.
+        """
+        keys: set[str] = set()
+        for port in range(pv_ports + 1, PV_COUNT_MAX + 1):
+            keys.add(f"pv{port}_power")
+            keys.add(f"pv{port}_energy_today")
+
+        for description in SENSOR_DESCRIPTIONS:
+            if description.pv_port is not None:
+                continue  # handled by the port loop above
+            if description.requires is not None and not coordinator.has_capability(
+                description.requires
+            ):
+                keys.add(description.key)
+            elif description.requires_absent is not None and coordinator.has_capability(
+                description.requires_absent
+            ):
+                keys.add(description.key)
+        return keys
+
+    async_add_gated_entities(
+        coordinator,
+        async_add_entities,
+        _build_with_alarm,
+        entry,
+        hass=hass,
+        domain="sensor",
+        stale=_stale,
     )
-
-    # Ports the device turned out not to have must not keep a stale registry
-    # entry from an earlier version, otherwise they stay ``unknown`` forever even
-    # though nothing creates them any more.
-    _async_prune_stale_pv_entities(hass, entry, dev_id, pv_ports)
-
-
-@callback
-def _async_prune_stale_pv_entities(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    dev_id: str,
-    pv_ports: int,
-) -> None:
-    """Remove registry entries of PV ports beyond what this unit reports."""
-    from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
-
-    registry = er.async_get(hass)
-    for port in range(pv_ports + 1, PV_COUNT_MAX + 1):
-        for key in (f"pv{port}_power", f"pv{port}_energy_today"):
-            unique_id = f"{DOMAIN}_{dev_id}_{key}"
-            entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
-            if entity_id is None:
-                continue
-            _LOGGER.info(
-                "Removing PV%d entity %s: this unit reports only %d input(s)",
-                port,
-                entity_id,
-                pv_ports,
-            )
-            registry.async_remove(entity_id)
 
 
 class HoymilesSensor(CoordinatorEntity[HoymilesCoordinator], SensorEntity):
@@ -873,3 +1139,99 @@ class HoymilesSensor(CoordinatorEntity[HoymilesCoordinator], SensorEntity):
             return None
         attrs = attrs_fn(self.coordinator.data or {})
         return attrs or None
+
+
+class HoymilesAlarmSensor(
+    CoordinatorEntity[HoymilesCoordinator], RestoreEntity, SensorEntity
+):
+    """The alarms the device has not cleared yet (protocol §27).
+
+    The state is the *count*, so an automation can trigger on
+    ``numeric_state above: 0``, and the alarms themselves are attributes.  The
+    device replaces the whole list on every change and keeps at most
+    :data:`ALARM_MAX` of them, so this is a snapshot, not a history.
+
+    Two details drive the shape of this class:
+
+    * ``alarm/state`` is **not retained** and is only published when the list
+      changes.  After a Home Assistant restart there is nothing to read until
+      the next alarm fires - possibly for days - so the last snapshot is
+      restored and shown until a new report arrives.
+    * ``unknown`` and ``0`` are not the same claim.  A device that has never
+      published the topic reports ``None`` (unknown), never ``0``; only a report
+      that really listed nothing reports ``0``.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Active Alarms"
+    _attr_icon = "mdi:alert-circle-outline"
+
+    def __init__(self, coordinator: HoymilesCoordinator, dev_id: str) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{DOMAIN}_{dev_id}_active_alarms"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, dev_id)},
+            name=dev_id,
+            manufacturer=MANUFACTURER,
+            model=coordinator.device_model,
+        )
+        # Filled in by ``async_added_to_hass``; ``None`` means there is nothing
+        # to fall back to, which is the honest "this device never told us".
+        self._restored: list[dict[str, Any]] | None = None
+        self._restored_count: int | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the last alarm list across a restart."""
+        await super().async_added_to_hass()
+
+        last = await self.async_get_last_state()
+        if last is None or last.state in ("unknown", "unavailable"):
+            return
+        if dt_util.utcnow() - last.last_updated > ALARM_RESTORE_MAX_AGE:
+            return
+
+        items = last.attributes.get("alarms")
+        if not isinstance(items, list):
+            return
+
+        self._restored = [item for item in items if isinstance(item, dict)]
+        try:
+            self._restored_count = int(float(last.state))
+        except (TypeError, ValueError):
+            self._restored_count = len(self._restored)
+
+    @property
+    def _alarms(self) -> list[dict[str, Any]] | None:
+        """The live list, the restored one, or ``None`` when never reported."""
+        live = _alarm_items(self.coordinator.data or {})
+        return live if live is not None else self._restored
+
+    @property
+    def native_value(self) -> int | None:
+        """Number of alarms still active, or ``None`` before any report."""
+        payload = (self.coordinator.data or {}).get(SRC_ALARM)
+        if not isinstance(payload, dict):
+            return self._restored_count
+        count = payload.get("alarm_num")
+        if isinstance(count, int) and not isinstance(count, bool):
+            return count
+        alarms = _alarm_items(self.coordinator.data or {})
+        return None if alarms is None else len(alarms)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """The decoded alarm list, plus a one-line summary.
+
+        With no list at all the attributes stay **empty** on purpose: an empty
+        ``alarms`` list would read as "nothing is wrong", which is a claim this
+        entity cannot make.  The card keys off the missing attribute and says
+        "no data" instead.
+        """
+        alarms = self._alarms
+        if alarms is None:
+            return {}
+        return {
+            "alarms": alarms,
+            "codes": [item["code"] for item in alarms],
+            "summary": _alarm_summary(alarms),
+        }

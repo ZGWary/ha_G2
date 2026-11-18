@@ -29,6 +29,10 @@ T_ALARM_STATE: Final = "homeassistant/sensor/{dev_id}/alarm/state"
 # connect.  It is the only reliable way to tell which topics a given model
 # actually implements, see ``CAPABILITIES`` below.
 T_ATTRIBUTES: Final = "homeassistant/sensor/{dev_id}/attributes"
+# Protocol §32 「状态事件」: the unit's role in the system plus the flags that
+# describe the whole installation.  Published right after the connection is up
+# and then only when something changes, so it is event driven, not a heartbeat.
+T_EVENT_STATE: Final = "homeassistant/sensor/{dev_id}/event/state"
 
 T_EMS_MODE_CMD: Final = "homeassistant/select/{dev_id}/ems_mode/command"
 T_SWITCH_SET: Final = "homeassistant/switch/{dev_id}/set"
@@ -159,6 +163,30 @@ SRC_ALARM: Final = "alarm"
 # Integration-owned, not a device topic: the running state of the power-control
 # keep-alive, so an entity can expose it to dashboards and automations.
 SRC_KEEPALIVE: Final = "keepalive"
+# Protocol §32 「状态事件」.
+SRC_EVENT: Final = "event"
+
+# ---------------------------------------------------------------------------
+# System role (protocol §32 「状态事件」 -> ``role``)
+# ---------------------------------------------------------------------------
+# ``single``  - a stand-alone unit.  It owns the meter and the smart plug itself,
+#               so its ``system/*`` view is complete.
+# ``master``  - the head of a master/slave pair.  It reads the meter on behalf
+#               of the whole installation, so its ``system/*`` view is complete
+#               too and it looks exactly like a ``single`` unit to a card.
+# ``slave``   - a follower.  ``has_meter`` / ``has_plug`` / ``has_solar2`` are
+#               all ``false`` for it by definition (the protocol marks them
+#               「从机不支持」), the firmware publishes no usable ``sys_*``
+#               aggregates, and only its own ``device/*`` readings can be drawn.
+ROLE_SINGLE: Final = "single"
+ROLE_MASTER: Final = "master"
+ROLE_SLAVE: Final = "slave"
+ROLES: Final = (ROLE_SINGLE, ROLE_MASTER, ROLE_SLAVE)
+# Spellings seen in the field for the follower role.  The protocol guide says
+# ``slave``; at least one build publishes ``servant``.  Both are normalised to
+# ``ROLE_SLAVE`` in one place (``HoymilesCoordinator.role``) so no consumer ever
+# has to know about the alias.
+ROLE_ALIASES: Final = {"servant": ROLE_SLAVE}
 
 # ---------------------------------------------------------------------------
 # Device capabilities
@@ -175,84 +203,185 @@ SRC_KEEPALIVE: Final = "keepalive"
 #                  power_ctrl, output_power, reboot, factory_reset,
 #                  reset_ble_pin_code
 #
-# A capability is therefore "the firmware declared this topic" - everything the
-# inverter lacks (battery, packs, system level energy, TOU) falls out of that.
+# A capability is therefore "the firmware publishes this topic", established by
+# either of two witnesses - everything the inverter lacks (battery, packs,
+# system level energy, TOU) falls out of that:
+#
+#   declared  the retained ``attributes`` inventory, plus every discovery object
+#             the firmware publishes for itself (``discovery_override.py``)
+#   observed  a state topic that actually delivered a message (see
+#             ``SOURCE_CAPABILITY``)
+#
+# Both are retained on the broker, so an offline device keeps exactly the entity
+# set of its last connection.  No local persistence is needed: the broker is the
+# store.
 CAP_QUICK_STATE: Final = "quick_state"
 CAP_DEVICE_STATE: Final = "device_state"
 CAP_SYSTEM_STATE: Final = "system_state"
 CAP_ALARM_STATE: Final = "alarm_state"
+CAP_EVENT_STATE: Final = "event_state"
 CAP_TOU: Final = "tou_get"
 # Not a ``supported_topics`` entry: the multi phase output limit is only visible
 # as its own discovery object, so ``discovery_override.py`` reports it instead.
 CAP_PHASE_OUTPUT: Final = "phase_output_power"
 
-# Every capability a fully featured device offers.  Used as the default while
-# ``attributes`` has not been received yet, so an upgrade never removes entities
-# from a device that simply had not been heard from at that point.
-CAPABILITIES_ALL: Final = frozenset(
-    {
-        CAP_QUICK_STATE,
-        CAP_DEVICE_STATE,
-        CAP_SYSTEM_STATE,
-        CAP_ALARM_STATE,
-        CAP_TOU,
-    }
-)
+# Capabilities that only gate *commands*, never entity creation: the firmware
+# registers its own entities for them through MQTT discovery.  They still have
+# to be tracked, because publishing to a topic a device never announced looks
+# exactly like a successful call while nothing happens - see ``services.py``.
+#
+# The name is what both carriers use: the ``supported_topics`` key *and* the
+# discovery object name (``button/<dev_id>/reboot`` -> ``reboot``).
+CAP_SWITCH: Final = "switch_ctrl"
+CAP_EMS_MODE: Final = "ems_mode"
+CAP_POWER_CTRL: Final = "power_ctrl"
+CAP_OUTPUT_POWER: Final = "output_power"
+CAP_REBOOT: Final = "reboot"
+CAP_FACTORY_RESET: Final = "factory_reset"
+CAP_RESET_BLE_PIN: Final = "reset_ble_pin_code"
+CAP_TOU_DAY_PLAN: Final = "tou_day_plan"
+CAP_TOU_WEEK_PLAN: Final = "tou_week_plan"
+
+# The capability a received *state* topic proves.
+#
+# This is the second, independent half of the capability set.  The retained
+# ``attributes`` inventory is what the firmware *says* it implements; a message
+# that actually lands is what it *does*.  Recording both means
+#
+#   * a device whose inventory is missing from the broker still grows the
+#     entities for every topic it demonstrably publishes, and
+#   * a topic it never publishes is never assumed, so nothing extra appears on
+#     the page (the reported problem: a micro inverter that only talks MQTTS
+#     publishes a strictly smaller topic set, yet used to get the storage and
+#     TOU entities as well).
+#
+# Deliberately no default: an empty set means "nothing known", not "everything".
+SOURCE_CAPABILITY: Final = {
+    SRC_QUICK: CAP_QUICK_STATE,
+    SRC_DEVICE: CAP_DEVICE_STATE,
+    SRC_SYSTEM: CAP_SYSTEM_STATE,
+    SRC_ALARM: CAP_ALARM_STATE,
+    SRC_EVENT: CAP_EVENT_STATE,
+    SRC_TOU_STATUS: CAP_TOU,
+    SRC_TOU_DAY_ACK: CAP_TOU_DAY_PLAN,
+    SRC_TOU_WEEK_ACK: CAP_TOU_WEEK_PLAN,
+}
 
 # ---------------------------------------------------------------------------
 # PV input count
 # ---------------------------------------------------------------------------
-# The firmware's model string names a whole family ("HiFlow" covers both the
-# 1-input 1650 and the 1-input 4160), so it cannot tell a 2-input from a
-# 4-input unit.  The four digit SKU at the start of the serial can - and unlike
-# ``device/state["pv_num"]`` it is known *before* the first payload arrives,
-# which matters because entities are created during setup.
+# The four digits right after the client prefix are the **PID** - the firmware's
+# product identification number - and every discriminating decision is made on
+# them rather than on the prefix.
+#
+# The prefix in front of the serial (``RMI-``, ``MSA-``, ...) is a *user
+# setting*: it is the MQTT client prefix and the user may change it to anything.
+# So ``RMI-`` cannot be used to recognise a device, and neither can the firmware's
+# model string, which names a whole family ("HiFlow" covers both the 1-input 1650
+# and the 1-input 4160).  The PID is stable, is present in every spelling of the
+# serial, and - unlike ``device/state["pv_num"]`` - is known *before* the first
+# payload arrives, which matters because entities are created during setup.
 #
 # Mirrors ``IV_PV_COUNT_BY_CODE`` in ``www/hoymiles-g2-power-flow.js``; keep
 # both tables in sync (see ``docs/hoymiles_g2-hiflow.md``).
-PV_COUNT_BY_CODE: Final[dict[str, int]] = {
+PID_PV_COUNT: Final[dict[str, int]] = {
     "1650": 1,  # HiFlow, single input
     "4160": 1,  # HiFlow Pro 1-in-1
     "4161": 2,  # HiFlow Pro 2-in-1
     "4162": 4,  # HiFlow Pro 4-in-1
 }
-# Storage units (MSA-) do not publish a fixed port count in their serial; the
-# firmware reports ``pv_num`` instead.  Four is the documented maximum, so it is
-# used as the default whenever the count cannot be derived up front.
+# Every PID above is a grid-tied micro inverter.  Storage units carry a
+# different PID and are recognised by *not* being in this set - the firmware
+# reports their port count as ``pv_num`` instead.  ``2800`` is the only storage
+# PID seen in the field (``MSA-2800...``); a unit with an unlisted PID can still
+# be added by typing its serial, because the config flow accepts custom values.
+INVERTER_PIDS: Final[frozenset[str]] = frozenset(PID_PV_COUNT)
+STORAGE_PIDS: Final[frozenset[str]] = frozenset({"2800"})
+# What the config flow will offer on its own.  Deliberately a closed set: the
+# discovery wildcard also matches unrelated devices that publish under
+# ``homeassistant/``, and offering those would be noise in the picker.
+KNOWN_PIDS: Final[frozenset[str]] = INVERTER_PIDS | STORAGE_PIDS
+# Storage units do not publish a fixed port count in their serial; the firmware
+# reports ``pv_num`` instead.  Four is the documented maximum, so it is used as
+# the default whenever the count cannot be derived up front.
 PV_COUNT_MAX: Final = 4
+
+# Kept under its old name because the cards' JS mirrors this table and the docs
+# refer to it; it is the same mapping as :data:`PID_PV_COUNT`.
+PV_COUNT_BY_CODE: Final[dict[str, int]] = PID_PV_COUNT
+
+
+def serial_body(dev_id: str) -> str:
+    """Return the serial without its (user changeable) client prefix.
+
+    ``RMI-4161A0209FF6`` -> ``"4161A0209FF6"``, and a bare ``4161A0209FF6`` is
+    returned unchanged.  Splitting on ``-`` and keeping the last part survives
+    any prefix the user configures, including one that itself contains ``-``.
+    """
+    return dev_id.split("-")[-1].strip()
+
+
+def serial_pid(dev_id: str) -> str | None:
+    """Return the four digit product id at the start of the serial, if any.
+
+    ``RMI-4161A0209FF6`` -> ``"4161"`` and ``MSA-280024180016`` -> ``"2800"``.
+    The prefix plays no part: only the serial body is inspected.
+    """
+    digits = serial_body(dev_id)[:4]
+    if len(digits) != 4 or not digits.isdigit():
+        return None
+    return digits
+
+
+def is_inverter_dev_id(dev_id: str) -> bool:
+    """True when this serial belongs to a grid-tied micro inverter.
+
+    Recognition is by PID, so it works for any client prefix the user chooses.
+    A serial whose PID is unknown is treated as storage, which is the
+    conservative answer: storage layouts never draw a PV port the unit lacks.
+    """
+    pid = serial_pid(dev_id)
+    return pid is not None and pid in INVERTER_PIDS
 
 
 def pv_count_from_dev_id(dev_id: str) -> int | None:
     """Return how many PV inputs this unit has, or ``None`` when unknown.
 
     ``RMI-4161A0209FF6`` -> ``"4161"`` -> ``2``.  A serial that is not a known
-    SKU returns ``None`` so the caller can fall back to the firmware's own
-    ``pv_num`` or to the maximum.
+    inverter PID returns ``None`` so the caller can fall back to the firmware's
+    own ``pv_num`` or to the maximum.
     """
-    body = dev_id.split("-")[-1]
-    digits = "".join(ch for ch in body[:4] if ch.isdigit())
-    if len(digits) != 4:
+    pid = serial_pid(dev_id)
+    if pid is None:
         return None
-    return PV_COUNT_BY_CODE.get(digits)
+    return PID_PV_COUNT.get(pid)
 
 
 # ---------------------------------------------------------------------------
 # Product family
 # ---------------------------------------------------------------------------
-# The serial prefix names the product family: ``RMI-`` is the grid-tied micro
-# inverter line and ``MSA-`` the micro storage one.  Only a fallback - the
-# firmware's own discovery carries a precise model string (``HiFlow Pro``) which
-# the coordinator prefers when it can find one.
-MODEL_BY_PREFIX: Final[dict[str, str]] = {"RMI-": "HiFlow", "MSA-": "HiBattery"}
+# Only a fallback - the firmware's own discovery carries a precise model string
+# (``HiFlow Pro``) which the coordinator prefers when it can find one.
+#
+# This is keyed by **PID**, not by the serial prefix.  The prefix is a user
+# setting (see the PID block above), so ``MODEL_BY_PREFIX`` could only ever
+# recognise the default spelling; a device renamed to ``GARAGE-4161...`` would
+# have lost its model entirely.  ``inverter`` / ``storage`` are used because the
+# PID set only distinguishes those two families.
+MODEL_BY_FAMILY: Final[dict[str, str]] = {
+    "inverter": "HiFlow",
+    "storage": "HiBattery",
+}
 
 
 def model_from_dev_id(dev_id: str) -> str | None:
-    """Return the product family implied by the serial prefix, if known."""
-    upper = dev_id.upper()
-    for prefix, name in MODEL_BY_PREFIX.items():
-        if upper.startswith(prefix):
-            return name
-    return None
+    """Return the product family implied by the serial's PID, if known."""
+    pid = serial_pid(dev_id)
+    if pid is None:
+        # Unknown PID: the serial is not one we can classify, so claim nothing
+        # rather than guessing a family from a prefix the user controls.
+        return None
+    return MODEL_BY_FAMILY["inverter" if pid in INVERTER_PIDS else "storage"]
 
 # ---------------------------------------------------------------------------
 # Availability / staleness (protocol §22 pushes every 1 s, §23/§24 every 5 min)
@@ -266,7 +395,9 @@ AVAILABILITY_WATCHDOG_SECONDS: Final = 30
 EMS_MODE_ECHO_GUARD_SECONDS: Final = 30
 
 # A source is alive while its last message is younger than its window.
-# Event driven topics (TOU ack/status) are excluded on purpose.
+# Event driven topics (TOU ack/status, and ``event/state`` which is only pushed
+# on connect and on change) are excluded on purpose: giving them a window would
+# declare a healthy device offline the moment nothing changed for long enough.
 SOURCE_STALE_SECONDS: Final = {
     SRC_QUICK: 120,
     SRC_DEVICE: 660,
@@ -298,6 +429,195 @@ TOU_WEEK_ACK_STATUS: Final = {
     6: "tou_plan not set",
 }
 
+# ---------------------------------------------------------------------------
+# Alarms (protocol §27)
+# ---------------------------------------------------------------------------
+# ``alarm/state`` carries the complete list of alarms that have not ended yet:
+#
+#   {"alarm": [{"code": "141", "time": "26-01-01 20:20"}], "alarm_num": 1}
+#
+# Two things about it are easy to get wrong and are handled by the sensor:
+#
+#   - the topic is **not retained** and is only published when the list changes,
+#     so after a Home Assistant restart the entity has nothing to read until the
+#     next alarm fires - possibly for days;
+#   - the code arrives as a **string**, and the same number means different
+#     things on a storage unit and on a micro inverter.
+#
+# Only a micro inverter declares ``alarm_state`` in its ``supported_topics``
+# inventory (verified live on RMI-4161 and RMI-1650), so the inverter appendix
+# below is the one that applies.  A code that is not listed is shown as its raw
+# number rather than being dropped or guessed.
+ALARM_MAX: Final = 20
+
+ALARM_CODES: Final = {
+    121: "Over Temperature Protection",
+    123: "Standby Mode Enabled by Remote Control",
+    125: "Grid Configuration Parameter Error",
+    127: "Firmware Error",
+    128: "Hardware Configuration Information Error",
+    130: "Offline",
+    141: "Grid Overvoltage",
+    142: "Grid Overvoltage (10 Min Mean Value)",
+    143: "Grid Undervoltage",
+    144: "Grid Overfrequency",
+    145: "Grid Underfrequency",
+    146: "High RoCoF",
+    147: "No Voltage on Grid Port",
+    148: "Grid Disconnection",
+    149: "Island Detected",
+    151: "Severe Grid Wave Distortion",
+    181: "Abnormal Insulation Impedance",
+    183: "Abnormal Relay",
+    184: "Abnormal Input Paralleling Wiring",
+    205: "MPPT-A Input Overvoltage",
+    206: "MPPT-B Input Overvoltage",
+    207: "MPPT-A Input Undervoltage",
+    208: "MPPT-B Input Undervoltage",
+    209: "PV1 No Input",
+    210: "PV2 No Input",
+    211: "PV3 No Input",
+    212: "PV4 No Input",
+    213: "PV1 & PV2 Abnormal Wiring",
+    214: "PV3 & PV4 Abnormal Wiring",
+    215: "PV1 Input Overvoltage",
+    216: "PV1 Input Undervoltage",
+    217: "PV2 Input Overvoltage",
+    218: "PV2 Input Undervoltage",
+    219: "PV3 Input Overvoltage",
+    220: "PV3 Input Undervoltage",
+    221: "PV4 Input Overvoltage",
+    222: "PV4 Input Undervoltage",
+    229: "Relay Inner Side Overvoltage",
+    231: "PV1 Arcing Fault",
+    232: "PV2 Arcing Fault",
+    233: "PV3 Arcing Fault",
+    234: "PV4 Arcing Fault",
+    241: "PV Input Wiring Abnormality: PV1 Reverse Connection",
+    242: "PV Input Wiring Abnormality: PV2 Reverse Connection",
+    243: "PV Input Wiring Abnormality: Cross Connection Case 1",
+    244: "PV Input Wiring Abnormality: Cross Connection Case 2",
+    301: "Hardware Error Code 301",
+    302: "Hardware Error Code 302",
+    303: "Hardware Error Code 303",
+    304: "Hardware Error Code 304",
+    305: "Hardware Error Code 305",
+    306: "Hardware Error Code 306",
+    307: "Hardware Error Code 307",
+    308: "Hardware Error Code 308",
+    309: "Hardware Error Code 309",
+    310: "Hardware Error Code 310",
+    311: "Hardware Error Code 311",
+    312: "Hardware Error Code 312",
+    313: "Hardware Error Code 313",
+    314: "Hardware Error Code 314",
+    316: "BOOSTA Internal Short Circuit Failure",
+    317: "BOOSTB Internal Short Circuit Failure",
+    318: "BOOSTA Overcurrent Protection Failure",
+    319: "BOOSTB Overcurrent Protection Failure",
+    320: "BOOSTC Internal Short Circuit Failure",
+    321: "BOOSTD Internal Short Circuit Failure",
+    322: "BOOSTC Overcurrent Protection Failure",
+    323: "BOOSTD Overcurrent Protection Failure",
+    324: "Arcing Lock-Up",
+    413: "Software Version Mismatch",
+    414: "Abnormal Master-Slave System Configuration",
+    415: "Sys File Abnormal",
+}
+
+# The same table in Chinese, keyed by the same code.
+#
+# Kept as a parallel dict rather than as a ``{code: (en, zh)}`` mapping so the
+# English table above stays byte-identical to the protocol appendix - that is
+# the text support quotes back and the string a web search matches.  A code
+# missing here falls back to English alone, so a partially translated release
+# degrades to the old single-language list instead of printing an empty name.
+ALARM_CODES_ZH: Final = {
+    121: "过温保护",
+    123: "远程控制开启待机模式",
+    125: "电网配置参数错误",
+    127: "固件错误",
+    128: "硬件配置信息错误",
+    130: "离线",
+    141: "电网过压",
+    142: "电网过压（10 分钟平均值）",
+    143: "电网欠压",
+    144: "电网过频",
+    145: "电网欠频",
+    146: "频率变化率（RoCoF）超限",
+    147: "并网端口无电压",
+    148: "电网断开",
+    149: "检测到孤岛",
+    151: "电网波形严重畸变",
+    181: "绝缘阻抗异常",
+    183: "继电器异常",
+    184: "输入并联接线异常",
+    205: "MPPT-A 输入过压",
+    206: "MPPT-B 输入过压",
+    207: "MPPT-A 输入欠压",
+    208: "MPPT-B 输入欠压",
+    209: "PV1 无输入",
+    210: "PV2 无输入",
+    211: "PV3 无输入",
+    212: "PV4 无输入",
+    213: "PV1 与 PV2 接线异常",
+    214: "PV3 与 PV4 接线异常",
+    215: "PV1 输入过压",
+    216: "PV1 输入欠压",
+    217: "PV2 输入过压",
+    218: "PV2 输入欠压",
+    219: "PV3 输入过压",
+    220: "PV3 输入欠压",
+    221: "PV4 输入过压",
+    222: "PV4 输入欠压",
+    229: "继电器内侧过压",
+    231: "PV1 电弧故障",
+    232: "PV2 电弧故障",
+    233: "PV3 电弧故障",
+    234: "PV4 电弧故障",
+    241: "PV 输入接线异常：PV1 反接",
+    242: "PV 输入接线异常：PV2 反接",
+    243: "PV 输入接线异常：交叉接线情况 1",
+    244: "PV 输入接线异常：交叉接线情况 2",
+    301: "硬件错误码 301",
+    302: "硬件错误码 302",
+    303: "硬件错误码 303",
+    304: "硬件错误码 304",
+    305: "硬件错误码 305",
+    306: "硬件错误码 306",
+    307: "硬件错误码 307",
+    308: "硬件错误码 308",
+    309: "硬件错误码 309",
+    310: "硬件错误码 310",
+    311: "硬件错误码 311",
+    312: "硬件错误码 312",
+    313: "硬件错误码 313",
+    314: "硬件错误码 314",
+    316: "BOOSTA 内部短路故障",
+    317: "BOOSTB 内部短路故障",
+    318: "BOOSTA 过流保护故障",
+    319: "BOOSTB 过流保护故障",
+    320: "BOOSTC 内部短路故障",
+    321: "BOOSTD 内部短路故障",
+    322: "BOOSTC 过流保护故障",
+    323: "BOOSTD 过流保护故障",
+    324: "电弧锁定",
+    413: "软件版本不匹配",
+    414: "主从系统配置异常",
+    415: "系统文件异常",
+}
+
+# Codes the document describes as a family rather than as one number.  Each
+# entry carries both names, because the range and the single code are decoded by
+# the same two lookups in ``sensor.alarm_name`` / ``sensor.alarm_name_zh``.
+ALARM_CODE_RANGES: Final = (
+    (400, 409, "Smart Device Offline", "智能设备离线"),
+    (420, 429, "Sys Comm Abnormal", "系统通信异常"),
+    (1055, 1056, "Fan Abnormal", "风扇异常"),
+    (1511, 1520, "Sys Comm Abnormal", "系统通信异常"),
+    (2101, 2110, "Smart Device Offline", "智能设备离线"),
+)
+
 TOU_GET_STATUS: Final = {
     0: "success",
     1: "general error",
@@ -311,6 +631,11 @@ FRONTEND_URL: Final = "/hoymiles_g2_static"
 
 # Frontend assets bundled in ``www/`` and auto-injected as ES modules.
 # Add new cards here; ``__init__._async_register_frontend`` walks this tuple.
+#
+# ``I18N_CARD_FILENAME`` is first on purpose: it defines ``window.HoymilesG2I18n``
+# and every card below resolves its language through it, so the module must be
+# evaluated before the cards are defined.
+I18N_CARD_FILENAME: Final = "hoymiles-g2-i18n.js"
 CARD_FILENAME: Final = "hoymiles-g2-tou-editor.js"
 SANKEY_CARD_FILENAME: Final = "hoymiles-g2-energy-sankey.js"
 POWER_FLOW_CARD_FILENAME: Final = "hoymiles-g2-power-flow.js"
@@ -319,7 +644,11 @@ HISTORY_CHART_CARD_FILENAME: Final = "hoymiles-g2-history-chart.js"
 GAUGE_CARD_FILENAME: Final = "hoymiles-g2-gauge.js"
 CONTROL_CARD_FILENAME: Final = "hoymiles-g2-control.js"
 PACK_LIST_CARD_FILENAME: Final = "hoymiles-g2-pack-list.js"
+ALARM_CARD_FILENAME: Final = "hoymiles-g2-alarm.js"
+# The five opt-in curves of the Device view, switchable from that page itself.
+CHART_OPTIONS_CARD_FILENAME: Final = "hoymiles-g2-chart-options.js"
 FRONTEND_ASSETS: Final = (
+    I18N_CARD_FILENAME,
     CARD_FILENAME,
     SANKEY_CARD_FILENAME,
     POWER_FLOW_CARD_FILENAME,
@@ -328,6 +657,8 @@ FRONTEND_ASSETS: Final = (
     GAUGE_CARD_FILENAME,
     CONTROL_CARD_FILENAME,
     PACK_LIST_CARD_FILENAME,
+    ALARM_CARD_FILENAME,
+    CHART_OPTIONS_CARD_FILENAME,
 )
 
 CARD_URL: Final = f"{FRONTEND_URL}/{CARD_FILENAME}"

@@ -30,6 +30,23 @@ $slug = ($addons | ConvertFrom-Json).data.addons |
     Where-Object { $_.slug -match 'ssh' } | Select-Object -First 1 -ExpandProperty slug
 Ok "addon: $slug"
 
+# --- 2.5. snapshot existing authorized_keys ----------------------------------
+Step "reading current authorized_keys"
+$origKeys = @()
+try {
+    $optsJson = (curl.exe -s -H "Authorization: Bearer $env:HA_TOKEN" `
+        "http://$HA/api/hassio/addons/$slug/options") 2>$null
+    if ($optsJson) {
+        $optsData = ($optsJson | ConvertFrom-Json).data
+        $origKeys = @($optsData.options.authorized_keys)
+    }
+} catch { }
+if ($origKeys.Count -gt 0) {
+    Ok ("snapshot: " + $origKeys.Count + " key(s)")
+} else {
+    Ok "no existing keys (or unreadable)"
+}
+
 # --- 3. inject the key, restart, deploy, restore ----------------------------
 Step "injecting key"
 $body = @{ options = @{ authorized_keys = @($Pub) } } | ConvertTo-Json -Depth 5
@@ -59,8 +76,14 @@ Step "restarting Home Assistant core"
 ssh -F NUL -i $KEY -o StrictHostKeyChecking=no "root@$HA" "ha core restart" | Out-Null
 
 Step "restoring authorized_keys"
+$restoreKeys = $origKeys
+if ($restoreKeys.Count -eq 0) {
+    # Fall back to the known single admin key rather than wiping SSH access.
+    $restoreKeys = @("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFL8Obipx/jfJiLtOFU06P609C4dbRt5zFlkOvBi5kuu qiyang.lin@hoymiles.com")
+}
+$restoreBody = @{ options = @{ authorized_keys = @($restoreKeys) } } | ConvertTo-Json -Depth 5
 curl.exe -s -X POST -H "Authorization: Bearer $env:HA_TOKEN" `
-    -H "Content-Type: application/json" -d '{"options":{"authorized_keys":[]}}' `
+    -H "Content-Type: application/json" -d $restoreBody `
     "http://$HA/api/hassio/addons/$slug/options" | Out-Null
 
 Remove-Item $KEY, "$KEY.pub" -ErrorAction SilentlyContinue

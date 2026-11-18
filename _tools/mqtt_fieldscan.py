@@ -1,0 +1,36 @@
+"""Show one captured payload per device family and topic (read-only)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+HERE = Path(__file__).parent
+WANT = ("/quick/state", "/device/state", "/system/state", "/alarm/state", "/event/state")
+
+seen: dict[str, str] = {}
+for name in ("mqtt-FC22.jsonl", "mqtt-full.jsonl"):
+    path = HERE / name
+    if not path.exists():
+        continue
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        topic = obj.get("topic", "")
+        for suffix in WANT:
+            if topic.endswith(suffix):
+                parts = topic.split("/")
+                serial = parts[2] if len(parts) >= 4 else "?"
+                family = serial.split("-")[0] + suffix
+                seen.setdefault(family, obj.get("payload", ""))
+
+for key in sorted(seen):
+    payload = seen[key]
+    try:
+        fields = sorted(json.loads(payload))
+    except ValueError:
+        fields = ["<not json>"]
+    print(f"\n=== {key} ({len(fields)} fields) ===")
+    print(", ".join(fields)[:1200])

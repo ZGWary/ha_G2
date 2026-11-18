@@ -12,12 +12,24 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant.const import ATTR_DEVICE_ID
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 
 from . import mqtt_util
 from .const import (
+    CAP_EMS_MODE,
+    CAP_FACTORY_RESET,
+    CAP_OUTPUT_POWER,
+    CAP_PHASE_OUTPUT,
+    CAP_POWER_CTRL,
+    CAP_REBOOT,
+    CAP_RESET_BLE_PIN,
+    CAP_SWITCH,
+    CAP_TOU,
+    CAP_TOU_DAY_PLAN,
+    CAP_TOU_WEEK_PLAN,
     DOMAIN,
     PHASE_A,
     PHASE_B,
@@ -41,6 +53,7 @@ from .const import (
     TOU_SOC_MIN,
     TOU_TS_MAX,
     TOU_WEEKDAYS,
+    is_inverter_dev_id,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,6 +68,11 @@ SERVICE_SET_PHASE_OUTPUT_POWER = "set_phase_output_power"
 SERVICE_REBOOT = "reboot"
 SERVICE_START_POWER_CTRL_KEEPALIVE = "start_power_ctrl_keepalive"
 SERVICE_STOP_POWER_CTRL_KEEPALIVE = "stop_power_ctrl_keepalive"
+# The five opt-in curves of the Device view.  Two services because the switch
+# card needs the current state to render as well as a way to change it; the
+# Options Flow has a `hass` of its own and reads `lovelace` directly.
+SERVICE_GET_OPTIONAL_CHARTS = "get_optional_charts"
+SERVICE_SET_OPTIONAL_CHARTS = "set_optional_charts"
 
 DAY_PLAN_ITEM = vol.Schema(
     {
@@ -144,6 +162,19 @@ SCHEMA_START_POWER_CTRL_KEEPALIVE = vol.Schema(
 
 SCHEMA_STOP_POWER_CTRL_KEEPALIVE = vol.Schema({**DEVICE_FIELDS})
 
+# The five opt-in Device-view curves.  `charts` is a free ``{key: bool}`` object
+# rather than five named booleans, so adding a sixth chart does not change this
+# schema; unknown keys are ignored by the handler and the five known ones are
+# read with an explicit ``False`` default.
+SCHEMA_GET_OPTIONAL_CHARTS = vol.Schema({**DEVICE_FIELDS})
+
+SCHEMA_SET_OPTIONAL_CHARTS = vol.Schema(
+    {
+        **DEVICE_FIELDS,
+        vol.Required("charts"): dict,
+    }
+)
+
 _PHASE_POWER = vol.All(
     vol.Coerce(int), vol.Range(min=PHASE_POWER_MIN, max=PHASE_POWER_MAX)
 )
@@ -200,6 +231,33 @@ def _resolve_dev_id(hass: HomeAssistant, data: dict[str, Any]) -> str:
     raise vol.Invalid(f"device_id {device_id} does not belong to a Hoymiles entry")
 
 
+def _require_capability(hass: HomeAssistant, dev_id: str, capability: str) -> None:
+    """Refuse a command the device has never shown any sign of supporting.
+
+    Publishing to a topic the firmware does not subscribe to is indistinguishable
+    from success: the broker accepts it, nothing happens, and the caller has no
+    way to tell.  That is the other half of the reported problem - a device that
+    connects over MQTTS publishes a strictly smaller topic set, so the page must
+    not offer controls for those topics *and* the services must not silently
+    accept them.
+
+    Only a *known* capability set is enforced.  A device that has not been heard
+    from at all yet keeps the benefit of the doubt, otherwise a command issued
+    right after a Home Assistant restart would fail for no reason.
+    """
+    coordinator = _find_coordinator(hass, dev_id)
+    if coordinator is None or not coordinator.capabilities_known:
+        return
+    if coordinator.has_capability(capability):
+        return
+
+    raise HomeAssistantError(
+        f"{dev_id} does not publish the '{capability}' topic, so this command "
+        "would be ignored by the device. Known topics: "
+        f"{', '.join(sorted(coordinator.capabilities)) or 'none'}"
+    )
+
+
 async def async_setup_services(hass: HomeAssistant) -> None:
     """Register the integration services once."""
     domain_data = hass.data.setdefault(DOMAIN, {})
@@ -209,6 +267,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def _handle_set_tou_day_plan(call: ServiceCall) -> None:
         dev_id = _resolve_dev_id(hass, dict(call.data))
+        _require_capability(hass, dev_id, CAP_TOU_DAY_PLAN)
         payload = {
             "day_idx": int(call.data["day_idx"]),
             "day_plan": [
@@ -230,6 +289,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def _handle_set_tou_week_plan(call: ServiceCall) -> None:
         dev_id = _resolve_dev_id(hass, dict(call.data))
+        _require_capability(hass, dev_id, CAP_TOU_WEEK_PLAN)
         payload = {
             "week_plan": [
                 {
@@ -245,18 +305,21 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def _handle_get_tou_plan(call: ServiceCall) -> None:
         dev_id = _resolve_dev_id(hass, dict(call.data))
+        _require_capability(hass, dev_id, CAP_TOU)
         await mqtt_util.async_publish(
             hass, mqtt_util.topic(T_TOU_GET, dev_id), {"week": call.data["week"]}
         )
 
     async def _handle_set_ems_mode(call: ServiceCall) -> None:
         dev_id = _resolve_dev_id(hass, dict(call.data))
+        _require_capability(hass, dev_id, CAP_EMS_MODE)
         await mqtt_util.async_publish(
             hass, mqtt_util.topic(T_EMS_MODE_CMD, dev_id), str(call.data["mode"])
         )
 
     async def _handle_set_phase_output_power(call: ServiceCall) -> None:
         dev_id = _resolve_dev_id(hass, dict(call.data))
+        _require_capability(hass, dev_id, CAP_PHASE_OUTPUT)
         values = {
             PHASE_A: int(call.data[PHASE_A]),
             PHASE_B: int(call.data[PHASE_B]),
@@ -275,12 +338,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def _handle_reboot(call: ServiceCall) -> None:
         dev_id = _resolve_dev_id(hass, dict(call.data))
+        _require_capability(hass, dev_id, CAP_REBOOT)
         await mqtt_util.async_publish(
             hass, mqtt_util.topic(T_REBOOT, dev_id), "RESTART"
         )
 
     async def _handle_start_power_ctrl_keepalive(call: ServiceCall) -> None:
         dev_id = _resolve_dev_id(hass, dict(call.data))
+        _require_capability(hass, dev_id, CAP_POWER_CTRL)
         entry_data = _find_entry_data(hass, dev_id)
         if entry_data is None:
             raise vol.Invalid(f"Device {dev_id} is not loaded")
@@ -302,6 +367,39 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise vol.Invalid(f"Device {dev_id} has no power control keep-alive")
 
         await keepalive.async_stop()
+
+    async def _handle_get_optional_charts(call: ServiceCall) -> dict[str, Any]:
+        from . import lovelace  # noqa: PLC0415
+
+        dev_id = _resolve_dev_id(hass, dict(call.data))
+        if not is_inverter_dev_id(dev_id):
+            raise vol.Invalid(f"Device {dev_id} has no optional charts")
+
+        # ``{key: since}`` - the card only needs to know which keys are on, but
+        # the instant is handed out as well so a caller can show when a curve
+        # started.  The stored dashboard is the source of truth.
+        charts = await lovelace.async_get_optional_charts(hass, dev_id)
+        return {"dev_id": dev_id, "charts": dict(charts)}
+
+    async def _handle_set_optional_charts(call: ServiceCall) -> dict[str, Any]:
+        from . import lovelace  # noqa: PLC0415
+
+        dev_id = _resolve_dev_id(hass, dict(call.data))
+        if not is_inverter_dev_id(dev_id):
+            raise vol.Invalid(f"Device {dev_id} has no optional charts")
+
+        # Every key defaults to False, *not* to its current value: this service
+        # is a whole-state write (the card sends all five every time), and a
+        # default of "unchanged" would make it impossible to switch a chart
+        # off by leaving its key out.
+        charts = call.data.get("charts") or {}
+        wanted = {key: bool(charts.get(key)) for key in lovelace.OPTIONAL_CHARTS}
+
+        if not await lovelace.async_set_optional_charts(hass, dev_id, wanted):
+            raise HomeAssistantError(
+                f"The dashboard of {dev_id} could not be written"
+            )
+        return {"dev_id": dev_id, "charts": await lovelace.async_get_optional_charts(hass, dev_id)}
 
     hass.services.async_register(
         DOMAIN, SERVICE_SET_TOU_DAY_PLAN, _handle_set_tou_day_plan, SCHEMA_SET_TOU_DAY_PLAN
@@ -333,4 +431,18 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         SERVICE_STOP_POWER_CTRL_KEEPALIVE,
         _handle_stop_power_ctrl_keepalive,
         SCHEMA_STOP_POWER_CTRL_KEEPALIVE,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_OPTIONAL_CHARTS,
+        _handle_get_optional_charts,
+        SCHEMA_GET_OPTIONAL_CHARTS,
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_OPTIONAL_CHARTS,
+        _handle_set_optional_charts,
+        SCHEMA_SET_OPTIONAL_CHARTS,
+        supports_response=SupportsResponse.OPTIONAL,
     )

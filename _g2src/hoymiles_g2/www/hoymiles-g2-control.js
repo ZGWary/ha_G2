@@ -10,11 +10,28 @@
  *   §12 ems mode    homeassistant/select/<dev_id>/ems_mode/command    general |
  *                                                                     mqtt_ctrl |
  *                                                                     tou_plan
+ *                   Only the modes the firmware declares in the discovery
+ *                   payload are rendered as buttons - a micro inverter offers
+ *                   just `general` and `mqtt_ctrl`, so it shows no TOU button
+ *                   at all rather than a disabled one.
  *   §13 power ctrl  homeassistant/number/<dev_id>/power_ctrl/set      float (W)
  *   §14 output pwr  homeassistant/number/<dev_id>/output_power/set    int (W)
  *   §15 phase pwr   homeassistant/number/<dev_id>/phase_output_power/set
  *                   {"phase_a":..,"phase_b":..,"phase_c":..}
  *   §20 tou get     homeassistant/sensor/<dev_id>/tou_plan/get        {"week":..}
+ *                   Storage models only - a micro inverter declares no `tou_get`
+ *                   capability and publishes no `tou_*` topic.
+ *   §29 factory reset
+ *                   homeassistant/button/<dev_id>/factory_reset/trigger RESET
+ *                   Payload is fixed (`RESET`, qos 1, retain false). Declared by
+ *                   the HiFlow / HiFlow Pro inverters; erases the device's own
+ *                   configuration, so it asks for confirmation first.
+ *   §31 ble pin reset
+ *                   homeassistant/button/<dev_id>/reset_ble_pin_code/trigger
+ *                                                                     RESET
+ *                   Same shape and the same models as §29: payload fixed to
+ *                   `RESET`, qos 1, retain false. Only the Bluetooth pairing PIN
+ *                   is reset, the rest of the configuration is kept.
  *
  * Commands are published straight to those topics (qos 1, retain false), which
  * keeps the card working even when a discovery entity is missing or has a
@@ -28,10 +45,37 @@
  *   title: Device control
  *   show_phase: true            # optional, default true
  *   show_power_ctrl: true       # optional, default true
+ *   show_ems: true              # optional; the EMS mode row. Omitted, it shows
+ *                               # only while the unit is not a follower - the
+ *                               # document lists `ems_mode` under 「主机和单机」,
+ *                               # so a `slave` answers "not supported" to the
+ *                               # command and gets no row (see below).
+ *   show_tou: true              # optional; the TOU plan row. Omitted, it shows
+ *                               # only when the device actually publishes
+ *                               # `tou_plan_status` - a micro inverter has no
+ *                               # TOU feature at all, so it gets no row.
  *   show_log: true              # optional, default true; the MQTT log row
+ *   show_factory_reset: true    # optional; the factory-reset row. Omitted, it
+ *                               # follows the product id: protocol §29 declares
+ *                               # the command for HiFlow / HiFlow Pro only, so a
+ *                               # storage unit gets no row rather than a dead
+ *                               # button.
+ *   show_ble_pin_reset: true    # optional; the BLE PIN reset row (protocol
+ *                               # §31), decided the same way as the row above.
  *   show_topics: true           # optional, default false; show the MQTT topic
  *                               # of every row (engineering detail)
  *   subtitle: false             # optional; hide the grey line under the title
+ *
+ * Role gating (protocol §32 「状态事件」).  Once this unit's `system_role`
+ * sensor reads `slave`, every row whose command topic the document limits to
+ * 「主机和单机」 is dropped outright: EMS mode, the power-control lease, the
+ * output limit, the per-phase limit and the TOU plan.  A follower answers
+ * "not supported" to all of them, so the earlier behaviour - showing the whole
+ * panel with nothing behind it - was five dead controls in a row.  Everything
+ * marked 「不限」 stays: the power switch and its reboot / PIN / factory-reset
+ * buttons work on any role.  An unread role (`unknown`, or the topic not heard
+ * from yet) keeps every row, because "not heard yet" is not "follows a master"
+ * - and a hard `show_*` override cannot bring a slave's dead row back either.
  *
  * The layout follows the iOS settings idiom: small grey section headers, one
  * rounded group per section, rows of icon + name + right-aligned control, and
@@ -54,21 +98,33 @@ function _hmControlRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -77,33 +133,24 @@ function _hmControlRegister() {
    * dashboard keeps working) or a language map:
    *
    *   title:
-   *     en: Device control
-   *     zh: 设备控制
+   *     en: Battery packs
+   *     zh: 电池包
    *
    * That is what lets the text *you* write follow the UI language too, instead
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   const EMS_MODES = [
     { id: "general", en: "General", zh: "自发自用" },
     { id: "mqtt_ctrl", en: "MQTT ctrl", zh: "MQTT 功率控制" },
-    { id: "tou_plan", en: "TOU plan", zh: "分时计划" },
+    { id: "tou_plan", en: "TOU Plan", zh: "分时计划" },
   ];
   const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -122,6 +169,33 @@ function _hmControlRegister() {
    * it has several entities and a wrong pick would show - and send - the value
    * of a different setting. */
   const SINGLE_ENTITY_DOMAINS = ["select", "switch"];
+
+  /* Rated AC output of **one unit**, in watts, by product id.
+   *
+   * This is the only honest upper bound on a power set-point, and it cannot be
+   * read off the firmware.  Measured: `RMI-4161A0209FF6/power_ctrl/config`
+   * declares `min 0 / max 3000` while the *same* serial declares `0 / 1000`
+   * under the `MI-` prefix it used before - because a `master` publishes the
+   * **whole installation's** capability, and its `slave` adds the rest.  A
+   * unit that can physically produce 1000 W was therefore offered a 3000 W
+   * slider, and a `slave` that publishes no `power_ctrl` object at all fell
+   * back to whatever `output_power` happened to say.
+   *
+   * The product id (the four digits of the serial body, the same key the PV
+   * count uses) is the only stable answer.  Values measured off
+   * `output_power/config` while each unit ran stand-alone:
+   *
+   *   1650  HiFlow           800 W
+   *   4161  HiFlow Pro 2-in-1 1000 W
+   *   4162  HiFlow Pro 4-in-1 2000 W
+   *
+   * `4160` is deliberately absent: no unit was measured, and trusting the
+   * device's own declaration is better than inventing a number. */
+  const RATED_W_BY_PID = {
+    1650: 800,
+    4161: 1000,
+    4162: 2000,
+  };
 
   const PING_MS = 8000; // how long the "sent" confirmation stays visible
 
@@ -249,6 +323,215 @@ function _hmControlRegister() {
    * `innerHTML`). Lit templates escape their own bindings, so a `${...}` inside a
    * `html` template must keep the value raw. */
 
+  /* ------------------------------ icons ------------------------------
+   *
+   * The same 24-grid glyph set the vendor's own control card draws, so the
+   * Control tab and the app read as one product instead of emoji next to SVG.
+   * Every glyph is a function of a per-call id prefix `u`: two cards on one page
+   * would otherwise share gradient ids and the second one would paint the
+   * first one's colours.
+   *
+   * The colour vocabulary is the vendor's, and it is consistent across glyphs:
+   * amber is power, green is "in" / up, teal is a limit, indigo is sleep, slate
+   * is a neutral part (a battery shell, a ceiling bar).
+   *
+   * The first block is copied glyph for glyph from the official card; the second
+   * block adds the four rows this integration has and the official one does not
+   * (the re-send timer, the TOU plan, the BLE PIN and the log), drawn in the same
+   * language so they do not stand out as borrowed emoji. */
+  const ICON_SVG = {
+    /* ---- power: a filled amber bolt ---- */
+    bolt: (u) => `
+      <defs><linearGradient id="${u}b" x1=".15" y1="0" x2=".85" y2="1">
+        <stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#f59e0b"/>
+      </linearGradient></defs>
+      <path fill="url(#${u}b)"
+        d="M13.9 1.6 4.6 13.3a.7.7 0 0 0 .55 1.15h4.7l-1.4 7a.7.7 0 0 0 1.23.55
+           l9.4-11.7a.7.7 0 0 0-.55-1.15h-4.75l1.35-6.9a.7.7 0 0 0-1.23-.55z"/>`,
+
+    /* ---- EMS mode: three faders, one per control strategy ---- */
+    faders: (u) => `
+      <g stroke-linecap="round">
+        <path d="M5.4 4.4v15.2" stroke="#e2e8f0" stroke-width="2.5"/>
+        <path d="M12 4.4v15.2" stroke="#e2e8f0" stroke-width="2.5"/>
+        <path d="M18.6 4.4v15.2" stroke="#e2e8f0" stroke-width="2.5"/>
+      </g>
+      <circle cx="5.4" cy="14.2" r="3.25" fill="#ea580c"/>
+      <circle cx="5.4" cy="14.2" r="1.1" fill="#fff"/>
+      <circle cx="12" cy="9.1" r="3.25" fill="#16a34a"/>
+      <circle cx="12" cy="9.1" r="1.1" fill="#fff"/>
+      <circle cx="18.6" cy="16.4" r="3.25" fill="#2563eb"/>
+      <circle cx="18.6" cy="16.4" r="1.1" fill="#fff"/>`,
+
+    /* ---- power controls: a bolt above a fader ---- */
+    powerLimit: (u) => `
+      <defs><linearGradient id="${u}p" x1=".15" y1="0" x2=".85" y2="1">
+        <stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#f59e0b"/>
+      </linearGradient></defs>
+      <path fill="url(#${u}p)"
+        d="M12.6 1.7 6.4 8.9 H12.0 L11.4 13.7 17.6 6.5 H12.0 Z"/>
+      <path d="M4.4 19.4h15.2" stroke="#cbd5e1" stroke-width="2.4"
+        stroke-linecap="round"/>
+      <circle cx="14.9" cy="19.4" r="3.05" fill="#0d9488"/>
+      <circle cx="14.9" cy="19.4" r="1.05" fill="#fff"/>`,
+
+    /* ---- max output: an arrow rising until it meets a ceiling ---- */
+    ceiling: (u) => `
+      <defs><linearGradient id="${u}c" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#4ade80"/><stop offset="1" stop-color="#16a34a"/>
+      </linearGradient></defs>
+      <path d="M3.4 4.1h17.2" stroke="#0d9488" stroke-width="2.5"
+        stroke-linecap="round"/>
+      <path fill="url(#${u}c)"
+        d="M12 7 7.1 12.9h3.3v7.4h3.2v-7.4h3.3z"/>`,
+
+    /* ---- per-phase limit: three bars capped by one shared ceiling ---- */
+    phaseLimit: (u) => `
+      <path d="M3.4 4.1h17.2" stroke="#94a3b8" stroke-width="2.2"
+        stroke-linecap="round"/>
+      <g stroke-linecap="round">
+        <path d="M6.2 20V10.4" stroke="#ea580c" stroke-width="3.1"/>
+        <path d="M12 20V7.4" stroke="#16a34a" stroke-width="3.1"/>
+        <path d="M17.8 20V13.2" stroke="#2563eb" stroke-width="3.1"/>
+      </g>`,
+
+    /* ---- reboot: a teal circular arrow ---- */
+    reboot: (u) => `
+      <defs><linearGradient id="${u}r" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#0d9488"/>
+      </linearGradient></defs>
+      <path fill="none" stroke="url(#${u}r)" stroke-width="2.5" stroke-linecap="round"
+        d="M19.6 12a7.6 7.6 0 1 1-2.3-5.4"/>
+      <path fill="#0d9488" d="M13.4 4.1h6.2v6.2l-6.2-6.2z"/>`,
+
+    /* ---- sleep: an indigo crescent with a small star ---- */
+    moon: (u) => `
+      <defs><linearGradient id="${u}m" x1=".2" y1="0" x2=".85" y2="1">
+        <stop offset="0" stop-color="#a5b4fc"/><stop offset="1" stop-color="#4f46e5"/>
+      </linearGradient></defs>
+      <path fill="url(#${u}m)"
+        d="M20.1 14.6A9 9 0 0 1 9.3 3.8a9.15 9.15 0 1 0 10.8 10.8z"/>
+      <circle cx="17.4" cy="5.1" r="1.45" fill="#c7d2fe"/>
+      <circle cx="20.6" cy="8.6" r=".95" fill="#c7d2fe"/>`,
+
+    /* ---- target power: a battery beside an up / down arrow ---- */
+    target: (u) => `
+      <rect x="2.2" y="6.6" width="8.2" height="11.6" rx="1.9" fill="none"
+        stroke="#94a3b8" stroke-width="1.9"/>
+      <rect x="4.6" y="3.9" width="3.4" height="2.9" rx=".9" fill="#94a3b8"/>
+      <path d="M16.6 16.4V7.6" stroke="#94a3b8" stroke-width="2.2"
+        stroke-linecap="round"/>
+      <path fill="#16a34a" d="M16.6 2.9 12.3 8.2h8.6z"/>
+      <path fill="#ea580c" d="M16.6 21.1 12.3 15.8h8.6z"/>`,
+
+    /* ---- input limit: an arrow coming down onto a floor ---- */
+    plug: (u) => `
+      <defs><linearGradient id="${u}i" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#7dd3fc"/><stop offset="1" stop-color="#0284c7"/>
+      </linearGradient></defs>
+      <path d="M12 3.1v9.4" stroke="url(#${u}i)" stroke-width="2.6"
+        stroke-linecap="round"/>
+      <path fill="url(#${u}i)" d="M12 17.6 6.9 12.4h3.4V9.8h3.4v2.6h3.4z"/>
+      <path d="M4.1 20.6h15.8" stroke="#94a3b8" stroke-width="2.4"
+        stroke-linecap="round"/>`,
+
+    /* ---- heating: an amber flame ---- */
+    heat: (u) => `
+      <defs><linearGradient id="${u}h" x1=".2" y1="0" x2=".9" y2="1">
+        <stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#ea580c"/>
+      </linearGradient></defs>
+      <path fill="url(#${u}h)"
+        d="M12.6 2.4c3 3.4 5.6 6 5.6 9.4a6.2 6.2 0 1 1-12.4 0c0-2 .9-3.6 2.4-4.9.3 1.7 1.2 2.9 2.5 3.3-.6-2.7-.3-5 1.9-7.8z"/>
+      <path fill="#fde68a"
+        d="M12.1 12.4c1.4 1.5 2.4 2.6 2.4 4a2.6 2.6 0 1 1-5.2 0c0-1.4 1.4-2.7 2.8-4z"/>`,
+
+    /* ---- the card's own badge: a battery beside the two limit arrows ---- */
+    socBattery: (u) => `
+      <rect x="5.75" y="2.2" width="4.5" height="2.6" rx="1" fill="#94a3b8"/>
+      <rect x="2.4" y="4.6" width="11.2" height="16.2" rx="2.6" fill="none"
+        stroke="#94a3b8" stroke-width="1.7"/>
+      <rect x="4.7" y="15.9" width="6.6" height="3.9" rx="1.1" fill="#16a34a"/>
+      <rect x="4.7" y="11.5" width="6.6" height="3.9" rx="1.1" fill="#22c55e"/>
+      <rect x="4.7" y="7.1" width="6.6" height="3.9" rx="1.1" fill="#cbd5e1"/>
+      <path d="M19.3 10.9V6.4" stroke="#16a34a" stroke-width="1.9"
+        stroke-linecap="round"/>
+      <path fill="#16a34a" d="M19.3 3.4 16.6 7.4h5.4z"/>
+      <path d="M19.3 13.1v4.5" stroke="#f59e0b" stroke-width="1.9"
+        stroke-linecap="round"/>
+      <path fill="#f59e0b" d="M19.3 20.6 16.6 16.6h5.4z"/>`,
+
+    /* ---- cut-off SOC: the two batteries of the dual-handle slider ---- */
+    batteryOut: (u) => `
+      <rect x="9.7" y="2.4" width="4.6" height="2.8" rx="1.1" fill="#f59e0b"/>
+      <rect x="6.3" y="5" width="11.4" height="16.6" rx="2.8" fill="none"
+        stroke="#f59e0b" stroke-width="1.9"/>
+      <rect x="8.6" y="15.9" width="6.8" height="4" rx="1.1" fill="#f59e0b"/>`,
+
+    batteryIn: (u) => `
+      <rect x="9.7" y="2.4" width="4.6" height="2.8" rx="1.1" fill="#16a34a"/>
+      <rect x="6.3" y="5" width="11.4" height="16.6" rx="2.8" fill="none"
+        stroke="#16a34a" stroke-width="1.9"/>
+      <rect x="8.6" y="15.9" width="6.8" height="4" rx="1.1" fill="#16a34a"/>
+      <rect x="8.6" y="11.4" width="6.8" height="4" rx="1.1" fill="#16a34a"/>`,
+
+    /* ---- re-send timer: a clock, because the row is about *when* ----
+       Drawn as a bare ring rather than the usual ticked face: at 18 px the
+       hour marks turn into grit, and the two hands alone already say "time".
+       The green hand is the one that moves, the teal stub is the hub. */
+    timer: (u) => `
+      <path d="M9.2 2.7h5.6" stroke="#94a3b8" stroke-width="2"
+        stroke-linecap="round"/>
+      <circle cx="12" cy="13.1" r="7.9" fill="none" stroke="#94a3b8"
+        stroke-width="2"/>
+      <path d="M12 13.1V8.3" stroke="#16a34a" stroke-width="2.2"
+        stroke-linecap="round"/>
+      <path d="m12 13.1 4 2.9" stroke="#0d9488" stroke-width="2.2"
+        stroke-linecap="round"/>
+      <circle cx="12" cy="13.1" r="1.2" fill="#0d9488"/>`,
+
+    /* ---- TOU plan: a calendar with one filled day ---- */
+    schedule: (u) => `
+      <rect x="2.9" y="5.3" width="18.2" height="15.5" rx="2.8" fill="none"
+        stroke="#94a3b8" stroke-width="1.9"/>
+      <path d="M2.9 9.7h18.2" stroke="#94a3b8" stroke-width="1.9"/>
+      <path d="M7.7 3.1v3.7M16.3 3.1v3.7" stroke="#0d9488" stroke-width="2"
+        stroke-linecap="round"/>
+      <rect x="6.4" y="12.2" width="3.7" height="3.3" rx=".9" fill="#16a34a"/>
+      <rect x="13.9" y="12.2" width="3.7" height="3.3" rx=".9" fill="#cbd5e1"/>`,
+
+    /* ---- BLE PIN: a key, indigo to match the "credential" idea ---- */
+    pin: (u) => `
+      <circle cx="8.2" cy="15.7" r="4.4" fill="none" stroke="#6366f1"
+        stroke-width="2"/>
+      <path d="M11.4 12.5 20 3.9" stroke="#6366f1" stroke-width="2.2"
+        stroke-linecap="round"/>
+      <path d="m16.7 7.2 2.1 2.1M19 4.9l2.1 2.1" stroke="#6366f1" stroke-width="2"
+        stroke-linecap="round"/>`,
+
+    /* ---- factory reset: two counter-clockwise arrows, in warning orange ---- */
+    factory: (u) => `
+      <defs><linearGradient id="${u}f" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#fdba74"/><stop offset="1" stop-color="#ea580c"/>
+      </linearGradient></defs>
+      <path fill="none" stroke="url(#${u}f)" stroke-width="2.3" stroke-linecap="round"
+        d="M19.4 9.1A7.6 7.6 0 0 0 6.2 7.2"/>
+      <path fill="#ea580c" d="M5.1 3.3 6 8.9l5.4-2z"/>
+      <path fill="none" stroke="url(#${u}f)" stroke-width="2.3" stroke-linecap="round"
+        d="M4.6 14.9A7.6 7.6 0 0 0 17.8 16.8"/>
+      <path fill="#ea580c" d="M18.9 20.7 18 15.1l-5.4 2z"/>`,
+
+    /* ---- log: three slanted lines of text ---- */
+    log: (u) => `
+      <g stroke-linecap="round">
+        <path d="M3.8 6.2h11.6" stroke="#0d9488" stroke-width="2.1"/>
+        <path d="M3.8 11.7h16.4" stroke="#94a3b8" stroke-width="2.1"/>
+        <path d="M3.8 17.2h13.2" stroke="#94a3b8" stroke-width="2.1"/>
+      </g>
+      <circle cx="19.1" cy="6.2" r="1.5" fill="#16a34a"/>`,
+
+    dot: () => `<circle cx="12" cy="12" r="4" fill="currentColor"/>`,
+  };
+
   class HoymilesControl extends LitElement {
     static get properties() {
       return {
@@ -294,6 +577,10 @@ function _hmControlRegister() {
       this._switchPending = null;
       this._switchConfirmedAt = 0;
       this._pendingTimer = null;
+      /* When the EMS mode was last commanded from this card.  Needed because the
+         select's state topic is event driven and never echoes a command, so the
+         row has to trust the user's pick (see `_emsMode`). */
+      this._emsCommandAt = 0;
       /* MQTT log. The entries live in `_log` (the source of truth) and are
          appended to the DOM by hand - see `_syncLogDom` for why. */
       this._logOpen = false;
@@ -357,6 +644,12 @@ function _hmControlRegister() {
         }
         .item .ico { flex: 0 0 auto; width: 24px; text-align: center;
                      font-size: 16px; line-height: 1; }
+        /* The glyph set draws itself on a 24 grid, so the box is 24 px wide and
+           the SVG inside is centred on both axes; without the flex centring an
+           inline SVG sits on the text baseline and every icon rides too high. */
+        .item .ico .ic { display: inline-flex; align-items: center;
+                         justify-content: center; line-height: 1; color: inherit; }
+        .item .ico .ic svg { display: block; }
         .item .nm { flex: 1 1 auto; min-width: 0; font-size: 15px;
                     color: var(--primary-text-color); line-height: 1.3; }
         /* Row layout only: giving the label a real basis keeps it readable and
@@ -570,6 +863,7 @@ function _hmControlRegister() {
            restored switch / EMS command - they belonged to the previous unit. */
         delete this._optimistic.switch;
         delete this._optimistic.ems_mode;
+        this._emsCommandAt = 0;
       }
     }
 
@@ -590,6 +884,10 @@ function _hmControlRegister() {
 
     connectedCallback() {
       super.connectedCallback();
+      /* The toolbar language switch only writes localStorage and fires
+         `hoymiles-language`; it never touches `hass.language`, so the card has
+         to re-render itself when it changes. */
+      I18N.watch(this);
       /* Dashboards disconnect cards when a view is left; coming back with the
          log still switched on must resume the stream. The guard also keeps a
          re-connect from subscribing twice. */
@@ -597,6 +895,7 @@ function _hmControlRegister() {
     }
 
     disconnectedCallback() {
+      I18N.unwatch(this);
       super.disconnectedCallback();
       if (this._toastTimer) clearTimeout(this._toastTimer);
       if (this._pendingTimer) clearTimeout(this._pendingTimer);
@@ -613,13 +912,19 @@ function _hmControlRegister() {
 
     /* ----------------------------- lookups ----------------------------- */
 
+    /** One of the two strings the card carries, in the current language. */
     _t(en, zh) {
-      return hmLang(this._hass, this._config) === "zh" ? zh : en;
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
     }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
 
     _dev() {
@@ -649,17 +954,51 @@ function _hmControlRegister() {
       const overrides = this._config.entities || {};
       const claimed = new Set();
       for (const [other, entityId] of Object.entries(overrides)) {
-        if (other !== key && typeof entityId === "string" && entityId) {
-          claimed.add(entityId);
-        }
+        if (other === key) continue;
+        if (typeof entityId !== "string" || !entityId) continue;
+        // A pin that contradicts its own key (`_pinFits`) names the setting
+        // this call is looking for, so it must not reserve it.
+        if (!this._pinFits(other, entityId)) continue;
+        claimed.add(entityId);
       }
       claimed.delete(overrides[key]);
       return claimed;
     }
 
+    /* Is a pinned entity actually able to be `key`?
+     *
+     * Entity ids are slugified from the *name*, and the firmware names all
+     * three `number` entities after the device, so the base id `number.<dev>`
+     * is merely whichever one was created first: `output_power` on a two-input
+     * HiFlow Pro (declared `100 ~ 3000`), `power_ctrl` on a single-input
+     * HiFlow (declared `0 ~ 132`). A dashboard generated for one model and
+     * copied to the other therefore pins the *wrong* setting - measured, that
+     * made the power-control row offer `100 ~ 800` while the output-power row
+     * offered `0 ~ 132`, i.e. both rows showed each other's range.
+     *
+     * The declared floor separates the two on every model measured:
+     * `power_ctrl` can curtail to nothing (and below, on a storage unit), while
+     * `output_power` starts at the hardware minimum of 100 W. So a pin that
+     * contradicts its key is ignored and the resolution below decides. When the
+     * entity carries no declared `min` there is nothing to judge it by, and the
+     * config stays authoritative.
+     */
+    _pinFits(key, entityId) {
+      if (!entityId) return false;
+      if (key !== "power_ctrl" && key !== "output_power") return true;
+      const hass = this._hass;
+      const state = hass && hass.states ? hass.states[entityId] : null;
+      const declared = state && state.attributes ? state.attributes.min : null;
+      if (declared == null) return true;
+      const lo = num(declared);
+      return key === "power_ctrl" ? lo <= 0 : lo > 0;
+    }
+
     _resolve(key, domain = "number") {
       const overrides = this._config.entities || {};
-      if (overrides[key]) return overrides[key];
+      if (overrides[key] && this._pinFits(key, overrides[key])) {
+        return overrides[key];
+      }
 
       const hass = this._hass;
       if (!hass || !hass.states) return null;
@@ -710,6 +1049,34 @@ function _hmControlRegister() {
         }
       }
 
+      /* The discovery object's own `name` reaches the frontend even when the
+       * entity id does not: `hass.entities[id].name` is what the firmware
+       * published ("Factory Reset", "Reset BLE PIN Code", "Power Control"),
+       * while the entity id collapses to `button.<dev>`, `button.<dev>_2`, ...
+       * because the discovery payload names every object after the device.
+       * `normKey` folds `ctrl` into `control`, so "Power Control" and
+       * `power_ctrl` compare equal.
+       *
+       * This is what makes the three maintenance buttons resolvable at all:
+       * unlike the numbers they have no declared range to separate them and no
+       * telling id tail, so without the published name `factory_reset` and
+       * `reboot` are indistinguishable - which used to hide both rows even
+       * though the device really did publish both /config topics. */
+      if (!found) {
+        const wanted = normKey(key);
+        const byName = this._deviceEntityIds(domain).filter((entityId) => {
+          if (claimed.has(entityId)) return false;
+          const entry = hass.entities ? hass.entities[entityId] : null;
+          const name = entry && entry.name;
+          return !!name && normKey(name) === wanted;
+        });
+        if (byName.length === 1) [found] = byName;
+        else if (byName.length > 1) {
+          byName.sort((a, b) => a.length - b.length || a.localeCompare(b));
+          [found] = byName;
+        }
+      }
+
       // The firmware's own number entities are unhelpfully named: the MQTT
       // discovery topics carry the object id (power_ctrl / output_power /
       // phase_output_power) but HA names all three after the device, so their
@@ -753,6 +1120,15 @@ function _hmControlRegister() {
             const value = state && state.attributes ? state.attributes.min : null;
             return value == null ? null : num(value);
           };
+          /* Does the firmware's own declared floor prove this entity is the
+           * *other* setting? `power_ctrl` can curtail to nothing, `output_power`
+           * starts at the hardware minimum of 100 W. Returns false when there is
+           * no declared `min` to judge by, so an unknown range never vetoes. */
+          const contradicted = (entityId) => {
+            const lo = declaredMin(entityId);
+            if (lo == null || !Number.isFinite(lo)) return false;
+            return key === "power_ctrl" ? lo > 0 : lo <= 0;
+          };
           let picked = null;
           if (key === "power_ctrl") {
             // `min <= 0` is `power_ctrl` and nothing else.
@@ -770,7 +1146,16 @@ function _hmControlRegister() {
             });
             if (ratedFloor.length === 1) [picked] = ratedFloor;
           }
-          if (!picked && numbered[index]) picked = numbered[index];
+          /* The index is only trustworthy when the declared ranges cannot
+           * separate the two settings at all. Falling back to it regardless is
+           * how a device that retained **only** `output_power/config` still got
+           * a power-control row: its single `number` entity occupies slot 0, and
+           * slot 0 is `power_ctrl`. A candidate the firmware positively
+           * contradicts is the other setting, so no row at all is the honest
+           * answer - better than a slider that silently writes the wrong topic. */
+          if (!picked && numbered[index] && !contradicted(numbered[index])) {
+            picked = numbered[index];
+          }
           if (picked) found = picked;
         }
       }
@@ -840,6 +1225,30 @@ function _hmControlRegister() {
       return this._resolve(key, domain) != null;
     }
 
+    /** This unit's role in the installation: `single` / `master` / `slave`.
+     *
+     * Protocol §32 `event/state` is the only carrier of the role, and the
+     * integration mirrors it as the `system_role` sensor (see `_role_value()` in
+     * `sensor.py`, which already normalises the `servant` spelling).  Reading it
+     * from the state machine rather than from the attributes of that sensor's
+     * payload means the value is available on any dashboard the card is placed
+     * on, not just on the generated one.
+     *
+     * `null` means "not known": the topic has not arrived yet, the sensor is
+     * `unknown`, or its state is a spelling this card does not recognise.  Every
+     * caller treats that as "do not hide anything", so a slow MQTT connect can
+     * never blank the panel out.
+     */
+    _role() {
+      const state = this._state("system_role", "sensor");
+      if (!state) return null;
+      const value = String(state.state).trim().toLowerCase();
+      if (value === "servant") return "slave";
+      return value === "single" || value === "master" || value === "slave"
+        ? value
+        : null;
+    }
+
     /** Entity ids the registry attributes to *this* device.
      *
      * `hass.entities` does expose `device_id`, and `hass.devices` carries the
@@ -854,22 +1263,32 @@ function _hmControlRegister() {
       const hass = this._hass;
       if (!hass || !hass.entities || !hass.devices) return [];
 
-      const wanted = String(this._dev()).toLowerCase();
-      let deviceId = null;
+      /* One unit, two devices. This integration registers
+       * `hoymiles_g2` -> `RMI-4161A0209FF6`; MQTT discovery registers
+       * `mqtt` -> `4161A0209FF6` (no model prefix) for the same serial. The
+       * control objects - switch, select, number, button - arrive over MQTT
+       * discovery, so they hang off the *second* device. Looking only at the
+       * first matched a device with no control entities at all and scoped every
+       * name lookup to an empty set, which is why the reboot / factory-reset
+       * rows stayed hidden while the device really had published them. */
+      const dev = String(this._dev()).toLowerCase();
+      const bare = dev.replace(/^[a-z]{1,3}-/, "");
+      const deviceIds = new Set();
       for (const [id, device] of Object.entries(hass.devices)) {
         const ids = (device && device.identifiers) || [];
         for (const pair of ids) {
           if (!Array.isArray(pair) || pair.length < 2) continue;
-          if (String(pair[0]).toLowerCase() !== "hoymiles_g2") continue;
-          if (String(pair[1]).toLowerCase() === wanted) { deviceId = id; break; }
+          const scope = String(pair[0]).toLowerCase();
+          if (scope !== "hoymiles_g2" && scope !== "mqtt") continue;
+          const value = String(pair[1]).toLowerCase();
+          if (value === dev || value === bare) { deviceIds.add(id); break; }
         }
-        if (deviceId) break;
       }
-      if (!deviceId) return [];
+      if (!deviceIds.size) return [];
 
       const out = [];
       for (const [entityId, entry] of Object.entries(hass.entities)) {
-        if (!entry || entry.device_id !== deviceId) continue;
+        if (!entry || !deviceIds.has(entry.device_id)) continue;
         if (domain && !entityId.startsWith(`${domain}.`)) continue;
         if (!hass.states || !hass.states[entityId]) continue;
         out.push(entityId);
@@ -913,8 +1332,7 @@ function _hmControlRegister() {
       };
       const pcPick = pick(pc, saved.power_ctrl);
       if (pcPick) {
-        const b = this._bounds("power_ctrl", -1000, 1000);
-        const { lo, hi } = this._powerRange(b.lo, b.hi);
+        const { lo, hi } = this._powerRange();
         this._powerCtrl = String(this._clamp(pcPick.value, lo, hi));
         any = true;
       }
@@ -935,8 +1353,7 @@ function _hmControlRegister() {
          slider empty made the row read "0 W" on a unit that was producing, and
          it is never a value anyone wants to keep. */
       if (!pcPick && opPick) {
-        const b = this._bounds("power_ctrl", -1000, 1000);
-        const { lo, hi } = this._powerRange(b.lo, b.hi);
+        const { lo, hi } = this._powerRange();
         this._powerCtrl = String(this._clamp(opPick.value, lo, hi));
       }
       const phases = ["a", "b", "c"];
@@ -962,6 +1379,10 @@ function _hmControlRegister() {
       }
       if (saved.ems_mode) {
         this._optimistic.ems_mode = saved.ems_mode;
+        /* The remembered record carries the moment it was written; without it a
+           reload would make our own pick look eternally fresher than the
+           device's reports and the row would stop following the hardware. */
+        this._emsCommandAt = Number(this._remembered().at) || 0;
         any = true;
       }
       if (Number.isFinite(saved.timer_period)) {
@@ -1173,31 +1594,89 @@ function _hmControlRegister() {
       };
     }
 
-    _isSwitchOn() {
-      return this._switchView().on;
-    }
-
     _setEmsMode(mode) {
       this._optimistic.ems_mode = mode;
+      this._emsCommandAt = this._now();
       this._remember({ ems_mode: mode });
+      /* Repaint now: the row must show the new selection on the click itself and
+         not wait for the next state push to arrive. */
+      this.requestUpdate();
       /* Leaving mqtt_ctrl makes the lease meaningless: the firmware ignores
          `power_ctrl` in every other mode, so re-sending it would only add
          broker traffic. The switch reflects that instead of staying on while
          doing nothing. */
       if (mode !== "mqtt_ctrl" && this._timerOn) this._setTimer(false);
       this._publish(this._topic("select/<dev_id>/ems_mode/command"), mode,
-        `${this._t("EMS mode", "EMS 模式")} → ${mode}`);
+        `${this._t("EMS Mode", "EMS 模式")} → ${mode}`);
     }
 
+    /** The mode the device itself reports, or "" when it is not known.
+     *
+     * Kept apart from `_emsMode()` because the two answer different questions:
+     * the select tells you what was *asked for*, this tells you what the
+     * hardware is *doing*.  `sensor.<dev>_ems_mode_(device)` is the
+     * integration's own sensor, fed from the device's `device/state` /
+     * `system/state` report - the only place the true current mode exists.
+     */
+    _emsDeviceMode() {
+      /* Two names for one thing: `sensor.py` calls the key `ems_mode_running`
+         but names the entity "EMS Mode (Device)", so the entity id ends in
+         `_ems_mode_device`. Both are tried because `_resolve` matches on
+         normalised tails and only one of them will ever line up. */
+      const state = this._state("ems_mode_device", "sensor")
+        || this._state("ems_mode_running", "sensor");
+      return state ? String(state.state) : "";
+    }
+
+    /**
+     * The mode the EMS row highlights, and the one the power rows gate on.
+     *
+     * A command sent from this card wins over the entity, because the select is
+     * not a reliable echo. The firmware publishes its state on an **event**
+     * topic (`homeassistant/sensor/<dev>/event/state`); it only changes when the
+     * device decides to, and it never reflects a command that was just sent.
+     * The integration used to rewrite that topic to its own and echo every
+     * command onto it, which is why clicking used to work; a firmware update
+     * added a `value_template`, and `discovery_override` deliberately leaves
+     * such a payload alone, so the echo is gone.
+     *
+     * Without this override the row snapped back to the old mode the instant it
+     * re-rendered, and every gated control (power control, re-send timer) stayed
+     * disabled - a select that ignores its own input looks broken, whatever the
+     * device is doing.
+     *
+     * The device still gets the last word: when it reports a *different* mode
+     * after the command was sent, that report is newer than our request and is
+     * what the row shows.
+     */
     _emsMode() {
       const state = this._state("ems_mode", "select");
-      return (state ? String(state.state) : null) || this._optimistic.ems_mode || "";
+      const reported = state ? String(state.state) : "";
+      const mine = this._optimistic.ems_mode || "";
+      if (!mine) return reported;
+      if (!reported || reported === mine) return mine;
+      const changedAt = state && state.last_changed
+        ? Date.parse(state.last_changed)
+        : NaN;
+      if (
+        Number.isFinite(changedAt)
+        && this._emsCommandAt > 0
+        && changedAt > this._emsCommandAt
+      ) {
+        return reported;
+      }
+      return mine;
     }
 
     _emsOptions() {
       const options = this._attr("ems_mode", "select", "options");
       if (Array.isArray(options) && options.length) return options;
-      return EMS_MODES.map((m) => m.id);
+      /* No discovery payload to read.  Returning every known mode would put the
+       * TOU button back on a device that has no such feature, so the fallback is
+       * the two modes every firmware in this family implements.  `_emsItem()`
+       * drops `tou_plan` even when the declared list above does contain it, so
+       * both paths agree. */
+      return EMS_MODES.filter((m) => m.id !== "tou_plan").map((m) => m.id);
     }
 
     _sendPowerCtrl(opts) {
@@ -1224,7 +1703,7 @@ function _hmControlRegister() {
         return;
       }
       this._publish(this._topic("number/<dev_id>/power_ctrl/set"), String(value),
-        `${this._t("Power control", "功率控制")} ${value} W`, opts);
+        `${this._t("Power Control", "功率控制")} ${value} W`, opts);
     }
 
     /* ---------------------------- re-send timer ---------------------------- */
@@ -1451,7 +1930,7 @@ function _hmControlRegister() {
       if (value === null) { this._showToast(this._t("Invalid value", "数值无效"), true); return; }
       this._remember({ output_power: value });
       this._publish(this._topic("number/<dev_id>/output_power/set"), String(value),
-        `${this._t("Output power", "输出功率")} ${value} W`);
+        `${this._t("Output Power", "输出功率")} ${value} W`);
     }
 
     /**
@@ -1481,12 +1960,12 @@ function _hmControlRegister() {
       const payload = { phase_a: parts[0], phase_b: parts[1], phase_c: parts[2] };
       this._remember({ phase: { a: payload.phase_a, b: payload.phase_b, c: payload.phase_c } });
       this._publish(this._topic("number/<dev_id>/phase_output_power/set"), payload,
-        `${this._t("Phase output", "多相输出")} ${payload.phase_a}/${payload.phase_b}/${payload.phase_c} W`);
+        `${this._t("Phase Output", "多相输出")} ${payload.phase_a}/${payload.phase_b}/${payload.phase_c} W`);
     }
 
     _sendTouGet() {
       this._publish(this._topic("sensor/<dev_id>/tou_plan/get"), { week: this._week },
-        `${this._t("Get TOU plan", "获取 TOU 计划")} ${this._week}`);
+        `${this._t("Get TOU Plan", "获取 TOU 计划")} ${this._week}`);
     }
 
     _reboot() {
@@ -1496,6 +1975,35 @@ function _hmControlRegister() {
       if (!ok) return;
       this._publish(this._topic("button/<dev_id>/reboot/trigger"), "RESTART",
         this._t("Reboot", "重启"));
+    }
+
+    /* Protocol §31. Same fixed `RESET` payload as §29 but a far smaller blast
+       radius: only the Bluetooth pairing PIN goes back to its default, the rest
+       of the configuration survives. A confirmation is still worth it - the PIN
+       is what a phone app needs to pair again - but the wording can be plain. */
+    _resetBlePin() {
+      const ok = window.confirm(this._t(
+        "Reset the Bluetooth PIN to its default? The device keeps the rest of its configuration.",
+        "确认重置蓝牙 PIN 码？设备其它配置会保留。",
+      ));
+      if (!ok) return;
+      this._publish(this._topic("button/<dev_id>/reset_ble_pin_code/trigger"), "RESET",
+        this._t("Reset BLE PIN", "重置蓝牙 PIN"));
+    }
+
+    /* Protocol §29. The payload is a fixed `RESET` - the firmware accepts nothing
+       else - and the device drops every setting it was given, including the MQTT
+       client prefix, so a stray click costs a re-provisioning session. Hence the
+       confirmation, and the slightly fuller wording than the reboot prompt. */
+    _factoryReset() {
+      const ok = window.confirm(this._t(
+        "Restore the device to its factory settings? This erases its whole configuration,"
+          + " including the MQTT prefix.",
+        "确认恢复出厂设置？设备上的全部配置（含 MQTT 前缀）都会被清除。",
+      ));
+      if (!ok) return;
+      this._publish(this._topic("button/<dev_id>/factory_reset/trigger"), "RESET",
+        this._t("Factory Reset", "恢复出厂"));
     }
 
     /* ------------------------------- log ------------------------------- */
@@ -1616,10 +2124,10 @@ function _hmControlRegister() {
       const dir = document.createElement("span");
       dir.className = `log-dir${entry.retain ? " retained" : ""}`;
       dir.textContent = entry.retain
-        ? this._t("retained · cached", "缓存（非实时）")
+        ? this._t("Retained · Cached", "缓存（非实时）")
         : entry.down
-          ? this._t("HA → device", "HA 下发")
-          : this._t("device → HA", "设备上报");
+          ? this._t("HA → Device", "HA 下发")
+          : this._t("Device → HA", "设备上报");
       if (entry.retain) {
         dir.title = this._t(
           "Retained message: the broker replayed its last stored copy when the log opened."
@@ -1833,12 +2341,44 @@ function _hmControlRegister() {
       // A missing entity means the device does not implement that feature, so
       // the row is dropped rather than shown as a control that does nothing.
       // The explicit `show_*` config still wins, for users who want it back.
-      const showPhase = this._config.show_phase !== undefined
+      //
+      // The role is the second, harder gate.  Protocol §32 is the only place the
+      // firmware says whether this unit heads an installation or follows one,
+      // and a follower answers "not supported" to every 「主机和单机」 command:
+      // `ems_mode`, `power_ctrl`, `output_power`, `phase_output_power` and the
+      // whole `tou_*` family.  Rendering those rows on a slave was the reported
+      // problem - a full panel of controls that the device refuses.  An unknown
+      // role keeps every row, so a unit whose `event/state` has not arrived yet
+      // is never stripped down to the power switch.
+      const slave = this._role() === "slave";
+      const showPhase = !slave && (this._config.show_phase !== undefined
         ? this._config.show_phase !== false
-        : this._hasEntity("phase_a_output_power", "number");
-      const showPowerCtrl = this._config.show_power_ctrl !== false;
-      const showTou = this._hasEntity("tou_plan_status", "sensor");
+        : this._hasEntity("phase_a_output_power", "number"));
+      const showPowerCtrl = !slave && (this._config.show_power_ctrl !== undefined
+        ? this._config.show_power_ctrl !== false
+        : this._hasEntity("power_ctrl", "number"));
+      const showEms = !slave && (this._config.show_ems !== undefined
+        ? this._config.show_ems !== false
+        : this._hasEntity("ems_mode", "select"));
+      const showOutput = !slave && (this._config.show_output !== undefined
+        ? this._config.show_output !== false
+        : this._hasEntity("output_power", "number"));
+      const showTou = !slave && (this._config.show_tou !== undefined
+        ? this._config.show_tou !== false
+        : this._hasEntity("tou_plan_status", "sensor"));
       const showLog = this._config.show_log !== false;
+      const showFactoryReset = this._config.show_factory_reset !== undefined
+        ? this._config.show_factory_reset !== false
+        : this._hasEntity("factory_reset", "button");
+      const showBlePinReset = this._config.show_ble_pin_reset !== undefined
+        ? this._config.show_ble_pin_reset !== false
+        : this._hasEntity("reset_ble_pin_code", "button");
+      const showReboot = this._config.show_reboot !== undefined
+        ? this._config.show_reboot !== false
+        : this._hasEntity("reboot", "button");
+      const showSwitch = this._config.show_switch !== undefined
+        ? this._config.show_switch !== false
+        : this._hasEntity("switch", "switch");
 
       return html`
         <ha-card>
@@ -1850,19 +2390,21 @@ function _hmControlRegister() {
                 "指令直接下发到设备",
               )}</div>`}
           </div>
-          ${this._group(this._t("Power & mode", "电源与模式"), [
-            this._switchItem(),
-            this._emsItem(),
+          ${this._group(this._t("Power & Mode", "电源与模式"), [
+            showSwitch ? this._switchItem() : "",
+            showEms ? this._emsItem() : "",
           ])}
-          ${this._group(this._t("Power settings", "功率设置"), [
+          ${this._group(this._t("Power Settings", "功率设置"), [
             showPowerCtrl ? this._powerCtrlItem() : "",
             showPowerCtrl ? this._timerItem() : "",
-            this._outputItem(),
+            showOutput ? this._outputItem() : "",
             showPhase ? this._phaseItem() : "",
           ])}
-          ${this._group(this._t("Plan & maintenance", "计划与维护"), [
+          ${this._group(this._t("Plan & Maintenance", "计划与维护"), [
             showTou ? this._touItem() : "",
-            this._rebootItem(),
+            showReboot ? this._rebootItem() : "",
+            showBlePinReset ? this._blePinResetItem() : "",
+            showFactoryReset ? this._factoryResetItem() : "",
             showLog ? html`${this._logItem()}${this._logOpen ? this._logPanel() : ""}` : "",
           ])}
           ${this._toast === "" ? "" : html`
@@ -1871,13 +2413,41 @@ function _hmControlRegister() {
       `;
     }
 
-    /** One grouped block, like an iOS settings section. */
+    /** One grouped block, like an iOS settings section.
+     *
+     * A group whose every row was dropped draws nothing at all.  The role gate
+     * above can empty a whole group - a follower has no "Power Settings" left -
+     * and an empty rounded box with its header still in place reads as a broken
+     * card rather than as "this unit has no such feature".
+     */
     _group(title, items) {
+      const rows = (items || []).filter(
+        (item) => item !== "" && item !== null && item !== undefined,
+      );
+      if (!rows.length) return "";
       return html`
         <div class="group-wrapper">
           ${title ? html`<div class="group-title">${title}</div>` : ""}
-          <div class="group">${items}</div>
+          <div class="group">${rows}</div>
         </div>`;
+    }
+
+    /**
+     * One icon from the set above, as an SVG element.
+     *
+     * Built as a string and injected with `_untrusted()` on purpose: a nested
+     * lit template would parse its `<path>` in the HTML namespace and paint
+     * nothing at all. The id prefix is per call so two cards on one page never
+     * share a gradient id.
+     */
+    _icon(name, size = 18) {
+      const build = ICON_SVG[name] || ICON_SVG.dot;
+      const uid = "hmci" + (this._iconSeq = (this._iconSeq || 0) + 1) + "-";
+      /* fill="none" on the root: the shapes that need a fill set it themselves,
+         and the stroke-only ones must not inherit the default black. */
+      const svg = `<svg viewBox="0 0 24 24" width="${size}" height="${size}"
+        fill="none" aria-hidden="true" focusable="false">${build(uid)}</svg>`;
+      return html`<span class="ic">${this._untrusted(svg)}</span>`;
     }
 
     /**
@@ -1956,7 +2526,7 @@ function _hmControlRegister() {
             @input=${(e) => onInput(e.target.value)} />
           <input type="number" min=${lo} max=${hi} step=${step}
             .value=${shown}
-            placeholder=${this._t("not set", "未设置")}
+            placeholder=${this._t("Not set", "未设置")}
             ?disabled=${disabled}
             @input=${(e) => onInput(e.target.value)}
             @change=${(e) => {
@@ -2046,11 +2616,11 @@ function _hmControlRegister() {
               view.on ? "已开机 ✓" : "已关机 ✓",
             )
             : view.on
-              ? this._t("running", "运行中")
-              : this._t("standby", "已休眠");
+              ? this._t("Running", "运行中")
+              : this._t("Standby", "已休眠");
       const subClass = view.pending ? "busy" : view.confirmed ? "done" : "";
       return this._item({
-        icon: "⚡",
+        icon: this._icon("bolt"),
         name: this._t("Power", "设备开关"),
         sub,
         subClass,
@@ -2071,81 +2641,130 @@ function _hmControlRegister() {
     _emsItem() {
       const current = this._emsMode();
       const supported = this._emsOptions();
-      const options = EMS_MODES.map((mode) => ({
-        id: mode.id,
-        label: this._t(mode.en, mode.zh),
-        enabled: supported.includes(mode.id),
-        title: supported.includes(mode.id)
-          ? mode.id
-          : this._t(
-            "This mode is not offered by the device's firmware.",
-            "该设备固件未提供此模式。",
-          ),
-      }));
+      /* Only the modes the firmware actually offers are rendered.  Drawing an
+       * unsupported mode as a greyed-out button was tried and is wrong: a micro
+       * inverter's `ems_mode` discovery payload declares just
+       * `["general", "mqtt_ctrl"]`, so it grew a permanently disabled
+       * "分时计划 / TOU plan" button next to two working ones - a control the
+       * user can see, cannot press, and has no way to remove.  A feature the
+       * hardware does not have should not appear at all.
+       *
+       * `tou_plan` is never offered from this row, whatever the firmware
+       * declares and whatever mode the device currently reports.  The plan has
+       * its own editor further down this card (and its own `tou_plan/status`
+       * reply), so a third button here only duplicated the entry point and, on
+       * units whose select does advertise `tou_plan`, it kept coming back.
+       *
+       * The current mode is kept even when the firmware does not list it: the
+       * state topic can report a mode the device was switched to by other
+       * means, and hiding the active option would leave the row with no
+       * highlighted entry and no explanation why.  That rule applies to the
+       * modes this row actually offers, not to `tou_plan`. */
+      const options = EMS_MODES
+        .filter((mode) => mode.id !== "tou_plan")
+        .filter((mode) => supported.includes(mode.id) || mode.id === current)
+        .map((mode) => ({
+          id: mode.id,
+          label: this._t(mode.en, mode.zh),
+          enabled: true,
+          title: mode.id,
+        }));
       return this._item({
-        icon: "🔋",
-        name: this._t("EMS mode", "EMS 模式"),
-        sub: current === "" ? "—" : current,
+        icon: this._icon("faders"),
+        name: this._t("EMS Mode", "EMS 模式"),
+        sub: this._emsSub(current),
         topic: this._topic("select/<dev_id>/ems_mode/command"),
         ctrl: this._segment(options, current, (id) => this._setEmsMode(id)),
       });
     }
 
-    /** Range the power-control slider offers, and the cap the device reports.
+    /** Rated output of *one* unit in watts, or `null` when the model is unknown.
      *
-     * Two different numbers are in play and they must not be confused:
+     * The product id is the four digits of the serial body - the same key the PV
+     * count uses, and the only part of the id that survives a user-changed
+     * client prefix. */
+    _ratedWatts() {
+      const pid = String(this._dev() || "").split("-").pop().slice(0, 4);
+      const rated = RATED_W_BY_PID[pid];
+      return Number.isFinite(rated) ? rated : null;
+    }
+
+    /** The range the power-control slider offers for **this one unit**.
      *
-     * * The **rated** maximum - `output_power`'s declared `max` (800 W on a
-     *   micro inverter). This is the physical capability and it never moves.
-     * * The **effective** cap - the value of `power_ctrl`'s declared `max`.
-     *   The firmware rewrites that payload after every `output_power` command
-     *   so it always equals the last `output_power` the device accepted, i.e.
-     *   the wattage the hardware will not exceed right now.
+     * The lower bound is `power_ctrl`'s declared `min` and always has been: it
+     * is meaningful (`0` on an inverter, which curtails to nothing; negative on
+     * a storage unit, which charges).
      *
-     * The slider used to stop at the effective cap, which made the control look
-     * broken: a device capped at 132 W could not be told to produce 300 W even
-     * though the firmware accepts it (measured: publishing 700 while the
-     * declared `max` was 234 was honoured and the device output 715 W). So the
-     * slider now spans the rated maximum, and the effective cap is surfaced as
-     * a hint instead of a hard stop.
+     * The upper bound cannot come from the device at all, and two earlier
+     * attempts to read it off a topic were both wrong:
      *
-     * The effective cap is read from the *declared attribute*, never from the
-     * `output_power` entity's state: that entity has no state topic, so its
-     * value is only whatever Home Assistant last commanded and goes stale
-     * immediately. The discovery payload, by contrast, comes from the device.
+     * * `output_power`'s `max` describes the **installation**, not the unit. On
+     *   `RMI-4161A0209FF6` (`master`) it declares `max 3000` while the same
+     *   serial declares `1000` under the `MI-` prefix it used before - the
+     *   3000 W is this unit plus its `slave`. A 1000 W unit was offered a
+     *   3000 W set-point, and on a `slave` - which publishes **no**
+     *   `output_power` object at all - the substitution collapsed the range to
+     *   `-1000 ~ 0`.
+     * * `power_ctrl`'s own `max` is the *transient* limit, not the capability:
+     *   the firmware rewrites it after every `output_power` command, and
+     *   `RMI-1650A028FC22` currently declares `132` while the hardware does
+     *   800 W. Bounding to it would make the row unable to ask for more than
+     *   the unit happens to be doing.
+     *
+     * So the upper bound is the model's rated output (`RATED_W_BY_PID`) and
+     * `power_ctrl`'s declared `max` only stands in when the model is unknown.
+     * A slider spanning the rated range while the device momentarily refuses to
+     * exceed the declared `max` is the honest drawing: the firmware accepts such
+     * a value regardless (measured - publishing 700 while the declared `max` was
+     * 234 was honoured and the device output 715 W).
      */
-    _powerRange(declaredLo, declaredHi) {
-      const rated = this._attr("output_power", "number", "max");
-      const hi = Number.isFinite(num(rated)) && num(rated) > declaredLo
-        ? num(rated)
-        : declaredHi;
-      return { lo: declaredLo, hi, cap: declaredHi };
+    _powerRange() {
+      const rated = this._ratedWatts();
+      /* The fallback is only reached when the entity is genuinely absent - a
+         `slave` publishes no `power_ctrl` object at all - and it has to be the
+         right shape for the model: a micro inverter curtails to `0` and never
+         goes negative, whereas a storage unit charges below zero. */
+      const declared = this._bounds(
+        "power_ctrl",
+        rated === null ? -1000 : 0,
+        rated === null ? 2000 : rated,
+      );
+      const hi = rated !== null && rated > declared.lo ? rated : declared.hi;
+      return { lo: declared.lo, hi };
+    }
+
+    /** Sub-line of the EMS row: the mode shown, plus the device's own report when
+     * the two disagree.
+     *
+     * The disagreement is the whole point of showing it. The hardware can accept
+     * a mode command and keep running the old one - measured on micro inverter
+     * `RMI-4161A0209FF6` firmware `01.05.00`, which acknowledges `mqtt_ctrl` and
+     * still reports `general` (and in `general` ignores the power set-point).
+     * Saying so is honest; silently reverting the selection is not.
+     */
+    _emsSub(current) {
+      if (current === "") return "—";
+      const device = this._emsDeviceMode();
+      if (!device || device === current) return current;
+      return `${current} · ${this._t("Device", "设备")} ${device}`;
     }
 
     _powerCtrlItem() {
       const ready = this._emsMode() === "mqtt_ctrl";
-      const declared = this._bounds("power_ctrl", -1000, 1000);
-      const { lo, hi, cap } = this._powerRange(declared.lo, declared.hi);
+      const { lo, hi } = this._powerRange();
       // The firmware declares the granularity itself and it differs per model
       // (0.1 W on a storage unit, 1 W on a micro inverter), so the slider must
       // follow the entity rather than assume the finer one.
       const step = this._step("power_ctrl", 0.1);
       const sub = !ready
-        ? this._t("switch EMS to mqtt_ctrl first", "需先切到 mqtt_ctrl")
-        : cap < hi
-          // The device will refuse to exceed `cap` whatever is sent, so say so
-          // rather than let a large value look like it had no effect.
-          ? this._t(
-            `${lo} ~ ${hi} W; device capped at ${cap} W by output power`,
-            `${lo} ~ ${hi} W；设备当前受输出功率限制为 ${cap} W`,
-          )
-          : this._t(
-            `${lo} ~ ${hi} W, re-send at least once a minute`,
-            `${lo} ~ ${hi} W，需至少每分钟下发一次`,
-          );
+        ? this._t("Switch EMS to mqtt_ctrl first", "需先切到 mqtt_ctrl")
+        : this._t(
+          `${lo} ~ ${hi} W, re-send at least once a minute`,
+          `${lo} ~ ${hi} W，需至少每分钟下发一次`,
+        );
       return this._item({
-        icon: "🎛",
-        name: this._t("Power control", "功率控制"),
+        icon: this._icon("powerLimit"),
+        name: this._t("Power Control", "功率控制"),
         sub,
         topic: this._topic("number/<dev_id>/power_ctrl/set"),
         stack: true,
@@ -2202,8 +2821,8 @@ function _hmControlRegister() {
                 + "打开后由 Home Assistant 持续下发，关闭页面也不受影响。",
             );
       return this._item({
-        icon: "⏱",
-        name: this._t("Re-send timer", "定时下发"),
+        icon: this._icon("timer"),
+        name: this._t("Re-send Timer", "定时下发"),
         sub,
         /* The row is stacked for the same reason the two sliders are: the
            segment plus the number box plus the unit do not fit beside the name
@@ -2229,10 +2848,16 @@ function _hmControlRegister() {
     }
 
     _outputItem() {
+      /* Deliberately the *declared* range, unlike `_powerRange()` above. On a
+         `master` this row really does address the whole installation - that is
+         what the 3000 W on `RMI-4161A0209FF6` means - so narrowing it to the
+         unit's own rating would take away the only way to set the system total.
+         The power-control slider below is the opposite case: it is a per-unit
+         lease, so it must never inherit that aggregate. */
       const { lo, hi } = this._bounds("output_power", 100, 2000);
       return this._item({
-        icon: "📤",
-        name: this._t("Output power", "输出功率"),
+        icon: this._icon("ceiling"),
+        name: this._t("Output Power", "输出功率"),
         sub: this._t(`Range ${lo} ~ ${hi} W.`, `范围 ${lo} ~ ${hi} W。`),
         topic: this._topic("number/<dev_id>/output_power/set"),
         stack: true,
@@ -2261,8 +2886,8 @@ function _hmControlRegister() {
         onInput: (v) => { this._phase = { ...this._phase, [key]: v }; },
       });
       return this._item({
-        icon: "🔌",
-        name: this._t("Phase output", "多相输出功率"),
+        icon: this._icon("phaseLimit"),
+        name: this._t("Phase Output", "多相输出功率"),
         sub: this._t(
           `Range ${lo} ~ ${hi} W, sent as {phase_a, phase_b, phase_c}.`,
           `范围 ${lo} ~ ${hi} W，按 {phase_a, phase_b, phase_c} 下发。`,
@@ -2282,8 +2907,8 @@ function _hmControlRegister() {
       const options = WEEKDAYS.map((d) =>
         `<option value="${d}" ${d === this._week ? "selected" : ""}>${d}</option>`).join("");
       return this._item({
-        icon: "📅",
-        name: this._t("Get TOU plan", "获取 TOU 计划"),
+        icon: this._icon("schedule"),
+        name: this._t("Get TOU Plan", "获取 TOU 计划"),
         sub: this._t(
           "Reply arrives on tou_plan/status; edited below",
           "应答发布在 tou_plan/status；编辑见下方",
@@ -2300,13 +2925,47 @@ function _hmControlRegister() {
 
     _rebootItem() {
       return this._item({
-        icon: "🔄",
+        icon: this._icon("reboot"),
         name: this._t("Reboot", "重启设备"),
         sub: this._t("Takes about a minute", "约需一分钟"),
         topic: this._topic("button/<dev_id>/reboot/trigger"),
         ctrl: html`
           <button class="btn danger"
             @click=${() => this._reboot()}>${this._t("Reboot", "重启")}</button>`,
+      });
+    }
+
+    /* Protocol §31: the BLE PIN reset. Same shape as the reboot row, and the
+       smallest consequence in the group, so the sub-line names what is kept. */
+    _blePinResetItem() {
+      return this._item({
+        icon: this._icon("pin"),
+        name: this._t("Reset BLE PIN", "重置蓝牙 PIN 码"),
+        sub: this._t(
+          "Back to the default PIN; other settings are kept",
+          "PIN 恢复为默认值，其它配置保留",
+        ),
+        topic: this._topic("button/<dev_id>/reset_ble_pin_code/trigger"),
+        ctrl: html`
+          <button class="btn danger"
+            @click=${() => this._resetBlePin()}>${this._t("Reset", "重置")}</button>`,
+      });
+    }
+
+    /* Protocol §29: shares the reboot row's shape, but the consequence is larger,
+       so the sub-line says what is lost rather than how long it takes. */
+    _factoryResetItem() {
+      return this._item({
+        icon: this._icon("factory"),
+        name: this._t("Factory Reset", "恢复出厂设置"),
+        sub: this._t(
+          "Erases the device configuration, including the MQTT prefix",
+          "清除设备配置，含 MQTT 前缀",
+        ),
+        topic: this._topic("button/<dev_id>/factory_reset/trigger"),
+        ctrl: html`
+          <button class="btn danger"
+            @click=${() => this._factoryReset()}>${this._t("Reset", "恢复")}</button>`,
       });
     }
 
@@ -2317,8 +2976,8 @@ function _hmControlRegister() {
     _logItem() {
       const open = this._logOpen === true;
       return this._item({
-        icon: "📋",
-        name: this._t("MQTT log", "MQTT 日志"),
+        icon: this._icon("log"),
+        name: this._t("MQTT Log", "MQTT 日志"),
         sub: open
           ? this._t(
             "Live traffic: what the device reports and what HA sends. Rows marked retained"

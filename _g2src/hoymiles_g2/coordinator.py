@@ -20,7 +20,6 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from . import mqtt_util
 from .const import (
     AVAILABILITY_WATCHDOG_SECONDS,
-    CAPABILITIES_ALL,
     DOMAIN,
     EMS_MODE_ECHO_GUARD_SECONDS,
     EMS_MODES,
@@ -29,9 +28,13 @@ from .const import (
     PHASE_POWER_MIN,
     PHASES,
     PV_COUNT_MAX,
+    ROLE_ALIASES,
+    ROLES,
+    SOURCE_CAPABILITY,
     SOURCE_STALE_SECONDS,
     SRC_ALARM,
     SRC_DEVICE,
+    SRC_EVENT,
     SRC_KEEPALIVE,
     SRC_QUICK,
     SRC_SYSTEM,
@@ -44,6 +47,7 @@ from .const import (
     T_DEVICE_STATE,
     T_EMS_MODE_CMD,
     T_EMS_MODE_STATE,
+    T_EVENT_STATE,
     T_PHASE_OUTPUT_POWER_SET,
     T_QUICK_STATE,
     T_SYSTEM_STATE,
@@ -61,16 +65,19 @@ SUBSCRIPTIONS: tuple[tuple[str, str, int], ...] = (
     (SRC_QUICK, T_QUICK_STATE, 0),
     (SRC_DEVICE, T_DEVICE_STATE, 1),
     (SRC_SYSTEM, T_SYSTEM_STATE, 1),
+    (SRC_EVENT, T_EVENT_STATE, 1),
     (SRC_ALARM, T_ALARM_STATE, 1),
     (SRC_TOU_STATUS, T_TOU_STATUS, 1),
     (SRC_TOU_DAY_ACK, T_TOU_DAY_ACK, 1),
     (SRC_TOU_WEEK_ACK, T_TOU_WEEK_ACK, 1),
 )
 
-# How long platform setup waits for the retained ``attributes`` payload that
-# declares the device's capabilities.  It is retained, so it usually arrives
-# within a few hundred milliseconds; the timeout only matters for a broker that
-# lost it, in which case the full entity set is created (see CAPABILITIES_ALL).
+# How long platform setup waits for the retained payloads that tell it which
+# topics this device actually has.  Both carriers are retained on the broker
+# (``attributes`` and every state topic the firmware publishes itself), so on a
+# healthy connection the answer arrives within a few hundred milliseconds; the
+# timeout only costs time on a broker that lost them, in which case the device
+# simply gets no entities until its first message - see ``capabilities``.
 CAPABILITIES_TIMEOUT_SECONDS: Final = 3.0
 
 
@@ -99,11 +106,56 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # None = no verdict yet.  Staying available until proven silent keeps a
         # Home Assistant restart from blanking out every entity instantly.
         self._available: bool | None = None
-        # Capabilities declared by the firmware in its retained ``attributes``
-        # payload.  ``None`` until that payload arrives, which the platforms
-        # treat as "assume everything" so an upgrade never drops entities from a
-        # device that merely had not been heard from yet.
-        self._capabilities: frozenset[str] | None = None
+        # Capabilities this device actually has, in three parts, each with a
+        # different lifetime:
+        #
+        #   _inventory  the ``supported_topics`` list from the retained
+        #               ``attributes`` payload.  Replaced WHOLESALE on every
+        #               message, because the firmware re-publishes its complete
+        #               list each time it connects: if a reconnect advertises
+        #               fewer topics (a device that linked over MQTTS instead of
+        #               plain MQTT does exactly that), the set has to be allowed
+        #               to shrink or the page keeps claiming features it no
+        #               longer has.
+        #   _declared   extras proven outside that list - the multi phase output
+        #               limit and the ``button`` / ``switch`` objects only exist
+        #               as their own discovery config.  Only a config the
+        #               firmware published **live** counts (see
+        #               ``discovery_override.py``): the broker replays retained
+        #               configs to every new subscriber, and one of those may be
+        #               days old - published by another build, or over MQTTS by
+        #               a unit that is now on plain MQTT.  Cleared when the
+        #               device goes silent, so it describes this connection.
+        #   _observed   every state topic that delivered a live message.  Cleared
+        #               when a NEW session starts, so it describes the current
+        #               connection rather than the union of all of them.
+        #
+        # There is deliberately no "assume everything" default: that fallback is
+        # what put a storage unit's TOU and battery entity set on a micro
+        # inverter that never publishes those topics.  An empty set now means
+        # "nothing known yet", and the first message fills it in.
+        self._inventory: set[str] = set()
+        self._declared: set[str] = set()
+        self._observed: set[str] = set()
+        # True once the device published anything *live* on this MQTT
+        # connection.  A retained payload the broker replayed when we subscribed
+        # is history, so it does not count.  Destructive cleanup waits for this
+        # flag: it is the difference between "the device is talking to us right
+        # now" and "the broker still remembers what it said once".
+        self._live_seen: bool = False
+        # True once THIS connection published its own ``supported_topics``
+        # payload.  ``attributes`` is published exactly once per MQTT connection,
+        # so a live copy of it is the one unambiguous "the device just connected"
+        # marker the firmware gives us - a retained replay of the same payload is
+        # merely the last connection's declaration.
+        self._inventory_live: bool = False
+        # When that live ``attributes`` was last seen, to tell a genuine
+        # reconnect apart from the same connection re-announcing itself.
+        self._attributes_live_at: float = 0.0
+        # Incremented every time the device announces a NEW connection.  The
+        # entity gate hangs its one-shot reconciliation off this, so the registry
+        # is reconciled once per CONNECTION and never on a timer.
+        self.session: int = 1
         self._capabilities_ready = asyncio.Event()
         # Cached product name.  ``None`` = not resolved yet, ``""`` = resolved to
         # nothing (so the registry is not scanned again on every access).
@@ -142,13 +194,129 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return mode
         return None
 
+    @property
+    def role(self) -> str | None:
+        """Return this unit's role in the installation, or ``None``.
+
+        Protocol §32 「状态事件」 is the only place the firmware says whether the
+        unit is standing alone (``single``), heading a master/slave pair
+        (``master``) or following one (``slave``), and everything else in that
+        payload - ``has_meter``, ``has_plug``, ``has_solar2`` - is derived from
+        it.  A slave answers ``false`` to all three by definition.
+
+        ``None`` means the topic has not been heard from yet; callers must treat
+        that as "unknown", not as ``single``, or a follower would be drawn with
+        the master's meter driven branches the moment HA starts.
+
+        ``servant`` is normalised to ``slave`` here so no consumer has to carry
+        the alias.
+        """
+        payload = self.data.get(SRC_EVENT)
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("role")
+        if not isinstance(value, str):
+            return None
+        role = value.strip().lower()
+        role = ROLE_ALIASES.get(role, role)
+        return role if role in ROLES else None
+
+    @property
+    def event_flags(self) -> dict[str, bool]:
+        """The ``event/state`` capability flags as real booleans.
+
+        Only the three documented tri-state flags are returned, and only when
+        the payload actually carries a boolean - a missing field means "this
+        build does not say", which is different from ``false`` and must not be
+        rendered as "the hardware is not there".
+        """
+        payload = self.data.get(SRC_EVENT)
+        if not isinstance(payload, dict):
+            return {}
+        flags: dict[str, bool] = {}
+        for field in ("has_meter", "has_plug", "has_solar2"):
+            value = payload.get(field)
+            if isinstance(value, bool):
+                flags[field] = value
+        return flags
+
     # ------------------------------------------------------------------
     # capabilities
     # ------------------------------------------------------------------
     @property
     def capabilities(self) -> frozenset[str]:
-        """Topics the firmware declared, or "all" while nothing was received."""
-        return self._capabilities if self._capabilities is not None else CAPABILITIES_ALL
+        """The capabilities this device has proven, by declaring or by sending.
+
+        The union is what makes "show only what was published" hold in both
+        directions: a topic in the retained inventory keeps its entities across
+        a Home Assistant restart even while the device is offline, and a topic
+        that only ever arrives because the device happened to publish it is
+        picked up as soon as the first message lands.
+        """
+        return frozenset(self._inventory | self._declared | self._observed)
+
+    @property
+    def capabilities_known(self) -> bool:
+        """True once anything about this device's topic set is known.
+
+        Used as the "is absence meaningful?" gate before pruning: with nothing
+        known, a missing capability is ignorance, not evidence that the feature
+        is absent.
+        """
+        return bool(self._inventory or self._declared or self._observed)
+
+    @property
+    def inventory_known(self) -> bool:
+        """True once the firmware's own ``supported_topics`` list has arrived.
+
+        Narrower than :attr:`capabilities_known`, and it is the only gate the
+        destructive cleanup may use.  The inventory is the one *complete* list
+        the firmware publishes - it is replaced wholesale on every connection -
+        so a capability missing from it is a real absence.  A discovery config
+        is not comparable in that way (the firmware never withdraws one), which
+        is why the two are tracked separately.
+        """
+        return bool(self._inventory)
+
+    @property
+    def live_seen(self) -> bool:
+        """True once the device published something live on this connection."""
+        return self._live_seen
+
+    @property
+    def connection_declared(self) -> bool:
+        """True once the CURRENT connection published its own topic list.
+
+        This is the only safe gate for the destructive cleanup: it means the
+        device has just told us, on this very connection, what it implements, so
+        anything else still sitting on the discovery topic is left over from an
+        earlier connection and may be deleted.  Without it, a broker that merely
+        replayed old payloads would look like a device that supports them.
+        """
+        return self._inventory_live
+
+    @callback
+    def _begin_connection(self) -> None:
+        """Forget everything the previous connection proved, and say so.
+
+        Called the moment the device announces itself on a new connection.  What
+        it published live from now on is the whole truth; the retained history
+        the broker replayed to us - possibly from a different firmware build, or
+        from a unit that linked over MQTTS - must no longer grant any entity.
+        The inventory itself is replaced by the caller with the freshly
+        announced list, so it is deliberately not cleared here.
+        """
+        self.session += 1
+        self._observed.clear()
+        self._declared.clear()
+        self._inventory_live = True
+        self._attributes_live_at = time.monotonic()
+        _LOGGER.warning(
+            "Hoymiles %s announced a new connection (session %d); its entities "
+            "will follow what this connection publishes",
+            self.dev_id,
+            self.session,
+        )
 
     @property
     def pv_count(self) -> int:
@@ -238,7 +406,7 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return resolved or None
 
     def has_capability(self, capability: str) -> bool:
-        """Return True when the firmware declared this capability."""
+        """Return True when this device declared *or* published the topic."""
         return capability in self.capabilities
 
     @callback
@@ -257,30 +425,55 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def add_capability(self, capability: str) -> None:
         """Record a capability discovered outside ``supported_topics``.
 
-        The multi phase output limit has no ``supported_topics`` entry; all that
-        exists is its own discovery object, which ``discovery_override.py``
-        reports here.  Until it arrives the capability is simply absent, so a
-        device that lacks the feature never gets the entities.
+        Several features have no ``supported_topics`` entry - the multi phase
+        output limit and every ``button`` / ``switch`` object are only visible as
+        their own discovery config - so ``discovery_override.py`` reports each
+        one here as it arrives.
+
+        The caller is responsible for only reporting a config the firmware
+        published **live**.  A config that merely came back as a retained replay
+        is not evidence of current support, and treating it as such is what kept
+        a storage unit's reboots and factory resets on screen long after the
+        firmware stopped offering them.
+
+        A *new* capability means new entities may be justified, so the platforms
+        are nudged through the normal listener fan-out.
         """
-        if self._capabilities is not None and capability in self._capabilities:
+        if capability in self._declared:
             return
 
-        # Nothing received yet means "everything", so adding to that set would be
-        # a no-op; only a real inventory needs extending.
-        if self._capabilities is not None:
-            self._capabilities = self._capabilities | {capability}
-            _LOGGER.debug("Hoymiles %s gained capability %s", self.dev_id, capability)
-            self.async_set_updated_data(dict(self.data))
+        self._declared.add(capability)
+        self._capabilities_ready.set()
+        _LOGGER.debug("Hoymiles %s declares capability %s", self.dev_id, capability)
+        self.async_set_updated_data(dict(self.data))
+
+    @callback
+    def _observe_capability(self, capability: str) -> bool:
+        """Record a capability proven by a message that actually arrived.
+
+        Returns True when this is the first time it was seen, which is the
+        moment the platforms get a chance to add entities for it.
+        """
+        if capability in self._observed or capability in self._declared \
+                or capability in self._inventory:
+            self._observed.add(capability)
+            return False
+
+        self._observed.add(capability)
+        self._capabilities_ready.set()
+        _LOGGER.debug("Hoymiles %s published %s", self.dev_id, capability)
+        return True
 
     async def async_wait_for_capabilities(self) -> None:
-        """Wait briefly for the retained ``attributes`` payload.
+        """Wait briefly for the retained payloads that describe this device.
 
         The platforms need the capability set *before* they decide which
         entities to create, so setup awaits this instead of racing the MQTT
-        message.  A timeout is not an error: it just means the broker has no
-        retained inventory for this device and the full entity set is created.
+        messages.  A timeout is not an error and no longer means "assume a fully
+        featured device": it means the broker has nothing for this device yet, so
+        the entities follow its first message instead.
         """
-        if self._capabilities is not None:
+        if self.capabilities_known:
             return
         try:
             await asyncio.wait_for(
@@ -288,8 +481,8 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except asyncio.TimeoutError:
             _LOGGER.debug(
-                "No 'attributes' payload for %s within %ss; assuming a fully "
-                "featured device",
+                "Nothing heard from %s within %ss; entities will follow its "
+                "first message",
                 self.dev_id,
                 CAPABILITIES_TIMEOUT_SECONDS,
             )
@@ -302,6 +495,17 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         the keys matter: the values are topics we already know, and trusting
         them would let a firmware change point our subscriptions somewhere else.
         """
+        live = getattr(msg, "retain", True) is False
+        if live:
+            self._live_seen = True
+            # ``attributes`` is published exactly once per MQTT connection, so a
+            # live copy *is* the device saying "I just connected, this is my topic
+            # set".  No debouncing: a power cycle a few seconds after a reconnect
+            # is still a new connection, and treating it as the old one would skip
+            # the cleanup for the burst it is about to send.  A duplicate would at
+            # worst buy one redundant, idempotent pass.
+            self._begin_connection()
+
         try:
             payload = json.loads(msg.payload)
         except (ValueError, TypeError):
@@ -314,15 +518,29 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not isinstance(supported, dict):
             return
 
-        declared = frozenset(str(key) for key in supported)
-        if declared == self._capabilities:
+        declared = {str(key) for key in supported}
+        if not declared:
             return
 
-        self._capabilities = declared
+        previous = self.capabilities
+        # Replace, never union: the firmware publishes its COMPLETE topic list on
+        # every connection, so a key missing from this payload is a feature this
+        # build does not have.  Unioning would make the set grow forever and the
+        # page keep advertising options the device already dropped.
+        self._inventory = declared
         self._capabilities_ready.set()
-        _LOGGER.debug(
-            "Hoymiles %s declares %s", self.dev_id, ", ".join(sorted(declared))
+        _LOGGER.info(
+            "Hoymiles %s declares %d topics: %s",
+            self.dev_id,
+            len(self._inventory),
+            ", ".join(sorted(self._inventory)),
         )
+        # Always notify, even when the set happens to match the previous one.
+        # ``supported_topics`` is NOT the whole picture - the device also
+        # publishes discovery configs and state topics that never appear in it -
+        # so the listeners are what schedule the cleanup, and they have to run
+        # as soon as the inventory is known rather than only on a visible change.
+        del previous
         self.async_set_updated_data(dict(self.data))
 
     async def async_setup(self) -> None:
@@ -553,8 +771,36 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_publish_availability(self, available: bool) -> None:
         """Publish an availability change and refresh the entities."""
+        was_available = self._available
         self._available = available
         payload = PAYLOAD_AVAILABLE if available else PAYLOAD_NOT_AVAILABLE
+
+        # Going silent ends this connection, so everything the device announced
+        # during it - the discovery configs it published live included - is
+        # history.  Clearing on the way *down* rather than on the way back up
+        # keeps this out of the reconnect burst's way: those configs land about
+        # a second before the first state message flips the verdict back.
+        if not available:
+            self._declared.clear()
+            self._live_seen = False
+            self._inventory_live = False
+
+        # A transition from a PROVEN-offline state back to available is a
+        # reconnect: the device is about to re-publish its whole topic set, so
+        # what it published during the previous connection is no longer evidence
+        # of what it supports now.  Clearing ``_observed`` here (and only here -
+        # never on the initial None -> True, which is just this process
+        # subscribing to retained topics) is what lets a device that reconnects
+        # with fewer topics lose the entities it no longer justifies.
+        if available and was_available is False:
+            self.session += 1
+            self._observed.clear()
+            _LOGGER.info(
+                "Hoymiles %s reconnected (session %d); its topic set will be "
+                "re-read from the new connection",
+                self.dev_id,
+                self.session,
+            )
 
         try:
             await mqtt_util.async_publish(
@@ -574,6 +820,13 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _make_handler(self, key: str):
         @callback
         def _handler(msg: Any) -> None:
+            # ``retain`` is the broker's replay flag: True means the payload was
+            # delivered because *we* subscribed, not because the device just
+            # said it.  Only the second kind describes the current connection.
+            live = getattr(msg, "retain", True) is False
+            if live:
+                self._live_seen = True
+
             try:
                 payload = json.loads(msg.payload)
             except (ValueError, TypeError):
@@ -584,6 +837,17 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if key in SOURCE_STALE_SECONDS:
                 self._last_seen[key] = time.monotonic()
+
+            # A *live* message is proof that this topic exists for this device,
+            # independent of what the retained inventory claims.  This is what
+            # keeps the page honest for a unit whose ``attributes`` payload is
+            # missing, stale, or simply lists fewer topics than the firmware of
+            # a differently connected build actually publishes.  A replayed
+            # retained message only proves the topic existed at some point in
+            # the past - exactly the claim this integration must not act on.
+            capability = SOURCE_CAPABILITY.get(key)
+            if capability is not None and live:
+                self._observe_capability(capability)
 
             data = dict(self.data)
             data[key] = payload

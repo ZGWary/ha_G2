@@ -59,21 +59,33 @@ function _hmSankeyRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -82,31 +94,19 @@ function _hmSankeyRegister() {
    * dashboard keeps working) or a language map:
    *
    *   title:
-   *     en: Energy flow
-   *     zh: 能量流
-   *   balancer_label:
-   *     en: Loss / other
-   *     zh: 损耗/其他
+   *     en: Battery packs
+   *     zh: 电池包
    *
    * That is what lets the text *you* write follow the UI language too, instead
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   /* ------------------------------------------------------------------ *
    * Layout constants — the SVG uses a fixed viewBox and is scaled by CSS,
@@ -164,29 +164,29 @@ function _hmSankeyRegister() {
     // ---- sources (left) ----
     { id: "pv", side: "src", en: "PV", zh: "光伏", color: "#F5A623",
       keys: ["system_pv_energy_today", "system_pv2_energy_today"] },
-    { id: "grid_in", side: "src", en: "Grid in", zh: "电网受电", color: "#4A90D9",
+    { id: "grid_in", side: "src", en: "Grid In", zh: "电网受电", color: "#4A90D9",
       keys: ["grid_on_energy_in_today"] },
-    { id: "bat_discharge", side: "src", en: "Battery out", zh: "电池放电", color: "#9B8AFF",
+    { id: "bat_discharge", side: "src", en: "Battery Out", zh: "电池放电", color: "#9B8AFF",
       keys: ["battery_discharge_energy_today"] },
-    { id: "plug_in", side: "src", en: "Plug in", zh: "插座输入", color: "#2DD4BF",
+    { id: "plug_in", side: "src", en: "Plug In", zh: "插座输入", color: "#2DD4BF",
       keys: ["plug_input_energy_today"] },
-    { id: "eps_in", side: "src", en: "EPS in", zh: "EPS 输入", color: "#FB923C",
+    { id: "eps_in", side: "src", en: "EPS In", zh: "EPS 输入", color: "#FB923C",
       keys: ["eps_input_energy_today"] },
     // ---- sinks (right) ----
-    { id: "grid_out", side: "snk", en: "Grid out", zh: "电网送电", color: "#2E6DB4",
+    { id: "grid_out", side: "snk", en: "Grid Out", zh: "电网送电", color: "#2E6DB4",
       keys: ["grid_on_energy_out_today"] },
-    { id: "bat_charge", side: "snk", en: "Battery in", zh: "电池充电", color: "#7B61FF",
+    { id: "bat_charge", side: "snk", en: "Battery In", zh: "电池充电", color: "#7B61FF",
       keys: ["battery_charge_energy_today"] },
-    { id: "plug_out", side: "snk", en: "Plug out", zh: "插座输出", color: "#12B76A",
+    { id: "plug_out", side: "snk", en: "Plug Out", zh: "插座输出", color: "#12B76A",
       keys: ["plug_output_energy_today"] },
-    { id: "eps_out", side: "snk", en: "EPS out", zh: "EPS 输出", color: "#E5484D",
+    { id: "eps_out", side: "snk", en: "EPS Out", zh: "EPS 输出", color: "#E5484D",
       keys: ["eps_output_energy_today"] },
   ];
 
   // Synthetic nodes, only drawn when a balancing amount exists.
   const SYNTH = {
     unmeasured: { id: "unmeasured", side: "src", en: "Unmetered", zh: "未计量", color: "#A78BFA" },
-    loss: { id: "loss", side: "snk", en: "Loss / other", zh: "损耗/其他", color: "#9CA3AF" },
+    loss: { id: "loss", side: "snk", en: "Loss / Other", zh: "损耗/其他", color: "#9CA3AF" },
   };
 
   const RANGES = [
@@ -202,6 +202,13 @@ function _hmSankeyRegister() {
    * ------------------------------------------------------------------ */
   function slug(id) {
     return String(id).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  }
+
+  /* Only letters and digits, so `RMI-4161A0209FF6`, `rmi_4161a0209ff6` and the
+   * user-renamed forms all collapse to the same string - the join used to find
+   * entities whose id no longer matches the conventional pattern. */
+  function norm(name) {
+    return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
   function esc(text) {
@@ -489,15 +496,44 @@ function _hmSankeyRegister() {
       this.requestUpdate();
     }
 
+    connectedCallback() {
+      super.connectedCallback();
+      /* The toolbar language switch only writes localStorage and fires
+         `hoymiles-language`; it never touches `hass.language`.  Node and ribbon
+         labels are baked into `_graph`, so a switch has to rebuild the diagram
+         rather than just re-render the template. */
+      I18N.watch(this, () => this._relabel());
+    }
+
+    disconnectedCallback() {
+      I18N.unwatch(this);
+      super.disconnectedCallback();
+    }
+
+    /** Rebuild the diagram after the language changed under us. */
+    _relabel() {
+      this._langUsed = this._lang();
+      this._graph = null;
+      this._fetch();
+    }
+
     getCardSize() { return 6; }
 
     /* --------------------------- text / config --------------------------- */
 
-    _t(en, zh) { return hmLang(this._hass, this._config) === "zh" ? zh : en; }
+    /** One of the two strings the card carries, in the current language. */
+    _t(en, zh) {
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
+    }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
     _dev() { return this._config.dev_id; }
 
@@ -517,6 +553,18 @@ function _hmSankeyRegister() {
       const prefix = `${domain}.${dev}`;
       for (const entityId of Object.keys(states)) {
         if (entityId.startsWith(prefix) && entityId.endsWith(suffix)) return entityId;
+      }
+
+      // A renamed device: Home Assistant rewrites every entity id to the new
+      // name, so the `<slug(dev_id)>_` prefix above stops matching.  The
+      // serial never changes, so look for the suffix right after it.
+      const marker = norm(this._dev());
+      const wanted = norm(suffix);
+      for (const entityId of Object.keys(states)) {
+        const flat = norm(entityId);
+        const at = marker ? flat.indexOf(marker) : -1;
+        if (at < 0) continue;
+        if (flat.slice(at + marker.length) === wanted) return entityId;
       }
 
       const uniqueSuffix = `hoymiles_g2_${this._dev()}_${suffix}`;
@@ -877,7 +925,7 @@ function _hmSankeyRegister() {
       }
 
       return `<svg viewBox="0 0 ${VB_W} ${VB_H}" role="img"
-        aria-label="${esc(this._t("Energy flow", "能量流"))}">${parts.join("")}</svg>`;
+        aria-label="${esc(this._t("Energy Flow", "能量流"))}">${parts.join("")}</svg>`;
     }
 
     /** Detail panel for the current highlight (empty when nothing is selected). */
@@ -911,7 +959,7 @@ function _hmSankeyRegister() {
         .join("");
 
       const total = flows.length > 1
-        ? ` · ${esc(this._t("total", "合计"))} ${esc(fmtEnergy(sum))}`
+        ? ` · ${esc(this._t("Total", "合计"))} ${esc(fmtEnergy(sum))}`
         : "";
 
       return `<div class="detail">
@@ -998,7 +1046,7 @@ function _hmSankeyRegister() {
 
     render() {
       if (!this._config) return html``;
-      const title = this._text(this._config.title) || this._t("Energy flow", "能量流");
+      const title = this._text(this._config.title) || this._t("Energy Flow", "能量流");
 
       let body;
       if (this._loading && !this._graph) {

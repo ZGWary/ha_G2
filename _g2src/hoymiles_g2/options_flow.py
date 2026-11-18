@@ -16,6 +16,7 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -40,6 +41,7 @@ from .const import (
     TOU_SOC_MIN,
     TOU_TS_MAX,
     TOU_WEEKDAYS,
+    is_inverter_dev_id,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,8 +90,55 @@ class HoymilesOptionsFlow(OptionsFlow):
     ) -> FlowResult:
         return self.async_show_menu(
             step_id="init",
-            menu_options=["day_plan", "week_plan", "get_plan", "set_mode", "reboot"],
+            menu_options=[
+                "charts",
+                "day_plan",
+                "week_plan",
+                "get_plan",
+                "set_mode",
+                "reboot",
+            ],
         )
+
+    # ------------------------------------------------------------------
+    # optional device charts
+    # ------------------------------------------------------------------
+    async def async_step_charts(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Tick the extra Device-view curves the user wants to keep.
+
+        The device page has drawn a fixed set of curves since the first release;
+        ``device/state`` carries more readings than that, so each of the
+        remaining ones can be added as a card of its own.  The dashboard is the
+        source of truth - the checkboxes are preselected from the cards already
+        stored, and a card that stays enabled keeps the instant it was enabled
+        (see ``lovelace.OPTIONAL_CHARTS``), which is what makes its curve start
+        at that moment instead of at the device's whole recorded history.
+        """
+        from . import lovelace  # noqa: PLC0415
+
+        dev_id = self._dev_id
+        if not is_inverter_dev_id(dev_id):
+            # These are the ``grid_on_*`` readings of a micro inverter, and the
+            # only layout they belong on is its Device view.
+            return self.async_abort(reason="charts_unsupported")
+
+        if user_input is not None:
+            wanted = {
+                key: bool(user_input.get(key)) for key in lovelace.OPTIONAL_CHARTS
+            }
+            if not await lovelace.async_set_optional_charts(self.hass, dev_id, wanted):
+                return self.async_abort(reason="charts_not_saved")
+            return self.async_create_entry(title="", data={})
+
+        current = await lovelace.async_get_optional_charts(self.hass, dev_id)
+        schema: dict[Any, Any] = {}
+        for key in lovelace.OPTIONAL_CHARTS:
+            schema[
+                vol.Optional(key, default=key in current)
+            ] = BooleanSelector()
+        return self.async_show_form(step_id="charts", data_schema=vol.Schema(schema))
 
     # ------------------------------------------------------------------
     # day plan

@@ -5,7 +5,7 @@
  *
  * Draws the system as a **wiring diagram**, the way the vendor app does on its
  * system screen: one ringed icon per branch, the inverter in a rounded square
- * in the middle, and thick rounded connectors with moving pearls that show the
+ * in the middle, and thick rounded connectors with a streak of light that shows the
  * direction of the power.
  *
  *   ⬜ PV1 ──┐                  ┌── ⬜ PV2
@@ -43,9 +43,18 @@
  *   show_title: true              # optional, false hides the title + device id
  *   language: en                  # optional (en|zh); omit to follow Home Assistant
  *   temperature_entity: sensor.x  # optional, shown next to the title
+ *   alarm_entity: sensor.x        # optional; when set, a badge in the corner
+ *                                 # of the drawing shows the condition - a
+ *                                 # green tick with no alarms, the vendor app's
+ *                                 # red warning triangle with them.  Unset on
+ *                                 # the System tab, which has no single device
+ *                                 # to ask.  While the alarm card beside it is
+ *                                 # hidden the drawing also widens over the
+ *                                 # freed columns.
  *   gradient: true                # optional white backdrop (default true)
- *   max_width: 620                # optional px, the drawing stays centered
- *   flow_speed: 1                 # optional multiplier for the moving pearls;
+ *   max_width: 620                # optional px cap; 0 = no cap, fill the cell;
+ *                                 # omitted = 620
+ *   flow_speed: 1                 # optional multiplier for the flowing streak;
  *                                 # 0.5 = half speed (calmer), 2 = faster
  *   variant: inverter             # optional; 'inverter' draws the HiFlow
  *                                 # micro-inverter layout (the PV inputs and
@@ -97,21 +106,33 @@ function _hmPowerFlowRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -120,28 +141,19 @@ function _hmPowerFlowRegister() {
    * dashboard keeps working) or a language map:
    *
    *   title:
-   *     en: History
-   *     zh: 历史数据
+   *     en: Battery packs
+   *     zh: 电池包
    *
    * That is what lets the text *you* write follow the UI language too, instead
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   /* ------------------------------------------------------------------ *
    * Drawing constants. The SVG uses a fixed viewBox and is scaled by CSS,
@@ -149,37 +161,77 @@ function _hmPowerFlowRegister() {
    * ------------------------------------------------------------------ */
   const VB_W = 700;
   const VB_H = 470;
-  const MIN_FLOW = 5; // W; below this a branch is drawn as idle
+  const MIN_FLOW = 1; // W; below this a branch is drawn as idle
 
-  /* Speed of the moving pearls. The travel time is derived from the connector
-     length, so a short stub and a long line no longer look like different
-     animals.
+  /* ------------------------------------------------------------------ *
+   * The streak
+   *
+   * A connector that carries power gets **one** streak of light travelling from
+   * one end of it to the other, like a signal being sent down the wire.  The
+   * connector itself is not recoloured - it keeps the plain grey of
+   * `.pf-edge`; only the streak is lit.
+   *
+   * The streak is a **single dash**, not a repeating pattern: the dash is
+   * `STREAK` units long and the gap after it is several times the connector, so
+   * only one can be on the line at a time.  A repeating pattern put two or three
+   * of them on a long connector, which reads as decoration rather than as
+   * something being sent.
+   *
+   * It is drawn as a run of **slices**, each a short dash with its own colour
+   * and opacity, and that is what makes the fade.  The first slice is white and
+   * opaque, the last is the branch colour at almost nothing, and the slices in
+   * between are interpolated: a smooth comet instead of a bar.  Stacking four
+   * strokes of different length on top of each other was the earlier approach
+   * and is why the tail came out as visible steps.
+   *
+   * A real `<linearGradient>` is wrong here: a gradient is painted in a
+   * straight line, so on an L shaped connector the colour would run diagonally
+   * across the pipe instead of along it.
+   *
+   * Slice `i` sits `i * slice` further back than the head, so
+   * `dashoffset = length - head` becomes `offset_i = offset_head + i * slice`,
+   * and every slice is animated by the same keyframes - the run moves as one
+   * piece.
+   *
+   * The motion is a plain CSS animation of `stroke-dashoffset`, with the three
+   * end points handed to the keyframes as CSS variables because they depend on
+   * the connector's length.  That also fixes the freeze the old
+   * `requestAnimationFrame` dots had: a card that was detached and re-attached
+   * (switching dashboard tabs does) is not re-rendered, so nothing restarted
+   * the loop.  A CSS animation simply keeps running.
+   *
+   * The same negative `animation-delay` mechanism puts a rebuilt path back
+   * where it was, so a re-render (about once a second, as the readings change)
+   * does not restart the streak at the beginning.
+   */
+  const STREAK_SHARE = 0.34; // streak length, as a fraction of the connector
+  const STREAK_MIN = 34; // units; below this a short stub barely reads
+  const STREAK_MAX = 120; // units; a long connector must not carry a bar
+  /* How many slices a streak is cut into.  More slices, smoother fade - and a
+     bigger DOM (14 paths per lit connector).  At card size one slice is about
+     2 px wide, so the steps are already invisible; going higher only costs. */
+  const STREAK_SLICES = 14;
+  /* One cycle of the whole diagram, in seconds.  Every connector runs on this
+     single clock: that is what lets several branches meet at the junction
+     instead of each one running on its own timer.  `flow_speed` scales the
+     whole cycle. */
+  const FLOW_CYCLE_S = 6;
+  /* The three stages of that cycle, in order.  Energy gathers into the unit
+     (0), runs through it to the junction - together with everything else
+     arriving there (1) - and finally leaves the junction towards whatever is
+     consuming it (2).  Each stage starts exactly where the previous one ends,
+     so a downstream branch can never light up before the energy that feeds it
+     has arrived.  The keyframe names below must match. */
+  const FLOW_STAGES = ["in", "trunk", "out"];
+  /* Width at the head and at the tail, in user units.  The grey pipe is 6.8, so
+     the streak sits just inside it. */
+  const STREAK_WIDTH = 6;
+  const STREAK_TIP = 3.6;
 
-     Tuned three times: the first values (40..230 px/s) crossed the 233 unit PV
-     connector in 1.0 s and looked frantic, so they were more than halved; the
-     user then found that a little too calm and asked for a step up, and then
-     for one more, which is where these sit - the same connector now crosses in
-     about 1.6 s. Use the card's `flow_speed` option to nudge the whole thing
-     (1 = default). */
-  const DOT_SPEED_MIN = 28; // px per second at ~0 W
-  const DOT_SPEED_MAX = 150; // px per second at full power
-  const DOT_SPEED_PER_W = 0.17; // px/s gained per watt, saturates near 720 W
-  const DOT_DUR_MIN = 1.0; // s, keeps the very short stubs readable
-  const DOT_DUR_MAX = 6.0; // s
-  /* The readings arrive once a second and their last digit jumps about, so the
-     pearls low pass the power over this long; without it the dots stutter in
-     step with the pushes instead of gliding. */
-  const DOT_SMOOTH_TAU = 1.2; // s
-
-  /* A rounded corner is flattened into this many straight segments when a
-     pearl is placed on it - fine enough that the flattening is invisible. */
-  const PEARL_QUAD_STEPS = 12;
-  /* Where a pearl fades in / out along its lap, as a fraction of the connector. */
-  const PEARL_FADE_IN = 0.12;
-  const PEARL_FADE_OUT = 0.15;
-  const PEARL_OPACITY = 0.95;
-  const PEARL_FADE_MIN_LEN = 70; // below this the fade would hide the pearl
-  const PEARL_SECOND_MIN_LEN = 110; // above this a connector carries two
+  /* A rounded corner is flattened into this many straight segments - fine
+     enough that the flattening is invisible at the card's size.  Used when a
+     streak travel path is measured. */
+  const CURVE_STEPS = 12;
 
   const COLORS = {
     pv: "#f5a623",
@@ -263,7 +315,7 @@ function _hmPowerFlowRegister() {
    *
    * The 并网端口 value is the *absolute* reading: whether the energy is being
    * drawn from the grid (取电) or fed back into it (馈电) is carried by the
-   * pearls, which run towards the unit while importing and away from it while
+   * streaks, which run towards the unit while importing and away from it while
    * exporting, and by the colour of the connector.
    *
    * The photo is a transparent cut-out, so a connector that stops at a fixed
@@ -299,28 +351,48 @@ function _hmPowerFlowRegister() {
   const IV_CORNER = 10;                          // rounded elbow radius
   /* The DC inputs share one bottom row.  The row is laid out per input count
      rather than incrementally: a single-input unit keeps its one node on the
-     far left (where the storage schematic's PV1 also is) and a four-input one
-     spreads across the whole row instead of piling up on one side.  The two
-     middle slots of a 4-input unit plug into the photo's bottom edge, the outer
-     two into its side edges - see `elbowRoute`. */
+     far left (where the storage schematic's PV1 also is) and a three-input one
+     spreads across the whole row instead of piling up on one side.  The one
+     cut-out that draws its DC lead on the *right* face (the Pro 1-in-1, 4160)
+     says so through `pvSides` in `IV_TERMINAL_BY_ART` and its node is mirrored
+     to the same x on the other side, so the connector never crosses the photo.
+
+     A 4-input body is the exception.  Its artwork carries **two MC4 pairs on
+     each cheek** and nothing on the bottom edge, so its four nodes sit two per
+     side, just outside the photo's edges - PV1 + PV2 on the left, PV3 + PV4
+     mirrored on the right.  Keeping them in the middle of the row (as an
+     evenly spread `[95, 235, 465, 605]` did) would have forced the inner two to
+     rise into an edge the render does not draw a port on.
+
+     The 4-input x values are pulled in from the outer positions of the 2-input
+     layout to make room for the second node per cheek while keeping every ring
+     clear of the photo (which is 300 px wide, i.e. x 200..500) and of the
+     drawing's own edges. */
   const IV_PV_MAX = 4;
   const IV_NODE_ROW_Y = 275;
   const IV_NODE_X = {
     1: [95],
     2: [95, 605],
     3: [95, 350, 605],
-    4: [95, 235, 465, 605],
+    4: [78, 150, 550, 622],
   };
+  /* Vertical gap between two connectors that land on the same cheek without a
+     measured stub list to aim at.  Only used as a fallback - a listed cut-out
+     gets its heights from the artwork itself. */
+  const IV_SIDE_STAGGER = 30;
   /* The 并网端口 node: the AC output of the unit.  It takes the unit's own
      on-grid port power, which is where a micro inverter's energy actually
      leaves - the PV inputs feed it, and it feeds the house.  Its placement is
      defined again below, over the photo, now that the node is permanent. */
   const IV_NODE_GRID = { x: 605, y: 90 };
-  /* PV input count by product code, i.e. the first four digits of the serial
-     (`RMI-4161A0209FF6` -> `4161`).  The firmware's model string names a whole
-     family - `HiFlow` covers both the 1-input 1650 and the 1-input 4160 - so
-     the code is the finer discriminator and the one a new SKU is added to.
-     Keep this table in sync with `docs/hoymiles_g2-hiflow.md`. */
+  /* PV input count by PID - the four digits at the start of the serial
+     (`RMI-4161A0209FF6` -> `4161`, and the same for `GARAGE-4161A0209FF6`).
+     The firmware's model string names a whole family - `HiFlow` covers both the
+     1-input 1650 and the 1-input 4160 - so the PID is the finer discriminator
+     and the one a new SKU is added to.  It is also the *only* stable part of
+     the id: the prefix before the dash is a user setting.
+     Keep this table in sync with `PID_PV_COUNT` in `const.py` and
+     `docs/hoymiles_g2-hiflow.md`. */
   const IV_PV_COUNT_BY_CODE = {
     1650: 1,   // HiFlow, single input
     4160: 1,   // HiFlow, single input
@@ -331,6 +403,90 @@ function _hmPowerFlowRegister() {
      it: a connector that ends at the very corner reads as passing the unit by,
      not as plugging into it. */
   const IV_TERMINAL_INSET = 22;
+  /* Where each cut-out actually shows its ports: `pvFrac` / `pvRightFrac` are
+     heights as a fraction of the photo, `pvRightXFrac` a width fraction.
+
+     A connector has to stop on the cable exit the render draws, not on a corner
+     the layout picked: the small HiFlow body (1650) carries its MC4 pair on the
+     **left** face (around 57% down) and its AC socket on the **right** face at
+     46% down, while the Pro bodies put the AC lead high on the right (24-30%
+     down) and the Pro 1-in-1 (4160) puts its single PV pair there as well, low
+     on the right (see its own entry below).  The 800's socket is a *recess*, so
+     it is found by the run of rows that sit 30-40 luminance points darker than
+     the panel around them and that project one pixel past the rest of the right
+     face - not by its outline, which the render's drop shadow swallows.
+
+     `pvSides` is the escape hatch for the one body whose DC input is on the
+     right: the layout's bottom row is laid out per input count and puts a lone
+     node on the left, so an artwork that names `pvSides` overrides that and the
+     node is mirrored to the matching column.
+
+     The two-input body is the awkward one: its two MC4 pairs sit on *opposite*
+     cheeks at slightly different heights (77% down on the left, 74% on the
+     right), and the right-hand pair stops short of the crop - the artwork keeps
+     a strip of empty background past the plug, so aiming at the photo's right
+     edge leaves the connector dangling in white space beside the port it was
+     meant to reach.  `pvRightXFrac` is that plug's tip.
+
+     Values were measured off the artwork's own dark connector runs, so they stay
+     correct when a photo is scaled to a new size.  A cut-out that is not listed
+     keeps the layout's own corner-based estimate, which is what a
+     dashboard-supplied `image` gets. */
+  const IV_TERMINAL_BY_ART = {
+    "hiflow-800.png": { pvFrac: 0.574, gridFrac: 0.455 },
+    /* The Pro 1-in-1 is the one cut-out whose DC input is **not** on the left:
+       the render draws the body on the left third and runs *both* leads out of
+       its right face - the AC plug high up (27% down, reaching the crop's right
+       edge) and the MC4 pair low down (81-98% down, with the plug's body around
+       x 175..208 of the 237 px crop).  `pvSides` therefore overrides the layout's
+       left-by-default column, and the x fraction stops the connector on that
+       plug instead of in the empty background past it. */
+    "hiflow-pro-1in1.png": {
+      pvRightFrac: 0.893,
+      pvRightXFrac: 0.8,
+      pvSides: ["right"],
+      gridFrac: 0.268,
+    },
+    "hiflow-pro-2in1.png": {
+      pvFrac: 0.768,
+      pvRightFrac: 0.735,
+      pvRightXFrac: 0.9028,
+      gridFrac: 0.298,
+    },
+    /* A four-input body draws **two MC4 pairs per cheek** - four plugs a side,
+       one PV string per pair - so a single height per cheek is not enough to
+       aim with.  The rows are listed and `ivTerminals` averages each pair into
+       the midpoint of the two plugs that string actually uses.
+
+       Measured off the render's four cable bands: left cheek 0.738 / 0.774 /
+       0.807 / 0.842, right cheek 0.741 / 0.780 / 0.818 / 0.860 (slightly lower,
+       because that face also carries the AC lead higher up).  The plugs are
+       only 6 px apart in the 366x168 artwork, i.e. ~8 px once scaled to the
+       drawing, so the two strings of one cheek do end up close together - which
+       is what the hardware looks like.
+
+       The x fractions are the exception to the rule used by every other
+       cut-out here.  This render is much wider than the body it shows and its
+       crop keeps a band of empty background on *both* sides: the silhouette
+       only spans x 77..258 of the 366 px, so aiming at `photo.l` / `photo.r`
+       left all four connectors stopping 65-90 px short of the unit, hanging in
+       the white margin - and the thin diagonal cable lines the render draws
+       there happen to miss the exact rows the connectors land on (measured:
+       at row 127 only x 9-26 and 36-39 are opaque out of the whole 0..77
+       margin), which is why the gap reads as a gap and not as a joined cable.
+       Aiming a few pixels *into* the silhouette instead makes the run
+       disappear behind the unit, which is what "plugged in" looks like.  The
+       artwork paints over the connectors (`edges` are emitted before
+       `_unitImage`, and transparent crop pixels paint nothing), so the line is
+       hidden exactly where the unit covers it and nowhere else. */
+    "hiflow-pro-4in1.png": {
+      pvLeftFracs: [0.738, 0.774, 0.807, 0.842],
+      pvRightFracs: [0.741, 0.780, 0.818, 0.860],
+      pvLeftXFrac: 0.222,
+      pvRightXFrac: 0.696,
+      gridFrac: 0.238,
+    },
+  };
   /* One cut-out per SKU, matched to the port count the drawing shows.  The
      photo is part of the diagram rather than decoration: every connector stops
      on its edge, so a 4-input unit has to show a 4-input body or the two middle
@@ -377,11 +533,81 @@ function _hmPowerFlowRegister() {
   }
 
   /**
+   * The ports of one photo, in drawing coordinates.
+   *
+   * Each side is resolved on its own: `pvLeftX/Y` and `pvRightX/Y` are where a
+   * DC connector plugs into the left or right cheek, `pvBottom` is the inset a
+   * riser has to stop at, and `gridY` where the AC output leaves.  All of them
+   * come from `IV_TERMINAL_BY_ART`, so a connector stops on the cable the render
+   * actually shows.
+   *
+   * `gridY` is `null` when the artwork is not in the table, which keeps the
+   * caller's own estimate for an unknown / custom image.  The PV side always has
+   * a value: an unlisted image gets the photo corner plus `IV_TERMINAL_INSET`,
+   * which is where such a render's cable leaves anyway.
+   *
+   * `pvLeftSlots` / `pvRightSlots` are only filled in by an artwork that lists
+   * its plugs individually (`pvLeftFracs` / `pvRightFracs`).  One PV string is
+   * wired through an MC4 **pair** - a plus and a minus connector side by side -
+   * so the strings of such a body are counted in pairs and each lands on the
+   * midpoint of its own two plugs.  `null` means "one terminal per side, use
+   * `pvLeftY` / `pvRightY`".
+   *
+   * `pvSides` is `null` for every cut-out that follows the layout's own column
+   * order; an artwork that names it (`["right"]` for the Pro 1-in-1, whose only
+   * DC lead leaves the right face) pins each slot to that cheek.
+   */
+  function ivTerminals(art, photo) {
+    const name = String(art || "").split("/").pop().split("?")[0];
+    const spec = IV_TERMINAL_BY_ART[name] || null;
+    const yAt = (frac) => (Number.isFinite(frac) ? photo.t + frac * photo.h : null);
+    const xAt = (frac) => (Number.isFinite(frac) ? photo.l + frac * photo.w : null);
+    /* Four measured plugs per cheek are two MC4 pairs, not four strings: keep
+       the pair together by averaging the two heights.  A trailing odd plug is
+       its own terminal, so a 3-plug cheek still resolves. */
+    const pairUp = (fracs) => {
+      if (!Array.isArray(fracs) || !fracs.length) return null;
+      const out = [];
+      for (let i = 0; i < fracs.length; i += 2) {
+        const a = yAt(fracs[i]);
+        const b = i + 1 < fracs.length ? yAt(fracs[i + 1]) : a;
+        if (a !== null && b !== null) out.push((a + b) / 2);
+      }
+      return out.length ? out : null;
+    };
+    const inset = photo.b - IV_TERMINAL_INSET;
+    const leftY = yAt(spec && spec.pvFrac);
+    const rightY = yAt(spec && spec.pvRightFrac);
+    /* Both cheeks can name their own x, because a cut-out's crop is not always
+       tight around the body: the Pro 4-in-1 keeps a wide empty margin on *both*
+       sides, so aiming at `photo.l` / `photo.r` left all four connectors ending
+       in white space well short of the unit.  Unlisted artwork keeps the photo
+       edge, which is correct for a tightly cropped render. */
+    const leftX = xAt(spec && spec.pvLeftXFrac);
+    const rightX = xAt(spec && spec.pvRightXFrac);
+    const leftSlots = pairUp(spec && spec.pvLeftFracs);
+    const rightSlots = pairUp(spec && spec.pvRightFracs);
+    return {
+      pvBottom: inset,
+      pvLeftX: leftX === null ? photo.l : leftX,
+      pvLeftY: leftSlots ? leftSlots[0] : (leftY === null ? inset : leftY),
+      pvRightX: rightX === null ? photo.r : rightX,
+      pvRightY: rightSlots
+        ? rightSlots[0]
+        : (rightY === null ? (leftY === null ? inset : leftY) : rightY),
+      pvLeftSlots: leftSlots,
+      pvRightSlots: rightSlots,
+      pvSides: (spec && Array.isArray(spec.pvSides)) ? spec.pvSides : null,
+      gridY: yAt(spec && spec.gridFrac),
+    };
+  }
+
+  /**
    * One connector: straight out of the node, one rounded elbow, straight into
    * the unit.
    *
    * Written as `M / V / Q / H` so the existing `parsePath` / `reversePath`
-   * helpers understand it unchanged - the pearls then run along it and can be
+   * helpers understand it unchanged - the streak then runs along it and can be
    * reversed for a charging / exporting reading without the drawing moving.
    *
    * `x2` is the x the connector stops at (a photo edge) and `y2` the height of
@@ -389,9 +615,16 @@ function _hmPowerFlowRegister() {
    * line never appears to grow out of the middle of the ring.
    */
   function elbowRoute(node, x2, y2) {
+    const dir = x2 >= node.x ? 1 : -1;
+    const hx = node.x + dir * IV_CORNER;
+    /* A terminal level with the node leaves the ring sideways.  Routing it
+       through a rim would draw a loop smaller than the ring itself and the
+       connector would read as a knot rather than a cable. */
+    if (Math.abs(y2 - node.y) < NODE_R) {
+      return `M${node.x + dir * NODE_R} ${node.y} H${x2}`;
+    }
     const down = y2 > node.y;
     const rim = down ? node.y + NODE_R : node.y - NODE_R;
-    const hx = node.x + (x2 > node.x ? 1 : -1) * IV_CORNER;
     const gap = down ? y2 - rim : rim - y2;
     /* The single-input photo is proportionally taller, so its top edge sits very
        close to the grid node and the elbow would fold back on itself.  Shrink
@@ -443,6 +676,8 @@ function _hmPowerFlowRegister() {
     "pv.off": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX///////7+///8/f3e5euywtHnRgnjAAAFX0lEQVR42pVYS29bRRT+5twbWlEJj/MAtYmvx04igRGpnbgLioSom67YFGh+ZoWQYFXyIN00qE2NF8DCTSZOSpPWsScOQqjEMyyufe9MfJ24s5r7OOc7jzmvYXAXBRJlngYAtM0qKJDuD8x9zO+gnOYwCgDjMO1V5HcuICDtVbhR7WcAgKU046ZeFXIoQX6nnDOqWQXyLKV2AO8O48drDgZz+Jdzpl4loUOeJLT0Kry1amMwW9/JXLtZdfjld7w76da6RtIS/soySJyzmsC9la8ofuHFnzqVKz+SVi6BUWJ7enzsMP4t2ulKqk4J2FKsncwlIIi56/Vaoqwq+1vh+p45R+B1bre2knWDyv66OHZVuSJlKmY1wJDVOFNzDReBTkv1q3IYgSFZmEII4Yevgnld0xi6tJDZxzYCnZbqV9RwAnQOC5MhREhw89N/ttoX/A+TfXtjy0QE9KZ08AoXLnXUgyAACEq6hktWRk40IrN64kVwGUFjm4p9gvyeqcnLCHRGfZDv6ZBa+tuoywjQ2Vt8YgACyOOblwIAeoZ9JgACdENjpCVFKJIYSSKgc1R4YkCAx5UcBUAbtgAQaM/URhMpo7gAAaWzYDSCxvoEQAi4wqiLNQDCg3NZ4lzytPPKvSJ87cMO/aCx5BI8c5648IkZ63/av8tdgvRa/FlOTcMzS2eIlciWU+pfZ6Wn4s909MkTX/A3Fr+Dcr3qIpTFphVHjPmy/MjSaqpZXQYANOFzADjbyC1ELDROtO85OvPjclh9Uj98E/IsSh4nb4EiOQVC8u10z+K994wDtp84wTaSZwadVR2PCaQCsePYVcTg8YGEYZeQ5zwM1PjrAMA4mFUd4JHNUTPDBo6Py4ORo1KxNXjeukzbEhAQR4+I4UyfsRGqaMUQiDueVTM9wBfRhoMLS2jfFlHeeiTWQn417Iebqhi7ZnN0DrdnaP/bcNtV86F8fPXl15bQsE1GDLrS288e9PQZLxpyIszpCkzkNxbZl7uOIKsXMKybEMfc9g13ELRQbJDAM9AOgklyg5PALC7KQQBPQmBQRZGsNIBiIgZ3RLKSAq8mCMWEddok7IhLCp9QcDvilC2Ft97ftaJ8a6S0efpAFONdZrr9ar0mdnvineUnIiUI8BHnYqEWOj/39osnT/tMM/xNNTYZ2QKq2ajf237R33UPUlYEGL/6RWyCA7GcoHNaW11l1zcTG9HTzG4uqc94GDt9SflgcUA0ZGRYlpUJCV/w/5yI0/noo599Fve/tprUtc/iTtKJ0bajqyROimLUEkdeinylBopiHmAMeRsxymoaNHY/iZn/XdLbW/eFD+Of74fLHABbBtB0y5HgSvp6IGa80BlpAGfusCHnN4SPzMmX0nnd3Y2iwm1CiFIkfTSmrp2DeDq0ETCB9IHn9zeHFX/XSsH8cSjzSnE0N3griwD1uppR3MZMFSCgsTHRGIUgKJ3p8NBoGq33EQ0BeIC56WVwec9Epx+vt0OEzvrkCDIFd5q9rhLt3I1oYhkO0Ckd/t4/+F05eylEsKir0TjQOSpYk1ryOv28aVR/pNELaoIubo/FpHncjSeU13uLF2tBndshQG9o0gtq9vsLNZgym9oey17vFS6CoE5Pgyg96Bk1J4eeKNIV058Y+qNlRxY+rA2pD8jOXa9/dOgSmOzb6bHXyRRi/3Zr69X5aVf9NX0jmULsV678ZBJS3NrJXNK5FbKSqoukKppZZw/04Igvl3nTGsI8K88Gb9OFsT/z9oyZb53eTbd+CVQSATov30+Pv/cH5VI9k+dSu14l3VrNyqEXIXOlgYuQ1urQi5B3v2p598ucEa6L/gcZVSGaagDa8AAAAABJRU5ErkJggg==",
     "load.on": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX///////7//f3/qrH/WGb/UF/PHtmbAAAFO0lEQVR42q1YTW/bNhh++MpLk3aVKK1FkQKzKDlA0VyWOi32cRnQ9R/0h+4nbDts6A5zkw3Y1oNt2cPaNFgkUmtTN1vIHWwlImXLBTpebIl8+Lzf5CsGe7A4Q4+zkMMU0gxAvnQW2I9Rjl4opJEAGGe6GDAxbgFEOfVFIYsRACANWaiHWTJeCYjyXuQXeQaWAMglKAnj8cBCdGr/Ke+lepixtJhThGE+JKQYiGwpA4u9pDjJ0lFtj3RE98L8QGPZEN6jfRB3jCKw/2iPLl94lwq83L/yPemZs40Sv0XJKZs1AOzNfjCk0yaxTH6/uv0rnzUE6j0WhOWy0oN+Y4rIkrShnRDVwsVvt28Ou6sA0+uyN7V1oPLukGerAObsRXp9U9b9IG6erzB2JdTe17rGQOWno0C2AEp57eacYg6Id/JnRct6mIDt/mguAFTeeW5mbQC8lVfnFAQAfmImsnU9jC+jyYVZSYxirBnliEQFiJSZZusAuiuDZKHDrZ1XVyTWUhx98cQAHsBIvCxclcOtZrRd1ZiBACiTOQQpLwqWOmrrLJgni3iwJ9ykoTQVbjKR95gAD4i2jyyJWHCcptthGG4cB5ZcPNKYeSAlDt5Ysh73b29vvg3DLX1s6hO3aAPSA9Jzy0ak+smb2QyzWbSlubTsdDebEWLrJZjfF4uwKqg3sdQwTMFj8u5BHcG9vgQWKRxtTKwIvPaBJObxevVjlBZgFWmRijoFZ1yQQVHPHKZiIBh9s1hXBnVAVkBSnOZ1L3T7Emx0eK+S4iKXAYDGaUmwMo3+iAF9+DCpXpbd+nZGgbJgUovUIAHYST+4TL9U1SLWV4bI0jkIJfxf4ktSEypL69ijW1nNneUu2KsbddtvvcZlfPAzn4CakYgFQGk5S/HaYwYQy50CHxwGK5OIjTklqAF0Ahj3nLSOn4is7QQkTGLFloFVo1UHsj4fAtIRMbTQIEC2HdxOmgIEt8Do1mIDCpwtjcfbEIoaMlDQVvYbxyxgWmsac861JTXfeWUDMjQImWMFclzfZHBCh9Y7oQ2gjXKXB9J2FNk26TZMZKb2I9k6qcK9zRSWWyTIlkE1tM5tQECwSr3+eGKv93/ObJXJsUJpW5GNY8eKBG6tKMYWhZ9bjmbM1QHGr1OwsXt+BzR2EkgNa0LrQeAkUE4msgEmfHpBwU4SZzKR5DobqiYSGTcdQCZ0XXuppsldx4ey40tnF8MnlWv0xJmTN7IOV7FTB4pRFS3nznoqA+pAcZf35GRlggYA8x42rqQ1He2xs8c7DCE5pcjsV1RuzQj/4R1NrtZgbG5Z4wLkjQPeQbehtf6JLy04VAYkO1CdhtZGCQC6cUtjxpcAeV8R3mmI+3sCHRjO4sLm4B9xAOapcYoeH2XowPgqcKUNEwD6wAFM7mXzHGJffusYlpbpIDofZhIdwHDi2qbQo2VlmJ9U11DvunsMhVtbW5v2vZLUZ08WN7fonewk7u8li7jJA9YV69bTlKtxFWg6SyfrAH46N4IHAGcy0WhvB9hZ8npTVr2oFmW0hiL24nlP4y0umJ+f8razjVTvryu1lsbE/24+M20E0Z3vinpbVh7tnrdQkOr/ubgNU1W1ZW+y0rTk901VxSuPTQfsk+kqQPdvPuw63a6J1e5puVwNMd0/vejaLtpjlV/b1ksRybQf/HDRGNBlER6UPd28SUCM+/Ewkf9Diw8Zq+1w4yitnzlpUfbD/NCfLQOgzNnt0IxZuoir8LZ5Qf3k+SA+eo8PIe/3qQWItHQ+5iAZt95f1n4u+g+4/ipIMVqNyQAAAABJRU5ErkJggg==",
     "load.off": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX///////7+///6+/zL1uCuvs0UaJSEAAAE7klEQVR42q1Y30/cRhD+PDYB0sKtuWslTsJeTFApD+n5QqW+NReaf6DN39k+VarUEpK3IAW4oCrtAz/2jqSBisOLqVqpDbt9uF/ePZ8vkbJP9npmZ75vd2Z27MAcFAjc8x0GQMtkFxQIU8AxX6NjbPhMy+43ppMtRMcFCqTchp9ouQsAuOcwP7locjFWITpeibTuNIEIwDHgxowd7xk2HGP9jeXkoklcddckroTb8C+3sjacLF4vTi6axnrRsdvwO08U8gZ3H26CuMUax8ajGg0n3OGn9IHaIiVNBS35y9vR1NlQbPCk6rpDObYF35crORb4Hf7qINdXGb6oLre0pUDp+t87+dggw4N4akaaCuGdW49Dma+A9Ob28o42FCj96vWMGCMPTWfVuZ6JnkK48c9OgrFDhxQ90xkFuq69npbjFZCeVZcghwrhii4yAOiQFrso3D6CNygc8ryHwu1SpPskjB0hdYlyAaC8Voygh6L0pnc0opY+EBPkoZbkfNSzUFp5qycZANLz+JkGXIAW1n5KJspDBx/PzUgQoFoj4hEHKLJnE9Z1ia94pkcUnqT16q0TMg9Xeh7vaHiAGx6akIP2BvPhrxy1TdhOGgi4oPSzp8Ym8NPNxVlgdrY69afxIXQ/hXTh1E2OKH3AegliYRAFfZ/eSELATEpVnQ1Syh3TV+20QSRKTWPay+QN5765d1cBSLmaDEYb2beKxS3jRI7MhjK1GYDLH/omgmyeEicMpOKb7FzQANB5MnClkqWWRLlFvGRgPmWAfvqtP0Bx10B95ZCAgbkO4PBBFlMW9Y2jyGVZzJwB+leWdcP4jBo52vbowuDJ9EkyQpIhiQDgmllZPUOTBjmKW/XlhUV91r8mo5qxlzGgrTpZNs6BS5CWdV2zK3GWVxCz7WtWFKgOaUxIGFkPlZaEpp1PCpON7RIAr9geGZi6F4YCeT4iPnFYCjkJUBcpiHygBRb2R+U7vECB3heDyikrUhStuTSCWh/YFlQxTVqZrJAp0d6zFY64VePBrcJke2SGA8hhhkbbKi5JYAJgZDu9b0zojg3Jg5m8VbcwDQw07eAgOxzwPLOA3rK/3pB27QO0PXy8sK6MiksCo5F75Nijwn2QnVWAk+HjpW2dSbqxg1gNK562AQrd9LisWcdLbferw1v7pDqMPHnF7K14+8vYFKCV++95YBum/iHn9jmp38CDrtj3YfVN7+HQJsmRwlOjUUa9TDMSTWL1Zw7whzWeH4Yj0+4jgof2JyOoFXEASoxiDgRA3nfvmM34l/c5PCg4dy2eeIUB0NsWGaerHQEPCFqM282an5PGyZnfAjyg/errtsVGWwHoWBpBpaO6yV37I9lxN2+b/Q4XcAEd/reKyddQuv7iSdKlnPbL7ckcBXGH9y66Ca+ad7VcA+nn8mV/U1Vrsokgnm8O2oH0LM50avnjev3VtOyXQMVbZVLFu1yZ31LDDiU9j4tRULr+Vzd0u0VWBVflg0IEldL3KttlpaLQBKU9BIOjr5ZaZcHHyqt4vp/F3UHHEgUH4/qgsLJ2NG21ljok+26eub3Xh23hoNuVf3y0MJerwU8b7Eedkz33nEpORgAXMTvkH6LFhwzTqDr3e5QtWtHl9ebi5U4g8xSQdm4v0vxvtNy7XdNy6cRt+JePQ/GBfoS8/6+W9/+Z8w6/i/4HMs8B683VQP0AAAAASUVORK5CYII=",
+    "gridload.on": "data:image/png;base64,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",
+    "gridload.off": "data:image/png;base64,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",
     "battery.on": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX//////f/7/f+p1f9fsP9Uqv+4QbGVAAAEa0lEQVR42q1Yy27jNhQ9vNI0QR8WpWTQySwsSs6gSVYZox9QTLPvn7afUHQz3RRO0lVTjGXGwEwToBFJAW2DQUN2YTuWFMoPoNzZvEf3/SJD87BUYsAZj6GcdoWmnm4RNH8mJQYxh9MAEMOpEbLJCgBZGgqlVQEAyGMW27EUshOQlIOkp0oJ5AAKgLI4nYwaPFjj+4PMjSXLypncLCs1DXk5qvNgdX2DTN3JvKh9Iy/odVxeWPiOCM6GIN4yisDg7JSWfwRLgcxw5y3Z+9ZntJgksV3adom1w2hMHt5SjMzAw0HsvRhPvbLq9Lfkxa1rAcgMy9/9ukGnVycPXDcB6V7v51T7AagsiUvXAFD1esxlBz0cqfyLXV33g3j+0GHshclPf7A1DlR99SHSKwCV/vT5jEUIAOjvq+kqBrBciV+XHMgcfVBYee5N8ozrheN6ubvGmtPT+fWjp0kU6TpAVZBYABJjp3IdwPZllM11+HLw147GWhb65MIBAcBI3E7W0sOlwTPcIwSccW2BcgCw7X81hwYA8fWpwAaHgm8JCAHi71rfoswBzBUttYn1JULQdTZt16ocHLCy5fy+5kIGQP6w86S6OaXUpGzJZG6PJ/chUv7nE5uPvUowxyqETA5+ad8MZqXjTutWBJq+DF2AZurnAIsBACpJ0FCcg4uQwTV1KwC88xtWhp9rhlefaemRZ+7eUcPc7LvvQxE1dOZ7ebP2nbs63lDY0pkS10il7LyuNYwl4lSn163EMGk9bAQTxNSqjgTWFFBxAiw2PhIgVvLNAWzCKcM2ACQUYatjQmi9ObkDCNgS4OQ2EtknTfBRPeW/MATyXkQX/rLfQQ64rEO1DpHYXdwhaheHqss/HYDokm8HcDnrkCn06sbGtoAX4cIOxk5Zf5iF3nRwScLufPRyn0yXIwz393h0lPpI+t1G6Eggr6sZQOBeANM+IzGGTh06Uj2iSUcCeWPDoSSXaL+rtV8x6ooO7k8HkOuIGb+gsSart6l8TobCCGxaBwgRkTTbVL7IEiuSjQuNzQpOrDtNnxqJQ5N1aDQlvcJaEhec0K83GdtrhUqPLQUmikiHuA4bE27ZCHdXyMYo0NMMxL750W7UdsX+v1oCoDOxoRvOciCcTzWtaawxFzy29Xmlp+DNRoYVh6ezQuYc20wibvhsDE2D+SC+mt4cXfwzA5A8vnRrAenew66eZU8ZUX+toWgqzGRRjK3M1w/r+WyODQDgo8rsOiU+Zu+5XiwcVpjkerUWIohGdrnSVDfHluuVJsrnA30wH8TD3atVLNLk6CdVX8uqm+Vq52UwfN+ahsXhm+6xhnD4GD2LTbFSeW/aJVQaHI+j1mrpUvPSVn6EmJ78faXa265Wewd+hJgOo7fO03ZHZmA9cS7kMBoLX5/un7OhfbriywG/qy1hQX1tNi/jT27y+lyaq2p4UF5E9z4AqpIdxG7Ccje7Z7n7g4ZxORI3/9NDyPZPLY+POWo+Ra99zGk/F43w5LnoPwRx0jPx67CsAAAAAElFTkSuQmCC",
     "battery.off": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX///////7+///5+vvN1+Gtvs11K4XAAAAEYklEQVR42q1Y308bRxD+bu4oKBF4zzhSY4m79QFSwkPiA1fKIwT1L2j/1UqVKic0Ly1SCcZS2zwQs4YQoMW+5eiPh5bdPviw7y539p3UebJv59tvZnZ2dmcNJIUcgS3bYAC0DA5AjkgqGMm/Xg8tm2k5GmM6aMPrTQGQMnfsQMsDAMCWwezgusNFLsDrrXpaDzqAB6AHmL5d6b1NcBiJ+VuN4LpDXI3mJK6EuWMP23EOI+6v5QfHIjGf1zN37MGeQpZw88tdEE9FjaP1dZMmH8zJUPhStUnJJEBL/ku9Pnc5URv/Upt6QBncgr+WqxkMfI1/6GbaKt2jeqOvUwAKN/7az/YN0u36cwsyCXDXPnvlymwAwrsHjX2dAFD44nxB5OhD02V9MaKIAG7r7/0AuaJd8n7UMQDdNn+uyHwAwov6CiQAWAAA51FwqqboQ/HAfTNhoPDF+QWmiryKvDBHIdL3QcgVl0aBMgGg+vR8Xs4AhJd1HUSp4Z3qrpihD7UiHS9iqKz+q2cRAOHV5g8aMAGqPvk2mKkP7TxcXJCwANXn6UEPAFTaTMlGdvAvtjkKCFlfEWABpnucmot8AMBBym2EjoAF6je7KX1jZNJhavEdySFMGJvpGGljIQiCQH78JE7NC2nBYb9/EvODvDQ/hUWi9V16oMUAANdSpDLwxhGWMnVy63uAYQMAhuQhWVjBOMjaRWFZ2+aW2rpLVtvInsjqdiJ84vn3Fk/6zGuNxJy7r1UifgYJ3YkTkJ00IvFX3d0oMhnF9fssdeA8i6cNR5MMPe1EAlgq/wiBKh4loUGG4sUB1GHURCkxCbKMvgaxcgwGaSmKqystCaIMgco3KcgzCZTt3V72SZujDmg/bylyvg9YScBtSYA+QkmAXxIw0EFQCmCqk+PsJLOQuR2qVQyz3BbrlJusMqf4gZeJE4EMxovHiQyWa5JmeSblLGmmzzBAnbzcyP58R9rM3kHV7CuHJLDstcu0iNsgbZTZokzSHUpVvg7xm2bh0kcmI5KyRGUytKLwsHihUc0BJ+gaFQVwWwpSOlU8pyStQIcTnJvYIaNW0pf1UMR8rpAgnAo2peIFIuGzAws4efYmxiqQe+w6jwajLWokWq+fcn0+Wx8IWIDT5/HIegmlXnz3LLVjN60CQW1tR2WmYP4ZdsgBE9DuP+sFTjq6fb4XjBjocPl0NoHjD3h00Q14fdyx5BOET0Xvvh1Q/eXuTILakhi3A+GlH+vUcorCxod5OWbg/WWavvF4bamtJi1NeOX/yaZ5QTcbf4wuq+b9Rdw+mtZyuKufRxf6qMsKhT8tUBRGHowPFLXSXxa5xYCUv3TfkpjjjsVzunlGubUn7+dTraV2qT73WzaCn21O2sJxtys/PqwuZiL42Q77Rmccim+NmsrIcy58dsz/jxYf0g29+uI7L14GvGG4+3i478gsAMLBg8e09Cs1oj6WGpUT86U9fOWKKQ8hlaD4Q0j5p5byjzkFnov+Awfpysp4Vtq4AAAAAElFTkSuQmCC",
     "plug.on": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAABgBAMAAAAQtmoLAAAAElBMVEX////+///+/f/g0/+7m/+0k/9Qi3+AAAAFc0lEQVR42qVYXW/cRBQ9c+02aQvZ8aZItFBnPBuppUJt4oZHRJXsP4C/WxBC4qnZJpWKCuo6EyPUIhHP2BJVBc0MD/vl8drZVPghq4zv8bkzc++5d4bBfyhWGPCIcTij3QgUK9+A+f/KDIMo0c4AYDwq9AgyuwBAllKhjZ7YyIhFdqyE6gTIbCCdPlOABJABtMtENhINrxbfx2B4ICbWkw8AtDdMIdoZKA4SfaY8n2VGKS+ObCuBCIYHINFgFdgb7tBiIFi8KtO1J2SND3BG/NKPaqMLrE17Y2rhVmJUDloYxOatcd7qq9l6KfmfrrlCNEypY/UggqEQDZfi1I3iLkB+bga57xJVX4x51/7A0Wv58bqpM8SpzTvtARurGUUwJbib9Uw3AJW+PaWYALa23/6qL7CHc+z2sZu7RL/3CouLnxP2QABACABxaNUKe8Qqfr5gEJlYBcgzimcAeerylQw2NlxOJ90b/L1mVgFQvbl/5AACKOeVR0BSzv/WKO6wWSgE+/UoksLLhlpEbe8IgAHi5nujajJDCUcEOAOd1TWD2OMfLEKA+KuFvc0fRRGcAVifu0SPFiliicUKIeg0yReOBrtJkWmrAEjG+5Id1rbCcKEYSH6u5gzBvtWj2hx2+/ZJzadvMkWIeS1hUzse0WzaUtrDjPbrGpMDhOFiYPvbhmxIBN/Nkw1iTyBwgTh187z+65+33hZqsjeuvpsN8etX14mYWwRq73nRjAgaLTJRGQ6ySTGnVIiXglCwxa7SSV+RqGca47lo6v9uPY9KCtXgaW1kG0eylhsUZwNxtvAPpQ2J1+WuHNAIJGAVSCCz+aO+8fwTITO+oEimswwAbAZKosSV3nsewtWzmblS6sQ4AyBCxLjzKo4KPwpZ4RUY1tMR+lMAnI58QT35Okway8giZxBFAGa/3tMP+b9Ygvi//ktyq7PZqy8EdAqGXhJDC9AFmh1FbgnBQtdJX9oyWS5HIahDVV3vqYJotBYCxDsJivDgWcsqda9IkfQfli3tQudDMBYfAtgwvWrZ4bDTntufzsmxyzM49vA4WZ5D2BkZzMjNHluuwKhNTHhoXvISAIpamiuQ9w3d8xDggPPLMSdTx2dlM3g106oWbeQI9QYtzkruhaiJirHwlihkNS1GbiEjaIBxOAPGeeH3RIyH5oYnjGNEIpolnHMnZ40eyoUnX/pSOg42SjbZYO36h83OuAhd/8hHCHs4aUStwlBmnr3dNiFYIyHUHWmnnbFF1kgH/p7cUnxtZpOiIm3eo6XtD20jhi1V6QgkrMroUVMF1E0ViOAq9+WV3b92rdCGpBQvfASxe6ehusIbmzuGTBLDOLOvmorCejag8l4zczV7d319HW78shmqgysABQfNmUngK0HB42YfDrG3A7LLwpSRnLQRTY8UPxKEuHzQ/JK1U11sZGfgSBHU5dWYuRgEOtnMlzWpTXHjnQIgWMeWmm41bu0TeaVAk66mTUyarhJzajqXfbrMDMT2zuRT1rXbN2lJGDFpQ7fok/WWpWoMUSmO9cRZetayTstrtHsmprPLHItXttKU8yqbaWus5EoKO21aAgCojDxftd+0e7ZmZnJvhemv6NZF0PveLk4o1Zv7ll/EQaWcEEwBbiv49NhdANjavPujrh/Lqjfy/AIKKnf/WPOOZfaOGajOpSWbuufKP4tWr+XGb67ToVvjWZmYAdxW+dl51Y4QeVrMT23z067R/Vu2FSHydO1n11JFR+XAtsStUGmvVlRqFvEzdmCXj/hqj5/VDmFB/aBdRolVsi6PsqjSqDiOTRsAVcGiyJ1gDpFaUxoVoy3VcRFCdtDfMN5FSMSzkXdx8f+uWj78MucS10X/AUBxVFYRJPxDAAAAAElFTkSuQmCC",
@@ -620,7 +855,7 @@ function _hmPowerFlowRegister() {
    * pattern used here before swallowed the control point of
    * `Q104 200 114 200` into the argument list of the preceding `V`, which
    * turned the real path "M104 142 V190 Q104 200 114 200 H283" into a seven
-   * point zigzag.  The pearls on every charging battery and on PV1 therefore
+   * point zigzag.  The streaks on every charging battery and on PV1 therefore
    * jumped up and down the left connector - the direction looked broken
    * because the path itself was.
    */
@@ -657,7 +892,7 @@ function _hmPowerFlowRegister() {
   /**
    * Flatten one of our connectors into a polyline with cumulative lengths.
    *
-   * The card places the pearls itself, so it needs a point at an arbitrary
+   * The card measures the connectors itself, so it needs the length of an
    * distance along a connector.  Doing that in plain JavaScript (rather than
    * `getPointAtLength` on every frame) keeps the animation off the layout
    * engine and - just as useful - keeps it testable outside a browser.
@@ -681,8 +916,8 @@ function _hmPowerFlowRegister() {
          interpolating between the samples cannot be seen. */
       let px = a.x;
       let py = a.y;
-      for (let k = 1; k <= PEARL_QUAD_STEPS; k += 1) {
-        const t = k / PEARL_QUAD_STEPS;
+      for (let k = 1; k <= CURVE_STEPS; k += 1) {
+        const t = k / CURVE_STEPS;
         const u = 1 - t;
         const x = u * u * a.x + 2 * u * t * b.q.x + t * t * b.x;
         const y = u * u * a.y + 2 * u * t * b.q.y + t * t * b.y;
@@ -742,44 +977,13 @@ function _hmPowerFlowRegister() {
   }
 
   /**
-   * How fast a pearl travels, in SVG units per second.
-   *
-   * The power sets the speed, but the *travel time* is kept between
-   * `DOT_DUR_MIN` and `DOT_DUR_MAX`: an 18 px stub would otherwise flick past
-   * in a flash, and a long connector at low power would crawl.
-   */
-  function pearlSpeed(power, len, speedScale = 1) {
-    const scale = speedScale > 0 ? speedScale : 1;
-    const raw = clamp(
-      DOT_SPEED_MIN + Math.abs(num(power)) * DOT_SPEED_PER_W,
-      DOT_SPEED_MIN, DOT_SPEED_MAX,
-    ) * scale;
-    if (!(len > 0)) return raw;
-    return clamp(raw, len / DOT_DUR_MAX, len / DOT_DUR_MIN);
-  }
-
-  /**
-   * Opacity of a pearl along its lap: it fades in over the first
-   * `PEARL_FADE_IN` of the connector and out over the last `PEARL_FADE_OUT`, so
-   * it never pops into or out of existence at the ends.  A short stub skips the
-   * fade - it would spend most of the lap invisible.
-   */
-  function pearlOpacity(phase, fade) {
-    if (!fade) return PEARL_OPACITY;
-    const p = phase - Math.floor(phase);
-    if (p < PEARL_FADE_IN) return PEARL_OPACITY * (p / PEARL_FADE_IN);
-    if (p > 1 - PEARL_FADE_OUT) return PEARL_OPACITY * ((1 - p) / PEARL_FADE_OUT);
-    return PEARL_OPACITY;
-  }
-
-  /**
    * Reversed copy of a connector, so a flow can run the other way (charging
    * into the battery, importing from the grid) without moving the drawing:
    * "M236 182 H105 V376" -> "M105 376 V182 H236".
    *
    * Both traps worth remembering: a segment that changes in *both* x and y
    * must stay an `L` (emitting `H` collapsed the two diagonals into a
-   * horizontal line, so their pearls flew off the drawing), and a rounded
+   * horizontal line, so their streaks flew off the drawing), and a rounded
    * corner keeps its control point when it is walked backwards.
    *
    * Done here instead of with SMIL `keyPoints` because keyPoints support is
@@ -805,59 +1009,72 @@ function _hmPowerFlowRegister() {
     return out;
   }
 
+  /** The path a route's streak actually travels, cached both ways round. */
+  const TRAVEL_CACHE = new Map();
+
+  function travelPath(route) {
+    const key = `${route.reverse ? "r" : "f"}:${route.d}`;
+    const hit = TRAVEL_CACHE.get(key);
+    if (hit !== undefined) return hit;
+    const out = route.reverse ? reversePath(route.d) : String(route.d);
+    TRAVEL_CACHE.set(key, out);
+    return out;
+  }
+
   /**
-   * Markup for the pearls of one connector, placed at `phase` (0..1 of the
-   * connector; a second pearl rides half a lap behind).
+   * Markup for one connector's streak, as a run of slices that fade out.
    *
-   * There is deliberately no SMIL here.  The old version used
-   * `<animateMotion begin="0s">`, which looks like the obvious tool, but a
-   * rebuilt animation element is positioned at
+   * The connector itself keeps its own grey (`pf-edge`); what travels along it
+   * is one streak of light, drawn as `STREAK_SLICES` short dashes.  `t` runs 0
+   * at the head to 1 at the tail: the head is white and opaque, the tail is the
+   * branch colour at almost nothing, and the slices in between are
+   * interpolated - a comet rather than a bar.
    *
-   *     (document time / dur) mod 1
-   *
-   * and this diagram is rebuilt about once a second, because the powers keep
-   * changing.  With the document time in the thousands of seconds, a 0.01 s
-   * change in `dur` - which is what 197 W -> 198 W produces - shifts that by a
-   * tenth of the connector.  Measured on the live card, a dot teleported up to
-   * 100 px in a single frame: it flickered instead of flowing.  Placing the
-   * pearls by hand puts the phase on the card, so a rebuild picks the dot up
-   * exactly where it was and a change of speed only changes how fast it
-   * travels.  See `_advancePearls`.
-   *
-   *  * travel speed follows the connector length and the power, so equal power
-   *    moves at an equal speed everywhere;
-   *  * `reverse` sends the flow the other way (charging into the battery,
-   *    importing from the grid) without moving the drawing;
-   *  * each pearl fades in and out at the ends instead of popping into place;
-   *  * longer connectors carry two pearls, half a lap apart, which reads as one
-   *    continuous flow instead of a lone dot every few seconds.
+   * Slice `i` sits `i * slice` further back than the head, so
+   * `dashoffset = length - head` becomes `offset_i = offset_head + i * slice`,
+   * and every slice is animated by the same keyframes - the run moves as one
+   * piece.  The three end points travel as CSS variables because the keyframes
+   * cannot know a connector's length, while all of them share one animation.
    */
-  function flowPearls(route, phase) {
-    const power = Math.abs(num(route.power));
-    if (power < MIN_FLOW) return "";
-
-    const travel = route.reverse ? reversePath(route.d) : route.d;
-    const len = pathLength(travel);
-    if (!(len > 0)) return "";
-
-    const count = len > PEARL_SECOND_MIN_LEN ? 2 : 1;
-    const fade = len > PEARL_FADE_MIN_LEN;
+  function flowBeam(plan) {
+    const { route, travel, len, stage, cycle, delay } = plan;
+    const streak = clamp(len * STREAK_SHARE, STREAK_MIN, Math.min(STREAK_MAX, len));
+    const slice = streak / STREAK_SLICES;
+    /* The gap is well over the connector, so the pattern cannot repeat on it:
+       exactly one streak is ever on the wire, however long the line is. */
+    const gap = 2 * len + slice;
+    /* One negative delay for every connector on the diagram.  It is the part of
+       the shared cycle that has already run, which is what keeps the branches
+       in step across the re-render that every reading change causes. */
+    const delayText = (-delay).toFixed(2);
+    const stageName = `hm-pf-${FLOW_STAGES[stage] || FLOW_STAGES[0]}`;
 
     let out = "";
-    for (let i = 0; i < count; i += 1) {
-      const p = phase + i / count;
-      const at = pointAt(polyline(travel), p * len);
+    for (let i = 0; i < STREAK_SLICES; i += 1) {
+      /* 0 at the head, 1 at the tail. */
+      const t = i / (STREAK_SLICES - 1);
+      const shift = i * slice;
+      const from = slice + shift;
+      const to = slice - len + shift;
+      const park = slice - len - streak + shift;
+      const width = (STREAK_WIDTH - (STREAK_WIDTH - STREAK_TIP) * t).toFixed(2);
+      /* Nearly gone by the tail, but not quite: a slice that reaches zero
+         disappears in a step of its own, which is exactly the banding this is
+         meant to avoid. */
+      const opacity = (1 - 0.94 * t).toFixed(3);
+      const colour = mixHex("#ffffff", route.color, Math.min(1, t * 1.7));
+
       out += `
-      <g class="pf-pearl" data-pf="${route.id}:${i}"
-         data-pf-path="${esc(travel)}" data-pf-power="${power.toFixed(1)}"
-         data-pf-fade="${fade ? 1 : 0}"
-         transform="translate(${at.x.toFixed(2)} ${at.y.toFixed(2)})"
-         opacity="${pearlOpacity(p, fade).toFixed(3)}">
-        <circle class="pf-glow" r="6.8" fill="${route.color}"/>
-        <circle class="pf-dot" r="3.2" fill="${route.color}"/>
-      </g>`;
+        <path d="${esc(travel)}" fill="none" stroke="${colour}"
+              stroke-width="${width}" stroke-opacity="${opacity}"
+              stroke-linecap="${i === 0 ? "round" : "butt"}"
+              stroke-dasharray="${slice.toFixed(2)} ${gap.toFixed(2)}"
+              style="--hm-from:${from.toFixed(2)}px;--hm-to:${to.toFixed(2)}px;`
+        + `--hm-park:${park.toFixed(2)}px;animation-name:${stageName};`
+        + `animation-duration:${cycle.toFixed(2)}s;animation-delay:${delayText}s"/>`;
     }
-    return out;
+
+    return `<g class="pf-beam" data-pf-beam="${route.id}">${out}</g>`;
   }
 
   /* ------------------------------------------------------------------ *
@@ -925,6 +1142,27 @@ function _hmPowerFlowRegister() {
     return Math.min(Math.max(value, min), max);
   }
 
+  /** `#rrggbb` (or `#rgb`) -> `[r, g, b]`. */
+  function hexRgb(hex) {
+    let h = String(hex || "").trim().replace(/^#/, "");
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    if (!/^[0-9a-f]{6}$/i.test(h)) return [255, 255, 255];
+    return [
+      parseInt(h.slice(0, 2), 16),
+      parseInt(h.slice(2, 4), 16),
+      parseInt(h.slice(4, 6), 16),
+    ];
+  }
+
+  /** Blend two hex colours (`t` 0 -> `from`, 1 -> `to`) as `rgb(...)`. */
+  function mixHex(from, to, t) {
+    const a = hexRgb(from);
+    const b = hexRgb(to);
+    const k = clamp(t, 0, 1);
+    const at = (i) => Math.round(a[i] + (b[i] - a[i]) * k);
+    return `rgb(${at(0)},${at(1)},${at(2)})`;
+  }
+
   /**
    * Signal strength tiers, shared with the battery card so both cards draw the
    * same icon for the same reading. Returns the number of lit bars (0..4).
@@ -953,15 +1191,32 @@ function _hmPowerFlowRegister() {
       this._hass = null;
       this._config = null;
       this._cache = new Map();
-      /* Pearl animation state.  It lives on the card rather than in the markup
-         because the diagram is rebuilt roughly once a second; see
-         `_advancePearls`.  Deliberately not cleared by `setConfig`, so editing
-         an unrelated option does not restart every dot. */
-      this._pfPhase = new Map(); // route id -> 0..1 along its connector
-      this._pfPower = new Map(); // route id -> low passed |P|
-      this._pfPearls = []; // live nodes + geometry, refreshed per render
-      this._pfRaf = 0;
-      this._pfLast = 0;
+      /* Start of the shared flow clock, in `performance.now()` milliseconds.
+         0 means "not started yet", which `_beamPlan` fills in on the first
+         render.  All the streaks are driven by CSS animations from this one
+         origin, so nothing here has to be animated by hand - which is also why
+         a diagram that is detached and re-attached (switching dashboard tabs
+         does that) keeps moving. */
+      this._pfEpoch = 0;
+      /* The cell's own `grid-column`, captured before `_syncRowSpan` first
+         overrides it; `undefined` means "not captured yet", and
+         `_rowSpanHidden` records whether the override is currently applied. */
+      this._rowSpanBase = undefined;
+      this._rowSpanHidden = false;
+      /* Width of the drawing while the card shares its row, in px.  The
+         schematic keeps exactly this size once the alarm list hides and the
+         card takes the whole row (see `_wrapStyle`), so the card's height does
+         not change when a device stops reporting faults.  `_halfWidthBase` is
+         the card width the number was measured against, so a resized window
+         re-measures instead of reusing a stale figure. */
+      this._halfWidth = 0;
+      this._halfWidthBase = 0;
+      /* Frames left to retry an early, pre-layout measurement - see
+         `_remeasureLater`. */
+      this._remeasureTries = 0;
+      /* Watches the card's width so a measurement taken before the dashboard
+         settled is corrected - see `_watchHalfWidth`. */
+      this._halfWidthObserver = null;
     }
 
     static getConfigElement() {
@@ -990,7 +1245,43 @@ function _hmPowerFlowRegister() {
         .signal .bars { display: block; width: 22px; height: 18px; flex: none; }
         .chip { display: inline-flex; align-items: center; gap: 6px;
                 font-size: 14px; color: var(--primary-text-color); }
-        .wrap { display: flex; justify-content: center; }
+        /* The role chip: only a master or a slave shows one (see _roleChip),
+           so it is coloured quietly - it explains the drawing, it is not a
+           warning.  No backtick characters in here: this whole block is a
+           template literal, so a stray one would end the string early. */
+        .role { font-size: 12.5px; line-height: 1; padding: 4px 8px;
+                border-radius: 999px; border: 1px solid currentColor;
+                font-weight: 500; opacity: 0.8; }
+        .role.master { color: var(--primary-color); }
+        .role.slave { color: var(--secondary-text-color); }
+        .wrap { display: flex; justify-content: center; position: relative;
+                /* The drawing fills the cell unless a "max_width" caps it, and
+                   a cap (when there is one) leaves it centred.  On the Device
+                   tab the cap is off, so the schematic grows with the card in
+                   both of that page's shapes: half of the row while faults
+                   are listed beside it, and the whole row once they are not. */
+                margin: 0 auto; }
+        /* Health badge in the corner of the schematic.  It sits *over* the
+           drawing rather than in the header because the header is about the
+           device (name, role, signal) and this is about its condition: a green
+           tick when the alarm sensor reports nothing, a red lamp when it does.
+           Nothing is drawn at all when the card has no alarm entity, so the
+           System tab - which has no single device to ask - shows no badge. */
+        .health { position: absolute; left: 2px; top: 0; display: inline-flex;
+                  align-items: center; gap: 5px; font-size: 12.5px;
+                  font-weight: 600; line-height: 1;
+                  /* No plate behind it: the badge sits straight on the card and
+                     is the only coloured thing in the corner, exactly like the
+                     G3 dashboard.  The count lives in the tooltip rather than
+                     next to the icon, which keeps the corner quiet. */
+                  background: none; }
+        .health svg { display: block; flex: none; }
+        .health.ok { color: #15803d; }
+        /* The vendor app's warning tone: a saturated red, not the theme's
+           error colour, so the triangle reads the same on a dark dashboard
+           as on the light one the app uses. */
+        .health.warn { color: #e53935; }
+        .health.unknown { color: var(--secondary-text-color); }
         svg { display: block; width: 100%; height: auto; }
 
         /* --- the schematic ------------------------------------------------
@@ -1005,16 +1296,48 @@ function _hmPowerFlowRegister() {
            the middle, which the app draws a little larger. */
         .pf-ic { display: block; }
 
-        /* A pearl's opacity is written every frame (see pearlOpacity), so it
-           must NOT be declared here: a stylesheet rule beats the presentation
-           attribute, and the fade in / out would never be seen. */
-        .pf-glow { opacity: 0.2; }
-        .pf-dot { stroke: #fff; stroke-width: 1.15; }
+        /* The travelling streak.  Note what is *not* here: stroke-linecap.
+           Each slice sets its own as a presentation attribute (the tip is
+           round, the rest butt), and a rule of equal specificity would beat it
+           and turn the smooth fade back into visible beads. */
+        .pf-beam path { fill: none; stroke-linejoin: round;
+                        animation-timing-function: linear;
+                        animation-iteration-count: infinite; }
+        /* The three stages of the shared cycle: gather into the unit (in), run
+           through it to the junction (trunk), leave towards the load (out).
+           Each ends exactly where the next begins, so nothing downstream can
+           light up before what feeds it has arrived.  The end points come in
+           as CSS variables because they depend on the connector's length. */
+        @keyframes hm-pf-in {
+          0%, 4% { stroke-dashoffset: var(--hm-from, 100px); }
+          30% { stroke-dashoffset: var(--hm-to, 0px); }
+          35%, 100% { stroke-dashoffset: var(--hm-park, -100px); }
+        }
+        @keyframes hm-pf-trunk {
+          0%, 30% { stroke-dashoffset: var(--hm-from, 100px); }
+          55% { stroke-dashoffset: var(--hm-to, 0px); }
+          60%, 100% { stroke-dashoffset: var(--hm-park, -100px); }
+        }
+        @keyframes hm-pf-out {
+          0%, 55% { stroke-dashoffset: var(--hm-from, 100px); }
+          82% { stroke-dashoffset: var(--hm-to, 0px); }
+          87%, 100% { stroke-dashoffset: var(--hm-park, -100px); }
+        }
 
         .pf-v { font-size: 19px; font-weight: 600;
                 fill: #1f2933; letter-spacing: 0.2px; }
         .pf-soc { font-size: 15px; font-weight: 500; opacity: 0.9; }
         .pf-c { font-size: 13px; fill: #8b95a5; }
+        /* The micro-inverter layout has no white plate to sit on any more (see
+           _inverterSvg), so its labels take the card's own text colours.  The
+           storage schematic keeps the fixed greys above: its drawing is still
+           painted on white and would lose contrast on a dark dashboard. */
+        .pf-iv { fill: var(--primary-text-color, #1f2933); }
+        .pf-iv-c { fill: var(--secondary-text-color, #8b95a5); }
+        /* The backdrop of the micro-inverter drawing: the card's own surface,
+           not a white rectangle, so the schematic reads as part of the card in
+           either theme. */
+        .pf-bg { fill: var(--card-background-color, #ffffff); }
         /* The product photo in the micro-inverter layout.  It is a transparent
            cut-out, so it is drawn straight on the backdrop with no frame. */
         .pf-body { display: block; }
@@ -1034,6 +1357,223 @@ function _hmPowerFlowRegister() {
     set hass(hass) {
       this._hass = hass;
       this.requestUpdate();
+    }
+
+    /**
+     * Widen the card's grid cell while the device reports no alarms.
+     *
+     * The Device tab places this card (24 columns) beside the alarm list (24)
+     * in one grid section, so the two are equal halves while a fault is on
+     * screen - the vendor app's own layout for that page.  Both spans live in
+     * the stored dashboard config, so the section alone cannot know that the
+     * alarm card hid itself: it would keep reserving the right half and leave a
+     * blank panel next to the schematic.  Asking the *cell* to span the whole
+     * row instead is the only place that can react to live state, and it
+     * degrades quietly: without a grid-item wrapper (a non-sections dashboard,
+     * a `picture` embedding, a test page) nothing is touched at all.
+     *
+     * The element to style is found by walking up until an ancestor actually
+     * carries the card's `grid-column` - `hui-card` itself is `display: inline`
+     * and its parent is the grid item in the current dashboard markup, so
+     * writing to `hui-card` was silently a no-op there.
+     *
+     * Spanning the row is *not* what grows the drawing.  The Device tab's card
+     * carries no width cap (``max_width: 0``), so without a counter-measure the
+     * schematic would scale with the cell it is given - twice as wide, and
+     * therefore twice as tall, the moment the alarm list hides.  The user asked
+     * for the opposite: the card's height must be the same in both shapes, only
+     * its length changes, with the schematic centred in the extra space.  So
+     * while the span is applied `_wrapStyle` caps the drawing at the width it
+     * had in half a row and `justify-content: center` puts it in the middle.
+     *
+     * The System tab has no alarm entity - there is no single device to ask -
+     * so it never takes this path and keeps its own width.
+     */
+    /**
+     * Whether the card has to own its whole row: it has an alarm list, and that
+     * list is empty (or has not been heard from) so it hides itself.
+     *
+     * The alarm card drops out on *both* "no alarms" and "nothing heard yet"
+     * (`only_when_alarm` treats a silent device as nothing to show), so the
+     * schematic has to reclaim the row in both cases.  Deriving this from the
+     * readings alone - never from the layout - is what lets it be asked at three
+     * different moments: by `_signature` (so a change triggers a render), by
+     * `willUpdate` (so the very first paint of that render already has the right
+     * width cap) and by `_syncRowSpan` (where the cell is actually written).
+     */
+    _rowSpanWanted() {
+      if (!this._config || !this._config.alarm_entity) return false;
+      const count = this._alarmCount();
+      return count == null || count === 0;
+    }
+
+    _syncRowSpan() {
+      if (!this._config || !this._config.alarm_entity) return;
+      const cell = this._gridItem();
+      if (!cell) return;
+      /* The dashboard's own inline style is the value to restore, so it is
+         captured once, before the first override.  Writing "" instead would
+         drop the cell back to a single column on a wide screen. */
+      if (this._rowSpanBase === undefined) this._rowSpanBase = cell.style.gridColumn || "";
+      this._rowSpanHidden = this._rowSpanWanted();
+      if (this._rowSpanHidden) {
+        if (cell.style.gridColumn !== "1 / -1") cell.style.gridColumn = "1 / -1";
+      } else if (cell.style.gridColumn === "1 / -1") {
+        /* Only undo an override this card made - on a narrow screen, or when
+           the dashboard has re-laid the row out itself, the restored value is
+           already whatever it should be. */
+        cell.style.gridColumn = this._rowSpanBase;
+      }
+    }
+
+    /**
+     * The element the dashboard's grid actually sizes, or ``null``.
+     *
+     * Sections wrap every card in ``<hui-card>``, but the *span* is set on the
+     * element around it (``hui-card`` is ``display: inline`` and inherits the
+     * width of its parent grid item).  So the search starts at the closest
+     * ``hui-card`` and walks outwards until it finds an ancestor that either
+     * already carries a ``grid-column`` or whose parent is a grid container.
+     */
+    _gridItem() {
+      let el = this.closest ? this.closest("hui-card") : null;
+      if (!el) {
+        // A plain `custom:...` card outside a sections dashboard: the wrapper
+        // HA creates still counts, as long as it is a grid child.
+        el = this.parentElement;
+        if (!el) return null;
+        const host = el.parentElement;
+        if (!host) return null;
+        const display = getComputedStyle(host).display;
+        return display === "grid" || display === "inline-grid" ? el : null;
+      }
+      let node = el;
+      for (let depth = 0; depth < 6 && node; depth += 1) {
+        if (node.style && node.style.gridColumn) return node;
+        const parent = node.parentElement;
+        if (!parent) break;
+        const display = getComputedStyle(parent).display;
+        if (display === "grid" || display === "inline-grid") return node;
+        node = parent;
+      }
+      return el;
+    }
+
+    /**
+     * Settle the row span *before* the template is evaluated.
+     *
+     * Whether the card owns the whole row follows from the readings alone, so it
+     * can be decided here instead of in `updated()`.  That matters because the
+     * width cap in `_wrapStyle` is part of the template: deciding it afterwards
+     * would paint one frame of a full-width, full-height drawing before the cap
+     * snapped it down, which on a slow Raspberry Pi is a very visible jump.
+     *
+     * The DOM write itself still happens in `_syncRowSpan()`, which runs after
+     * the update - `willUpdate` must not touch the document.
+     */
+    willUpdate() {
+      this._rowSpanHidden = this._rowSpanWanted();
+    }
+
+    updated() {
+      super.updated();
+      this._syncRowSpan();
+      this._measureHalfWidth();
+      this._watchHalfWidth();
+    }
+
+    /**
+     * Remember how wide the schematic is while the card shares its row.
+     *
+     * That number is the width the drawing keeps once the alarm list hides and
+     * the card spans the whole row - see `_syncRowSpan` and `_wrapStyle`.  It is
+     * measured rather than hard coded because it depends on the dashboard's own
+     * column width, the card padding and any `max_width` cap, and because the
+     * half-row layout is the one an idle device has been drawing all along: the
+     * picture simply stays exactly the size the user is used to.
+     *
+     * Two situations have to be handled, and only one of them is free:
+     *
+     * - the card is already narrow (alarms on screen), so the wrap *is* at the
+     *   width to remember and can be read directly;
+     * - the card spans the row (no alarms yet) and the box on screen is the
+     *   capped one - reading it would feed the cap back into itself and shrink
+     *   the drawing on every render.  Here the dashboard's own column is
+     *   restored for a single synchronous reflow, measured, and put back.  That
+     *   costs one layout, so it only happens when the card width has changed
+     *   since the last measurement (first render, window resize, rotation).
+     */
+    _measureHalfWidth() {
+      if (!this.renderRoot) return;
+      const wrap = this.renderRoot.querySelector(".wrap");
+      if (!wrap) return;
+      const container = wrap.parentElement || wrap;
+      const base = Math.round(container.clientWidth);
+      if (!this._rowSpanWanted()) {
+        const width = Math.round(wrap.clientWidth);
+        if (width <= 0) return this._remeasureLater();
+        this._halfWidth = width;
+        this._halfWidthBase = base;
+        this._remeasureTries = 0;
+        return;
+      }
+      if (base > 0 && base === this._halfWidthBase && this._halfWidth > 0) return;
+      const cell = this._gridItem();
+      if (!cell) return;
+      const span = cell.style.gridColumn;
+      const cap = wrap.style.maxWidth;
+      cell.style.gridColumn = this._rowSpanBase || "";
+      wrap.style.maxWidth = "none";
+      const width = Math.round(wrap.clientWidth);
+      cell.style.gridColumn = span;
+      wrap.style.maxWidth = cap;
+      /* A card can be laid out before the dashboard around it is, which reads
+         as a zero-width wrap - ask again next frame instead of leaving the
+         drawing on the "50%" guess until the next reading happens to change. */
+      if (width <= 0) return this._remeasureLater();
+      this._halfWidthBase = base;
+      this._remeasureTries = 0;
+      if (width !== this._halfWidth) {
+        /* `_wrapStyle` reads the number during render, and the measured width is
+           part of `_signature`, so this asks for that render. */
+        this._halfWidth = width;
+        this.requestUpdate();
+      }
+    }
+
+    /** Retry `_measureHalfWidth` on the next frame, a few times at most. */
+    _remeasureLater() {
+      const tries = (this._remeasureTries || 0) + 1;
+      this._remeasureTries = tries;
+      if (tries > 6) return;
+      requestAnimationFrame(() => {
+        if (this.isConnected) this._measureHalfWidth();
+      });
+    }
+
+    /**
+     * Watch the card's own width, so a stale measurement cannot survive.
+     *
+     * A first render can happen before the dashboard has decided how wide the
+     * section is - the card is briefly laid out at some provisional width, which
+     * would otherwise be remembered as "half a row" for the rest of the session.
+     * There is no reading to wait for (`quick/state` re-renders are gated by
+     * `shouldUpdate`), so the size itself is the signal.  The callback only acts
+     * when the *width* changed, because the cap changes the card's height.
+     */
+    _watchHalfWidth() {
+      if (this._halfWidthObserver || typeof ResizeObserver === "undefined") return;
+      const wrap = this.renderRoot && this.renderRoot.querySelector(".wrap");
+      const target = wrap && (wrap.parentElement || wrap);
+      if (!target) return;
+      this._halfWidthObserver = new ResizeObserver(() => {
+        const el = this.renderRoot && this.renderRoot.querySelector(".wrap");
+        if (!el) return;
+        const container = el.parentElement || el;
+        const base = Math.round(container.clientWidth);
+        if (base > 0 && base !== this._halfWidthBase) this._measureHalfWidth();
+      });
+      this._halfWidthObserver.observe(target);
     }
 
     getCardSize() {
@@ -1096,149 +1636,135 @@ function _hmPowerFlowRegister() {
         d.pvPorts.map(wkey).join(","),
         d.soc === null || d.soc === undefined ? "x" : num(d.soc).toFixed(2),
         d.status, d.rssi, d.packs,
+        /* The role still changes the drawing: `solar2` decides whether a second
+           DC input is read at all, and the role chip itself is part of the
+           header.  `plug` no longer gates any branch - the system schematic
+           draws all of them whatever the role - so it is only in the key for
+           the sake of the `d.smartPlug` value, which its own `wkey` entry
+           already covers. */
+        d.role, d.solar2,
+        /* `has_meter: false` merges 电网 and 负载 into a single node, so the
+           flag changes the diagram's shape and has to be in the key - without
+           it the first report after a reload would leave the two-node layout
+           on screen forever. */
+        String(d.meter),
+        /* The corner badge and the row width both follow the alarm count, and
+           neither is a reading - without this key the first alarm after a
+           restart would leave the card spanning a row it no longer owns. */
+        String(this._alarmCount()),
+        /* Spanning the row caps the drawing at its half-row width
+           (`_wrapStyle`), i.e. it changes the SVG's size without changing any
+           reading, so it belongs in the key too - and it is derived from the
+           alarm count, which is already in the key, so this entry is what makes
+           the *cap* follow rather than the count alone. */
+        this._rowSpanWanted() ? "wide" : "half",
+        /* And the cap is a *measured* number that only exists after the first
+           layout pass, so learning it has to trigger a render of its own - the
+           first paint is drawn with the "50%" estimate. */
+        this._halfWidth,
       ].join("\u0001");
     }
 
-    /** Multiplier for the pearl speed (`flow_speed`, 1 = default). */
+    /** Multiplier for the flow speed (`flow_speed`, 1 = default). */
     _flowSpeed() {
       const scale = num(this._config && this._config.flow_speed);
       return scale > 0 ? scale : 1;
     }
 
-    /* --------------------------- the pearls --------------------------- */
-
-    /** Phase of a route's flow: 0..1 along its connector. */
-    _phaseOf(id) {
-      const known = this._pfPhase.get(id);
-      const p = Number.isFinite(known) ? known : 0;
-      return p - Math.floor(p);
-    }
+    /* ---------------------------- the streaks ---------------------------- */
 
     /**
-     * Cache the pearl groups together with the geometry a frame needs, so the
-     * animation never has to query the DOM or re-parse a path.
+     * Decide what each connector's streak should be doing right now.
      *
-     * Called after every render: Lit replaces the whole `<svg>` on each update,
-     * so the nodes from the previous render are dead.
+     * Every lit connector is put on **one shared clock** - `FLOW_CYCLE_S`
+     * divided by `flow_speed` - and each is given the stage of that cycle it
+     * belongs to.  A single negative `animation-delay` per connector then puts
+     * its CSS animation at the right point of the cycle, so the whole diagram
+     * runs in step: PV arrives, meets the battery at the junction, and only
+     * then does the trunk carry the total onwards.  Independent timers per
+     * branch (what the old dots did) could never express that, and every
+     * branch drifted against its neighbours.
+     *
+     * The epoch is remembered on the card rather than derived from the
+     * document, because the SVG is rebuilt about once a second: a rebuild must
+     * place the streaks exactly where the previous frame had them, and a
+     * document-time origin would jump them all forward by the render time.
      */
-    _collectPearls() {
-      const root = this.renderRoot;
-      const found = root ? root.querySelectorAll("g.pf-pearl") : [];
-      const nodes = [];
-      found.forEach((el) => {
-        const key = el.getAttribute("data-pf") || "";
-        const line = polyline(el.getAttribute("data-pf-path") || "");
-        const len = polylineLength(line);
-        if (!(len > 0)) return;
-        nodes.push({
-          el,
-          id: key.split(":")[0],
-          /* The second pearl of a connector rides half a lap behind the first. */
-          offset: key.endsWith(":1") ? 0.5 : 0,
-          line,
-          len,
-          fade: el.getAttribute("data-pf-fade") === "1",
-          /* What the flow *should* be at; the speed chases it (see below). */
-          target: Math.abs(num(el.getAttribute("data-pf-power"))),
+    _beamPlan(routes) {
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (!this._pfEpoch) this._pfEpoch = now;
+
+      const cycle = FLOW_CYCLE_S / this._flowSpeed();
+      const phase = ((now - this._pfEpoch) / (cycle * 1000)) % 1;
+      const delay = phase * cycle;
+
+      const plan = [];
+      for (const route of routes) {
+        if (Math.abs(num(route.power)) < MIN_FLOW) continue;
+        const travel = travelPath(route);
+        const len = pathLength(travel);
+        if (!(len > 0)) continue;
+        plan.push({
+          route, travel, len,
+          stage: route.stage || 0,
+          cycle, delay,
         });
-      });
-      this._pfPearls = nodes;
-    }
-
-    /**
-     * Move every pearl one frame forward.
-     *
-     * The phase advances in *normalised* units - a fraction of the connector -
-     * and not in seconds or pixels.  That is the whole trick: changing the speed
-     * then only changes how fast the dot travels, never where it is, so the next
-     * re-render (about once a second) draws it exactly where it had got to, and
-     * a power jump cannot teleport it.
-     */
-    _advancePearls(dt) {
-      const scale = this._flowSpeed();
-      /* The two pearls of a connector share one phase and differ only by an
-         offset, so the phase is advanced once per route and the offset is
-         applied on the way out.  Writing the offset back into `_pfPhase` would
-         advance the route twice per frame and shift it by half a lap. */
-      const phases = new Map();
-
-      for (const pearl of this._pfPearls) {
-        if (!phases.has(pearl.id)) {
-          const previous = this._pfPower.has(pearl.id)
-            ? this._pfPower.get(pearl.id)
-            : pearl.target;
-          /* `quick/state` pushes once a second and its last digit jitters; low
-             passing the power is what turns that into a steady glide. */
-          const power = previous + (pearl.target - previous)
-            * (1 - Math.exp(-dt / DOT_SMOOTH_TAU));
-          this._pfPower.set(pearl.id, power);
-
-          const speed = pearlSpeed(power, pearl.len, scale);
-          const raw = this._phaseOf(pearl.id) + (speed * dt) / pearl.len;
-          const phase = raw - Math.floor(raw);
-          this._pfPhase.set(pearl.id, phase);
-          phases.set(pearl.id, phase);
-        }
-
-        const phase = phases.get(pearl.id) + pearl.offset;
-        const at = pointAt(pearl.line, (phase - Math.floor(phase)) * pearl.len);
-        pearl.el.setAttribute("transform",
-          `translate(${at.x.toFixed(2)} ${at.y.toFixed(2)})`);
-        pearl.el.setAttribute("opacity", pearlOpacity(phase, pearl.fade).toFixed(3));
       }
+      return plan;
     }
 
-    /**
-     * Start the loop that drives the pearls.  A no-op when one is already
-     * running, so it is safe to call after every render.
-     */
-    _startPearls() {
-      if (this._pfRaf || !this._pfPearls.length) return;
-      if (typeof requestAnimationFrame !== "function") return;
-      const now = typeof performance !== "undefined"
-        ? () => performance.now()
-        : () => Date.now();
-      this._pfLast = now();
-      const tick = (stamp) => {
-        this._pfRaf = requestAnimationFrame(tick);
-        /* Clamped: a hidden tab stops firing rAF, and the time it was away must
-           not be dumped into the phase as one huge step. */
-        const dt = Math.min(Math.max((stamp - this._pfLast) / 1000, 0), 0.1);
-        this._pfLast = stamp;
-        this._advancePearls(dt);
+    /** Re-arm the flow clock so a re-mounted card starts a fresh cycle. */
+    connectedCallback() {
+      super.connectedCallback();
+      I18N.watch(this);
+      /* The streaks are CSS animations and survive the detach / re-attach that
+         switching dashboard tabs performs, so there is nothing to restart.
+         The clock is reset all the same: the card may come back a long time
+         later, and a phase computed from the old epoch would drop the streaks
+         in mid-run. */
+      this._pfEpoch = 0;
+      /* A window resize - or a tablet rotating - changes the dashboard's column
+         width, so the remembered half-row width has to be measured again.
+         Debounced: the measurement itself forces a reflow, and `resize` fires
+         on every frame of a drag. */
+      this._onResize = () => {
+        clearTimeout(this._resizeTimer);
+        this._resizeTimer = setTimeout(() => {
+          this._halfWidthBase = 0;
+          this._remeasureTries = 0;
+          this._measureHalfWidth();
+        }, 200);
       };
-      this._pfRaf = requestAnimationFrame(tick);
-    }
-
-    _stopPearls() {
-      if (this._pfRaf && typeof cancelAnimationFrame === "function") {
-        cancelAnimationFrame(this._pfRaf);
-      }
-      this._pfRaf = 0;
-    }
-
-    /** Pick up the freshly rendered pearls, then keep them moving. */
-    updated() {
-      this._collectPearls();
-      if (this._pfPearls.length) this._startPearls();
-      else this._stopPearls();
+      window.addEventListener("resize", this._onResize);
     }
 
     disconnectedCallback() {
+      I18N.unwatch(this);
+      window.removeEventListener("resize", this._onResize);
+      clearTimeout(this._resizeTimer);
+      if (this._halfWidthObserver) {
+        this._halfWidthObserver.disconnect();
+        this._halfWidthObserver = null;
+      }
       super.disconnectedCallback();
-      this._stopPearls();
-      this._pfPearls = [];
+      this._pfEpoch = 0;
     }
 
     /* ----------------------------- lookup ----------------------------- */
 
+    /** One of the two strings the card carries, in the current language. */
     _t(en, zh) {
-      return hmLang(this._hass, this._config) === "zh" ? zh : en;
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
     }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
 
     _dev() {
@@ -1248,11 +1774,12 @@ function _hmPowerFlowRegister() {
     /**
      * Resolve an entity id for this device.
      *
-     * Three strategies, cheapest first: the conventional
-     * ``<domain>.<slug(dev_id)>_<suffix>`` id, a prefix+suffix scan and
-     * finally the integration's ``hoymiles_g2_<dev_id>_<suffix>`` unique id.
-     * Results are cached, because the scan is O(entities) and the card
-     * re-renders on every state change.
+     * Four strategies, cheapest first: the conventional
+     * ``<domain>.<slug(dev_id)>_<suffix>`` id, a prefix+suffix scan, a scan
+     * keyed on the serial for a renamed device, and finally the integration's
+     * ``hoymiles_g2_<dev_id>_<suffix>`` unique id.  Results are cached,
+     * because the scan is O(entities) and the card re-renders on every state
+     * change.
      */
     _resolveEntity(suffix, domain = "sensor") {
       const overrides = (this._config.entities || {});
@@ -1279,6 +1806,26 @@ function _hmPowerFlowRegister() {
         for (const entityId of Object.keys(hass.states)) {
           if (!entityId.startsWith(prefix)) continue;
           if (norm(entityId.slice(prefix.length + 1)) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
+      if (!found) {
+        // A renamed device.  Renaming it in Home Assistant rewrites every
+        // entity id to the new name, so `sensor.rmi_4161a0209ff6_grid_port_power`
+        // became `sensor.wo_shi_rmi_4161a0209ff6_grid_port_power` and the
+        // `<slug(dev_id)>_` prefix the two strategies above rely on is gone.
+        // The serial never changes, so the normalized tail *after the serial*
+        // is compared instead: that still pins the entity to this unit and it
+        // keeps `soc` from matching `system_soc`, because only the part that
+        // follows the serial is looked at.
+        const marker = norm(this._dev());
+        const wanted = norm(suffix);
+        for (const entityId of Object.keys(hass.states)) {
+          const flat = norm(entityId);
+          const at = marker ? flat.indexOf(marker) : -1;
+          if (at < 0) continue;
+          if (flat.slice(at + marker.length) !== wanted) continue;
           if (!found || entityId.length < found.length) found = entityId;
         }
       }
@@ -1330,19 +1877,65 @@ function _hmPowerFlowRegister() {
       // lamp = sys_load_p, smart plug = sys_sp_p. `null` means the field is
       // absent (a slave unit does not carry the system level values) and that
       // node is left out.
-      const pv = this._read("system_pv_power", null);
-      const pv2 = this._read("system_pv2_power", null);
+      //
+      // A **slave** in a master/slave pair is exactly that case: protocol §32
+      // 「状态事件」 reports `has_meter: false` for it, so the firmware has
+      // nothing to build `sys_*` from and every system level entity stays
+      // `unknown` forever.  Falling through to the unit's own per-port and
+      // on-grid readings keeps the diagram readable instead of showing five
+      // dashes; a master or a single unit never reaches these fallbacks because
+      // its system level values are present.
+      const ev = this._eventInfo();
+      /* 光伏1 is **the generation of the devices in this system**, i.e. the
+         firmware's own `sys_pv_p` aggregate.  The fallback to this unit's own
+         `pv1_power` is kept, and only this one: a slave publishes no system
+         level figures at all, and that unit *is* a device in the system, so its
+         own first input is a true (if partial) sample of the same quantity - the
+         same kind of number, measured smaller.  It never turns into a different
+         concept. */
+      const pv = this._read("system_pv_power", null)
+        ?? this._read("pv1_power", null);
+      /* 光伏2 is a **different quantity and has no device-side counterpart**:
+         it is generation coming from *outside* this system - a second array, a
+         neighbour's roof, anything the meter sees but the system does not own.
+         In practice it lights up when the grid is exporting heavily while the
+         system's own devices produce nothing.
+
+         So `system_pv2_power` is read **alone**.  It used to fall back to this
+         unit's `pv2_power`, which is the second *DC connector on the machine* -
+         an input, not an external source.  On a 2-input unit that fallback
+         silently filled 光伏2 with the unit's own second string, which is drawn
+         on the Device tab as 「PV2」 and means something else entirely.  The two
+         must never be confused, so a system without the aggregate shows `—`.
+
+         `has_solar2` is still consulted, but only as the hardware fact it is:
+         `false` (no external second source fitted) drops the branch, `true` or
+         "not reported" keeps it. */
+      const solar2 = ev.solar2 !== false;
+      const pv2 = solar2 ? this._read("system_pv2_power", null) : null;
       /* The micro-inverter layout labels one node per *physical* PV input, so
-         it needs the per-port readings (`pvs[]`), not the system totals: pv1 is
-         the unit's own first input and pv2 its second.  They are `null` on a
+         it needs the per-port readings, not the system totals: pv1 is the
+         unit's own first input and pv2 its second.  They are `null` on a
          one-input unit, which is exactly what decides how many nodes to draw.
          A 4-input unit (`RMI-4162`) adds `pv3` / `pv4`, so all four are read -
          the two extra entities exist on every model and simply stay `unknown`
-         where the port is absent. */
+         where the port is absent.
+
+         These entities are 1 s: `pv<n>_power` prefers `quick/state["pv<n>_p"]`
+         and only falls back to the 5 min `pvs[].p` when that field is missing.
+         That is what lets the Device tab follow the same second-by-second rate
+         as the System tab - a slave unit has no meter and therefore no system
+         level data at all, so the Device tab has to stand on its own. */
       const pvPorts = [];
       for (let i = 1; i <= IV_PV_MAX; i += 1) {
         pvPorts.push(this._read(`pv${i}_power`, null));
       }
+      /* The household side of the meter, and the smart plug beside it.  Both are
+         drawn on the system schematic no matter what §32 says about this unit's
+         installation (see `_svgSystem`): the schematic shows the house the unit
+         is wired into, not only the parts the unit itself can measure.  A slave
+         reports no `system_load_power` / `system_smart_plug_power`, so those
+         nodes print `—` - present but blank, which is exactly what they are. */
       const load = this._read("system_load_power", null);
       const smartPlug = this._read("system_smart_plug_power", null);
 
@@ -1352,7 +1945,7 @@ function _hmPowerFlowRegister() {
 
          `grid` - the *system* grid balance, i.e. the house's side of the
          meter.  Positive = importing, negative = feeding back.  This is the
-         one `_svgSystem` / `_gridNode` have always drawn, so its sign is
+         one `_svgSystem` has always drawn, so its sign is
          fixed in stone.  `system_grid_power` is primary; `grid_on_p` uses the
          opposite sign (negative = drawing from the grid), so the fallback is
          negated to keep the convention.
@@ -1376,8 +1969,27 @@ function _hmPowerFlowRegister() {
       const neg = (v) => (v === null || v === undefined ? null : -v);
       const onGrid5 = this._read("grid_on_power_5_min", null);
       const onGrid1s = this._read("grid_on_power", null);
+      /* The 1 s AC port reading of a micro inverter: `quick/state["grid_on_p"]`,
+         i.e. the `grid_port_power` entity.  The very same number is repeated in
+         the 5 min `device/state` as `grid[0].p`, which is what
+         `grid_on_power_5_min` carries, so the fast and the slow reading describe
+         one physical port and must agree in sign.
+
+         They are *compared* rather than assumed, because a firmware reporting
+         the port from the opposite end of the wire would otherwise draw the
+         arrow backwards on every unit in the field.  The 5 W guard keeps the
+         comparison from firing while a unit idles, and nothing is cached, so a
+         real disagreement is corrected again on the next render.  Reading this
+         instead of the 5 min value is what lets the 并网端口 node keep up with
+         the System tab instead of trailing it by up to five minutes. */
+      const onGridFast = this._read("grid_port_power", null);
       let gridPort;
-      if (onGrid1s !== null) gridPort = onGrid1s;
+      if (onGridFast !== null) {
+        const disagree = onGrid5 !== null
+          && Math.abs(onGridFast) > 5 && Math.abs(onGrid5) > 5
+          && Math.sign(onGridFast) !== Math.sign(onGrid5);
+        gridPort = disagree ? -onGridFast : onGridFast;
+      } else if (onGrid1s !== null) gridPort = onGrid1s;
       else if (onGrid5 !== null) gridPort = onGrid5;
       else gridPort = neg(this._read("system_grid_power", null));
 
@@ -1417,6 +2029,47 @@ function _hmPowerFlowRegister() {
       return {
         pv, pv2, pvPorts, grid, gridPort, load, smartPlug, battery, soc,
         status: status.toLowerCase(), rssi, packs,
+        /* Which role the *installation* gave this unit, per protocol §32.  The
+           role no longer hides any branch of the system schematic - it only
+           decides the header chip - but it is kept in the data so a layout that
+           does draw this unit alone (the micro-inverter one) can still tell. */
+        role: ev.role,
+        solar2,
+        /* Whether the installation has a meter at all, straight from §32
+           「状态事件」.  `false` means this unit takes no part in metering: the
+           firmware has no idea where the grid ends and the house begins, so
+           the system schematic draws one combined 「电网&负载」 node instead of
+           two (see `_svgSystem`).  `true` or "not reported" keeps the two-node
+           layout - the same "unknown ⇒ draw as before" rule `solar2` follows. */
+        meter: ev.meter,
+      };
+    }
+
+    /**
+     * The device's role in the installation, from protocol §32 「状态事件」.
+     *
+     * The integration exposes the whole payload as the `system_role` sensor:
+     * the state is the role (`single` / `master` / `slave`) and the attributes
+     * are the snapshot, so the card reads one entity instead of twenty.  Both
+     * are optional - an older firmware without the topic, or one that has not
+     * reported yet, yields `role: ""` and `null` flags, and every consumer
+     * treats that as "draw what the readings say".
+     *
+     * `servant` is normalised to `slave`; the protocol guide says `slave` but
+     * at least one build publishes the other spelling.
+     */
+    _eventInfo() {
+      const state = this._stateOf("system_role");
+      const attrs = (state && state.attributes) || {};
+      let role = state ? String(state.state || "").trim().toLowerCase() : "";
+      if (role === "servant") role = "slave";
+      if (role !== "single" && role !== "master" && role !== "slave") role = "";
+      const flag = (name) => (typeof attrs[name] === "boolean" ? attrs[name] : null);
+      return {
+        role,
+        meter: flag("has_meter"),
+        plug: flag("has_plug"),
+        solar2: flag("has_solar2"),
       };
     }
 
@@ -1427,11 +2080,12 @@ function _hmPowerFlowRegister() {
      *
      *  1. `pv_count: 1|2|3|4` in the card config - explicit, always wins, and
      *     the only way to force it when every entity is still `unknown`.
-     *  2. The product code in the serial - see `IV_PV_COUNT_BY_CODE`.  Every
-     *     RMI serial starts with the four digit SKU (`RMI-4161A0209FF6`), which
-     *     identifies the port count exactly.  This is checked before any live
-     *     reading because a 4-input unit at night publishes `pv3` / `pv4` as
-     *     `0`, and "no live second reading" must not demote it to 1.
+     *  2. The product id (PID) in the serial - see `IV_PV_COUNT_BY_CODE`.
+     *     Every inverter serial starts with the four digit PID
+     *     (`4161A0209FF6`), which identifies the port count exactly.  This is
+     *     checked before any live reading because a 4-input unit at night
+     *     publishes `pv3` / `pv4` as `0`, and "no live second reading" must not
+     *     demote it to 1.
      *  3. A live per-port reading.  The highest `pvN_power` that reports a value
      *     decides, so a unit whose code is unknown still draws what it
      *     publishes.  All models *create* the `pvN_*` entities (the
@@ -1468,13 +2122,15 @@ function _hmPowerFlowRegister() {
     }
 
     /**
-     * The four digit product code from the serial, or `""`.
+     * The four digit PID from the serial, or `""`.
      *
-     * `RMI-4161A0209FF6` -> `"4161"`, `4161A0209FF6` -> `"4161"`.  The code is
-     * the leading four digits of the serial *without* the `RMI-` prefix - which
-     * is why the last `-` separated segment is used rather than the whole
-     * string.  Anything that does not look like a Hoymiles serial yields `""`
-     * and the caller falls through to the reading / model heuristics.
+     * `RMI-4161A0209FF6` -> `"4161"`, `4161A0209FF6` -> `"4161"`, and
+     * `GARAGE-4161A0209FF6` -> `"4161"` as well.  The PID is the leading four
+     * digits of the serial *body* - which is why the last `-` separated segment
+     * is used rather than the whole string, so that a renamed client prefix can
+     * never shift the digits.  Anything that does not look like a Hoymiles
+     * serial yields `""` and the caller falls through to the reading / model
+     * heuristics.
      */
     _productCode() {
       const dev = String(this._dev() || "");
@@ -1534,18 +2190,20 @@ function _hmPowerFlowRegister() {
           <div class="head ${showName ? "" : "bare"}">
             ${showName ? html`
               <div class="hname">
-                ${esc(this._text(this._config.title) || this._t("My home", "我的家"))}
+                ${esc(this._text(this._config.title) || this._t("My Home", "我的家"))}
                 <span class="dev">${esc(this._dev())}</span>
               </div>` : ""}
             <div class="hright">
+              ${this._roleChip(d)}
               ${this._signal(d)}
               ${temp === null ? "" : html`
                 <div class="chip">
-                  <span>☀️</span><span>${temp}</span>
+                  ${this._untrusted(this._sunChip())}<span>${temp}</span>
                 </div>`}
             </div>
           </div>
           <div class="wrap" style=${this._wrapStyle()}>
+            ${this._healthChip()}
             ${this._untrusted(this._svg(d))}
           </div>
         </ha-card>
@@ -1559,9 +2217,141 @@ function _hmPowerFlowRegister() {
       return this._config.show_title !== false && this._text(this._config.title) !== false;
     }
 
+    /**
+     * The device's role, as a chip in the header.
+     *
+     * The chip no longer explains a difference in the system schematic - that
+     * drawing is identical for every role now, because it shows the house the
+     * unit is wired into rather than only the parts the unit can measure.  It
+     * still records the fact, because the role does change the Device tab (a
+     * micro-inverter in a master/slave pair reports its own ports, not the
+     * system totals) and because knowing which unit carries the meter is useful
+     * when comparing the two tabs.  Nothing is shown for a stand-alone unit
+     * (the overwhelming majority, and `—` would just be noise) and nothing is
+     * shown when the firmware has not said, because an empty chip is worse than
+     * no chip.
+     */
+    _roleChip(d) {
+      const role = d.role;
+      if (!role || role === "single") return null;
+      const master = role === "master";
+      const text = master ? this._t("Master", "主机") : this._t("Slave", "从机");
+      const hint = master
+        ? this._t("This unit carries the system meter",
+          "本机承担系统电表计量")
+        : this._t("Follows the master; its own ports are drawn on the device tab",
+          "跟随主机，本机端口见设备页");
+      return html`<div class="role ${master ? "master" : "slave"}" title=${hint}>${text}</div>`;
+    }
+
+    /**
+     * The sun in front of the outdoor temperature.
+     *
+     * Drawn rather than typed: the emoji renders as a colour cartoon at whatever
+     * size and weight the host font picks, which reads as an illustration beside
+     * the flat chips around it.  A disc plus eight round-capped rays keeps it an
+     * icon - the same optical weight as the signal bars.
+     */
+    _sunChip() {
+      const rays = [0, 45, 90, 135, 180, 225, 270, 315].map((deg) => `<line
+          x1="12" y1="5" x2="12" y2="2" stroke="#f5a623" stroke-width="1.9"
+          stroke-linecap="round" transform="rotate(${deg} 12 12)"/>`).join("");
+      return `<svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+          aria-hidden="true" focusable="false">
+        <circle cx="12" cy="12" r="4.6" fill="#f5a623"/>${rays}</svg>`;
+    }
+
     _wrapStyle() {
       const width = num(this._config.max_width);
-      return width > 0 ? `max-width:${width}px` : "max-width:620px";
+      /* ``max_width: 0`` is not "no width" - it is "no cap": the drawing fills
+         whatever cell the dashboard gives the card, scaling proportionally.
+         The Device tab's card needs exactly that (it is half of a row while
+         faults are listed beside it and the whole row when they are not), so
+         the migrations write 0 there.  A positive number still caps the
+         drawing, and a card with no option at all keeps the System tab's
+         original 620 px. */
+      if (width > 0) return `max-width:${width}px`;
+      if (width === 0 && this._config.max_width != null) {
+        if (!this._rowSpanWanted()) return "max-width:none";
+        /* The card spans the row and there is no alarm list beside it.  The
+           drawing must not grow with the row: same height, only a longer card,
+           with the schematic centred in the middle of it.  So the cap is the
+           width the drawing had in half a row, measured by `_measureHalfWidth`.
+           "50%" is only reached before that first measurement lands (`updated`
+           is still to run), and it is a fair guess: half a row is half a card.
+           `min()` keeps the drawing inside the card on a phone, where the row
+           is narrower than the remembered desktop width. */
+        const cap = this._halfWidth > 0 ? `${Math.round(this._halfWidth)}px` : "50%";
+        return `max-width:min(100%, ${cap})`;
+      }
+      return "max-width:620px";
+    }
+
+    /**
+     * How many alarms the device is currently reporting, or ``null``.
+     *
+     * ``null`` covers two different situations that must not be drawn as
+     * "healthy": the card was never given an alarm entity (the System tab has
+     * no single device to ask), and the entity exists but the device has not
+     * said anything yet - ``alarm/state`` is not a retained topic, so a fresh
+     * restart legitimately has no data.  ``0`` is the only value that earns the
+     * green tick.
+     */
+    _alarmCount() {
+      const entityId = this._config && this._config.alarm_entity;
+      if (!entityId || !this._hass) return null;
+      const state = (this._hass.states || {})[entityId];
+      if (!state) return null;
+      const items = state.attributes && state.attributes.alarms;
+      if (Array.isArray(items)) return items.length;
+      const count = num(state.state);
+      // `unavailable` / `unknown` parse to 0 through `num`, which would claim
+      // the device is fine; the raw state has to be checked first.
+      if (state.state === "unavailable" || state.state === "unknown") return null;
+      return Number.isFinite(count) ? count : null;
+    }
+
+    /**
+     * The condition badge: a circled tick, or the vendor app's warning triangle.
+     *
+     * The alarm state is the G3 dashboard's own glyph - a *filled* red triangle
+     * with a white exclamation, sitting in the card's top-left corner - because
+     * that is the icon the official app uses for the same fact, and a user who
+     * has seen one device's page should not have to read a second convention on
+     * the next.  The healthy state keeps the ringed green tick this card has
+     * always drawn: it is quiet, it matches the schematic's other ringed icons,
+     * and the absence of a warning is not something to shout about.
+     *
+     * The markup goes through ``_untrusted()`` because it is a raw string.
+     */
+    _healthChip() {
+      const count = this._alarmCount();
+      if (count == null) return html``;
+      const ok = count === 0;
+      const hint = ok
+        ? this._t("No active alarms", "当前无告警")
+        : `${this._t("Active alarms", "当前告警")}: ${count}`;
+      /* A filled triangle reads at 19 px where an outlined one turns to mush,
+         so the warning is solid and its exclamation is cut out in the card
+         background colour.  The tick stays outlined to match its neighbours. */
+      const glyph = ok
+        ? "<svg viewBox=\"0 0 24 24\" width=\"19\" height=\"19\" fill=\"none\" "
+          + "aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9.2\" "
+          + "stroke=\"currentColor\" stroke-width=\"1.9\"/>"
+          + "<path d=\"M7.8 12.3l2.9 2.9 5.5-5.9\" stroke=\"currentColor\" "
+          + "stroke-width=\"2.1\" stroke-linecap=\"round\" "
+          + "stroke-linejoin=\"round\"/></svg>"
+        : "<svg viewBox=\"0 0 24 24\" width=\"19\" height=\"19\" fill=\"none\" "
+          + "aria-hidden=\"true\"><path d=\"M12 2.6c.66 0 1.27.35 1.6.93l9.1 15.9c.33.58.33 1.29 0 1.87"
+          + "-.33.58-.94.93-1.6.93H2.9c-.66 0-1.27-.35-1.6-.93a1.87 1.87 0 010-1.87"
+          + "l9.1-15.9c.33-.58.94-.93 1.6-.93z\" fill=\"currentColor\"/>"
+          + "<path d=\"M12 7.6v5.6\" stroke=\"#fff\" stroke-width=\"2\" "
+          + "stroke-linecap=\"round\"/><circle cx=\"12\" cy=\"16.9\" r=\"1.3\" "
+          + "fill=\"#fff\"/></svg>";
+      return html`
+        <div class="health ${ok ? "ok" : "warn"}" title=${hint}>
+          ${this._untrusted(glyph)}
+        </div>`;
     }
 
     _temperature() {
@@ -1586,13 +2376,13 @@ function _hmPowerFlowRegister() {
       if (rssi === null || !Number.isFinite(rssi)) return null;
 
       const bars = rssiBars(rssi);
-      const quality = bars === 4 ? this._t("excellent", "优秀")
-        : bars === 3 ? this._t("good", "良好")
-          : bars === 2 ? this._t("fair", "一般")
-            : this._t("weak", "较弱");
+      const quality = bars === 4 ? this._t("Excellent", "优秀")
+        : bars === 3 ? this._t("Good", "良好")
+          : bars === 2 ? this._t("Fair", "一般")
+            : this._t("Weak", "较弱");
 
       return html`
-        <div class="signal" title=${`${this._t("Wi-Fi signal", "Wi-Fi 信号")}: ${quality}`}>
+        <div class="signal" title=${`${this._t("Wi-Fi Signal", "Wi-Fi 信号")}: ${quality}`}>
           ${this._untrusted(this._signalBars(bars))}
           <span>${rssi.toFixed(0)} dBm</span>
         </div>`;
@@ -1647,7 +2437,7 @@ function _hmPowerFlowRegister() {
      * house.
      *
      * That is the same three-branch shape the storage schematic uses (PV in,
-     * unit, output out), so the two views read alike.  The pearls carry the
+     * unit, output out), so the two views read alike.  The streaks carry the
      * direction: they run from the PV ports into the unit, and from the unit
      * out through the 并网端口 while it is producing.  At night the unit draws
      * a standby current, so both reverse.
@@ -1665,31 +2455,96 @@ function _hmPowerFlowRegister() {
     _svgInverter(d) {
       const present = (v) => v !== null && v !== undefined && !Number.isNaN(num(v));
       const pvCount = this._pvCount();
-      const photo = ivPhoto(this._productImage());
+      const art = this._productImage();
+      const photo = ivPhoto(art);
+      const term = ivTerminals(art, photo);
       const pvNodes = [];
       /* The connectors run from their node towards the unit, so each slot has
          to know where it may plug in.  A node on the outer end of the row turns
          sideways into the photo's side edge; a node underneath the photo has no
-         room to turn and rises straight into its bottom edge instead. */
-      const pvTermY = photo.b - IV_TERMINAL_INSET;
+         room to turn and rises straight into its bottom edge instead.
+
+         The two cheeks are looked up separately rather than sharing one height.
+         A two-input body carries an MC4 pair on *each* side, and on the Pro
+         2-in-1 they sit at different levels - so a single `pvY` put the
+         right-hand connector above or below the plug it was aimed at, and
+         aiming at `photo.r` left it short of the plug in the empty strip the
+         crop keeps past it. */
       const rowX = IV_NODE_X[pvCount] || IV_NODE_X[1];
-      for (let i = 0; i < pvCount; i += 1) {
+      /* Which cheek each slot plugs into.  The artwork decides when it lists its
+         plugs (`pvLeftSlots` / `pvRightSlots`): a four-input body carries two
+         MC4 pairs on *each* side, so PV1 + PV2 belong to the left cheek and
+         PV3 + PV4 to the right, in that order.  Without a list the node's own
+         x decides, which is how every other layout works. */
+      const leftTotal = term.pvLeftSlots ? term.pvLeftSlots.length : null;
+      const slotSide = (i) => {
+        if (term.pvSides && term.pvSides[i]) return term.pvSides[i];
+        if (leftTotal !== null) return i < leftTotal ? "left" : "right";
         const x = rowX[Math.min(i, rowX.length - 1)];
-        const under = x > photo.l && x < photo.r;
+        if (x < photo.l) return "left";
+        return x > photo.r ? "right" : "bottom";
+      };
+      /* The node follows the cheek it plugs into.  The row is laid out per
+         input count and assumes the usual left / both corners / spread order,
+         so an artwork that moves a slot to the right cheek (the Pro 1-in-1's
+         single DC lead) gets its node mirrored to the matching column instead
+         of keeping the left one and dragging the connector across the photo. */
+      const slotX = (i) => {
+        const x0 = rowX[Math.min(i, rowX.length - 1)];
+        return slotSide(i) === "right" && x0 < photo.l ? IV_W - x0 : x0;
+      };
+      /* How many slots share each cheek, so a side with several strings can be
+         spread over the plugs the render actually draws. */
+      const sideCount = { left: 0, right: 0, bottom: 0 };
+      for (let i = 0; i < pvCount; i += 1) sideCount[slotSide(i)] += 1;
+      const sideSeen = { left: 0, right: 0, bottom: 0 };
+
+      for (let i = 0; i < pvCount; i += 1) {
+        const side = slotSide(i);
+        const x = slotX(i);
+        const under = side === "bottom";
+        const left = side === "left";
+        const slots = left ? term.pvLeftSlots : term.pvRightSlots;
+        const idx = sideSeen[side];
+        sideSeen[side] = idx + 1;
+        /* The height this connector stops at on the photo.  A measured plug
+           list gives one height per string, so PV1 stops on the upper pair of
+           the left cheek and PV2 on the lower one.  Without a list both strings
+           of a side would be aimed at the same point and the two connectors
+           would sit on top of each other, so they are fanned out by
+           `IV_SIDE_STAGGER` instead. */
+        let y2 = left ? term.pvLeftY : term.pvRightY;
+        if (slots) {
+          y2 = slots[Math.min(idx, slots.length - 1)];
+        } else if (sideCount[side] > 1) {
+          y2 += (idx - (sideCount[side] - 1) / 2) * IV_SIDE_STAGGER;
+        }
         pvNodes.push({
           id: `pv${i + 1}`,
+          /* A body with a single DC input captions it `PV`, not `PV1`: there is
+             no second input for the number to tell apart, and the vendor app
+             drops it too once a unit is 一拖一. */
+          caption: pvCount === 1 ? "PV" : `PV${i + 1}`,
           x,
           y: IV_NODE_ROW_Y,
           power: d.pvPorts[i],
           route: under
-            ? riserRoute({ x, y: IV_NODE_ROW_Y }, pvTermY)
-            : elbowRoute({ x, y: IV_NODE_ROW_Y }, x < photo.l ? photo.l : photo.r, pvTermY),
+            ? riserRoute({ x, y: IV_NODE_ROW_Y }, term.pvBottom)
+            : elbowRoute(
+              { x, y: IV_NODE_ROW_Y },
+              left ? term.pvLeftX : term.pvRightX,
+              y2,
+            ),
         });
       }
 
       const routes = pvNodes.map((n) => ({
         id: n.id, d: n.route, power: n.power, color: COLORS.pv,
         reverse: num(n.power) < 0,
+        /* Inverters have no junction to converge on: the energy goes in at the
+           DC inputs and straight out of the AC lead, so the inputs take the
+           first half of the cycle and the output the second. */
+        stage: 0,
       }));
       /* The AC output.  Drawn unless explicitly disabled - it is a port of the
          hardware, not an optional reading - and a missing value shows a dash
@@ -1703,23 +2558,38 @@ function _hmPowerFlowRegister() {
          unit", which is the direction the PV energy actually travels. */
       const showGrid = this._config.show_grid !== false;
       const g = present(d.gridPort) ? num(d.gridPort) : 0;
+      /* `above` puts the 并网端口 captions over the ring, which is only correct
+         while the connector leaves downwards - most of the artwork puts the AC
+         lead high on the body, so the line then leaves upwards and the captions
+         have to move below it. */
+      let gridAbove = true;
+      let gridY = IV_NODE_GRID.y;
       if (showGrid) {
-        /* The grid connector plugs into the photo's *right* edge, higher up
-           than the DC terminals: the right-most PV input uses that same edge,
-           so sharing one height made the two paths coincide exactly and read
-           as a single line.  Half way between the node's own bottom rim and
-           the DC terminal height gives the AC output its own port with a full
-           elbow, which is also how the hardware's terminal block is laid out.
-           The lower clamp keeps a few pixels of vertical run when the photo is
-           tall enough to put that midpoint right under the ring. */
-        const dcTermY = photo.b - IV_TERMINAL_INSET;
-        const gridTermY = Math.max(
-          (IV_NODE_GRID.y + NODE_R + dcTermY) / 2,
-          IV_NODE_GRID.y + NODE_R + 8,
-        );
+        /* The grid connector plugs into the photo's *right* edge, at the height
+           the artwork shows its AC lead (`term.gridY`).  Falling back to the
+           old estimate for an unknown image: half way between the node's own
+           bottom rim and the DC terminal height, which gives the AC output its
+           own port with a full elbow instead of overlapping the right-most PV
+           input.  The lower clamp keeps a few pixels of vertical run when the
+           photo is tall enough to put that midpoint right under the ring. */
+        const dcTermY = term.pvLeftY;
+        const gridTermY = term.gridY === null
+          ? Math.max(
+            (IV_NODE_GRID.y + NODE_R + dcTermY) / 2,
+            IV_NODE_GRID.y + NODE_R + 8,
+          )
+          : term.gridY;
+        /* The node rides at the port height, so the connector is a plain
+           horizontal run straight into the cable the render draws.  A fixed
+           node height could not hit every SKU: the small HiFlow exits near mid
+           body while the Pro bodies exit high up, a difference of some 40 px
+           once scaled.  Keeping the two apart would force an elbow that folds
+           back on the ring. */
+        gridY = term.gridY === null ? IV_NODE_GRID.y : gridTermY;
+        gridAbove = gridY - (NODE_R + 46) > 8;
         routes.push({
           id: "grid",
-          d: elbowRoute(IV_NODE_GRID, photo.r, gridTermY),
+          d: elbowRoute({ x: IV_NODE_GRID.x, y: gridY }, photo.r, gridTermY),
           power: present(d.gridPort) ? d.gridPort : null,
           /* Amber while the unit is producing (the same colour the PV flow and
              the storage schematic's trunk use, because it *is* the PV energy
@@ -1728,15 +2598,18 @@ function _hmPowerFlowRegister() {
              standstill neither direction applies, so nothing moves. */
           color: g > 0 ? COLORS.grid_out : COLORS.grid,
           reverse: g > 0,
+          /* Energy reaches the AC lead only after it has gone through the
+             unit, so the output always runs in the last stage. */
+          stage: 2,
         });
       }
 
       const edges = routes.map((r) => `
         <path class="pf-edge" d="${r.d}" fill="none"
               vector-effect="non-scaling-stroke"/>`).join("");
-      const dots = pvNodes.some((n) => present(n.power))
+      const beams = pvNodes.some((n) => present(n.power))
         || (showGrid && present(d.gridPort))
-        ? routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("")
+        ? this._beamPlan(routes).map(flowBeam).join("")
         : "";
 
       const busy = [...d.pvPorts, d.gridPort]
@@ -1746,14 +2619,14 @@ function _hmPowerFlowRegister() {
                    xmlns="http://www.w3.org/2000/svg" role="img">
         ${this._config.gradient === false
           ? ""
-          : `<rect x="0" y="0" width="${IV_W}" height="${IV_H}" fill="#ffffff"/>`}
+          : `<rect class="pf-bg" x="0" y="0" width="${IV_W}" height="${IV_H}"/>`}
         <clipPath id="${NODE_CLIP_ID}" clipPathUnits="userSpaceOnUse">
           <circle cx="0" cy="0" r="${NODE_CLIP_R}"/>
         </clipPath>
         ${edges}
-        ${dots}
+        ${beams}
         ${this._unitImage(busy, photo)}
-        ${this._inverterNodes(d, { pv: pvNodes, grid: true })}
+        ${this._inverterNodes(d, { pv: pvNodes, grid: true, gridY, gridAbove })}
       </svg>`;
     }
 
@@ -1776,7 +2649,9 @@ function _hmPowerFlowRegister() {
      * The PV captions are `PV1` / `PV2` - the same wording the vendor app and
      * the firmware's own port table use - because these are physical inputs on
      * the unit, not the system level 光伏1 / 光伏2 aggregates of the storage
-     * schematic (`_nodes`).
+     * schematic (`_nodes`).  A body with only one DC input is captioned plain
+     * `PV`: the caller puts that wording on the node itself, so the drawing and
+     * this label can never disagree.
      */
     _inverterNodes(d, opts) {
       const t = (en, zh) => this._t(en, zh);
@@ -1798,24 +2673,26 @@ function _hmPowerFlowRegister() {
             <image class="pf-ic" x="${-NODE_R}" y="${-NODE_R}"
                    width="${NODE_R * 2}" height="${NODE_R * 2}"
                    clip-path="url(#${NODE_CLIP_ID})" href="${art}"/>
-            <text class="pf-v" x="0" y="${vy}"
+            <text class="pf-v pf-iv" x="0" y="${vy}"
                   text-anchor="middle">${value}</text>
-            <text class="pf-c" x="0" y="${cy}"
+            <text class="pf-c pf-iv-c" x="0" y="${cy}"
                   text-anchor="middle">${esc(caption)}</text>
           </g>`);
       };
 
       for (const n of opts.pv) {
         node(n.x, n.y, "pv", working(n.power), reading(n.power),
-          t(`PV${n.id.slice(2)}`, `PV${n.id.slice(2)}`));
+          t(n.caption, n.caption));
       }
       if (opts.grid) {
         /* No 电网输入 / 电网输出 wording here: the number is absolute and the
-           direction is already drawn by the pearls, so a caption that moved
+           direction is already drawn by the streak, so a caption that moved
            with the sign would contradict it.  The reading is the unit's own AC
            port (`gridPort`), not the system grid balance. */
-        node(IV_NODE_GRID.x, IV_NODE_GRID.y, "grid", working(d.gridPort),
-          reading(d.gridPort), t("Grid port", "并网端口"), true);
+        node(IV_NODE_GRID.x, opts.gridY === undefined ? IV_NODE_GRID.y : opts.gridY,
+          "grid", working(d.gridPort),
+          reading(d.gridPort), t("Grid Port", "并网端口"),
+          opts.gridAbove !== false);
       }
 
       return parts.join("");
@@ -1831,13 +2708,13 @@ function _hmPowerFlowRegister() {
       /* The wiring diagram: PV1 / storage run into the inverter's left side, the
          inverter's right side meets a junction on the right edge, and the
          remaining branches fan out from that junction.  Each branch is one
-         path, so the moving pearls can simply run along it. */
+         path, so the travelling streak can simply run along it. */
       /* Direction of every connector, decided in one place.
        *
        * A route is always *written* from its own node towards the inverter /
        * junction, so `reverse: true` means "the power runs from the far end
        * back into this branch's node".  Getting this the wrong way round is
-       * very visible: the pearls then travel against the energy flow.
+       * very visible: the streak then travels against the energy flow.
        *
        *   pv, pv2      producing            node     -> junction
        *   battery      discharging (>= 0)   node     -> inverter
@@ -1850,39 +2727,118 @@ function _hmPowerFlowRegister() {
       const hasBattery = present(d.battery);
       const trunk = num(d.pv) + num(d.pv2) + (hasBattery ? num(d.battery) : 0); // W into the junction
 
+      /* Which *stage* of the shared cycle each connector runs in.
+       *
+       * The three stages are "gather into the unit", "run through it to the
+       * junction" and "leave the junction towards the load", and they are what
+       * makes the diagram read as one flow of energy rather than seven
+       * unrelated animations: a trunk can only light up once the branches
+       * feeding it have arrived.
+       *
+       * Where the junction sits depends on the direction the energy is going,
+       * so the stage of a given connector is not fixed.  Energy *enters* the
+       * trunk from the unit while the unit is a source (`trunk >= 0`, the usual
+       * case) and from the grid while the house is drawing the battery down
+       * through it (`trunk < 0`).  The trunk therefore always runs in the
+       * middle stage, and everything upstream of it takes the first stage while
+       * everything downstream takes the last.
+       *
+       * The two branches that feed the unit (PV2, and the battery while it is
+       * charging) run *towards* it and are drawn left to right, so their travel
+       * direction is the same either way round - `reverse` only flips which end
+       * the streak starts from.  The stage helpers below are symmetric in
+       * `reverse` for exactly that reason. */
+      const trunkToJunction = trunk >= 0;
+      /* A branch lying left of the unit: stage 0 when it feeds the unit, stage 2
+         when the unit feeds it.  Written as one expression because the two
+         directions are the two ends of the same wire. */
+      const stageLeft = (reverse) => (reverse ? 2 : 0);
+      /* A branch right of the junction: it is *upstream* of the trunk when it
+         feeds the junction, which is the `trunk < 0` case; otherwise it is
+         downstream and runs once the trunk has arrived. */
+      const stageRight = (reverse) => {
+        if (!reverse) return 0;
+        return trunkToJunction ? 2 : 1;
+      };
+
       /* Which branches are *hardware*, not data.
        *
-       * pv1, the grid and the load exist on every unit this card draws, so
-       * their connectors are always laid out - a device that has not reported
-       * yet still has to look like the same machine as a reporting one, with
-       * the readings left blank.  Only battery (storage units) and pv2 (a
-       * second DC input) are genuinely optional, so only those two decide
-       * whether a connector exists at all. */
+       * Every branch of this schematic is a feature of the machine, and this is
+       * the drawing that shows the machine as a whole, so **all of them are
+       * always laid out**: a unit that has not reported yet, or one that is part
+       * of a master/slave pair, still reads as the same box with the same
+       * terminals, and only the numbers go blank.
+       *
+       * This is deliberate for the master/slave pair too.  The two views have
+       * different jobs: the Device tab draws *this unit's own* ports, so there
+       * the role decides which are wired, while this one draws the installation
+       * around the house - PV1 / PV2 in, storage either side, and on the right
+       * the junction everything else meets.  Hiding 负载 / 智能插座 on a slave
+       * made the same house look like two different houses, which is what the
+       * role chip then had to explain.  Now the chip is the only difference.
+       *
+       * 智能插座 shares the junction with 电网, 负载 and 光伏2: it is a socket on
+       * the same AC bus the grid and the house hang from, so it belongs on that
+       * node rather than on a wire of its own. */
       const routes = [
         { id: "pv", d: "M104 142 V190 Q104 200 114 200 H283", power: d.pv,
-          color: COLORS.pv, reverse: num(d.pv) < 0 },
+          color: COLORS.pv, reverse: num(d.pv) < 0,
+          stage: stageLeft(num(d.pv) < 0) },
         ...(hasBattery ? [{ id: "battery", d: "M104 322 V274 Q104 264 114 264 H283",
-          power: d.battery, color: COLORS.battery, reverse: charging }] : []),
+          power: d.battery, color: COLORS.battery, reverse: charging,
+          stage: stageLeft(charging) }] : []),
+        /* The trunk is the one connector whose stage never changes: it *is* the
+           middle of the cycle, the moment everything meets. */
         { id: "trunk", d: `M361 ${JUNCTION.y} H594`, power: trunk,
-          color: COLORS.pv, reverse: trunk < 0 },
+          color: COLORS.pv, reverse: trunk < 0, stage: 1 },
         { id: "grid", d: `M600 142 V${JUNCTION.y - 6}`, power: d.grid,
           color: num(d.grid) > 0 ? COLORS.grid : COLORS.grid_out,
-          reverse: num(d.grid) < 0 },
+          reverse: num(d.grid) < 0,
+          stage: stageRight(num(d.grid) < 0) },
         { id: "load", d: LAMP_ROUTE, power: d.load,
-          color: COLORS.load, reverse: num(d.load) >= 0 },
-        { id: "plug", d: `M600 322 V${JUNCTION.y + 6}`,
-          power: d.smartPlug, color: COLORS.sp, reverse: num(d.smartPlug) >= 0 },
+          color: COLORS.load, reverse: num(d.load) >= 0,
+          stage: stageRight(num(d.load) >= 0) },
+        { id: "plug", d: `M600 322 V${JUNCTION.y + 6}`, power: d.smartPlug,
+          color: COLORS.sp, reverse: num(d.smartPlug) >= 0,
+          stage: stageRight(num(d.smartPlug) >= 0) },
+        { id: "pv2", d: PV2_ROUTE, power: d.pv2,
+          color: COLORS.pv6, reverse: num(d.pv2) < 0,
+          stage: stageRight(num(d.pv2) < 0) },
       ];
-      if (present(d.pv2)) {
-        routes.push({ id: "pv2", d: PV2_ROUTE, power: d.pv2,
-          color: COLORS.pv6, reverse: num(d.pv2) < 0 });
+
+      /* `has_meter: false` in §32 「状态事件」 (see `_data`): this unit takes no
+         part in metering, so the firmware cannot tell the grid from the house
+         and 电网 / 负载 become one lumped node - a single circle with a single
+         reading, the way the vendor's G3 dashboard draws it.  It keeps the 电网
+         slot and its straight connector, which is the one that already runs to
+         the junction; the diagonal 负载 line disappears with the node it fed.
+
+         `true` - and "not reported", which is what an older firmware gives -
+         leaves the two-node layout exactly as it is, the same "unknown ⇒ draw
+         as before" rule `solar2` follows.
+
+         The reading is the unit's own on-grid port (`grid_on_p`, `gridPort`
+         here), whose sign runs the *other* way round from the grid balance:
+         `< 0` means the unit is drawing from the lump, `> 0` that it is pushing
+         energy into it.  That inversion is why the colours are picked from the
+         sign here instead of from `d.grid` like the two-node branch does. */
+      const merged = d.meter === false;
+      const combined = merged ? num(d.gridPort) : 0;
+      if (merged) {
+        const grid = routes.find((r) => r.id === "grid");
+        const loadAt = routes.findIndex((r) => r.id === "load");
+        grid.power = d.gridPort;
+        grid.color = combined < 0 ? COLORS.grid : COLORS.grid_out;
+        grid.reverse = combined >= 0;
+        grid.stage = stageRight(combined >= 0);
+        if (loadAt >= 0) routes.splice(loadAt, 1);
       }
 
       const edges = routes.map((r) => `
         <path class="pf-edge" d="${r.d}" fill="none"
               vector-effect="non-scaling-stroke"/>`).join("");
 
-      const dots = routes.map((r) => flowPearls(r, this._phaseOf(r.id))).join("");
+      const beams = this._beamPlan(routes).map(flowBeam).join("");
 
       /* One icon per node and the unit in the middle.  The same rule as the
          connectors: the branches the hardware has are always drawn, dim and
@@ -1890,11 +2846,7 @@ function _hmPowerFlowRegister() {
          instead of collapsing to a single stray node.  A branch that exists but
          reads zero is still drawn in its dim variant - exactly like the app. */
       const nodes = this._nodes(d, {
-        pv2: present(d.pv2),
         battery: hasBattery,
-        plug: true,
-        lamp: true,
-        grid: true,
         reading,
       });
 
@@ -1912,7 +2864,7 @@ function _hmPowerFlowRegister() {
           <circle cx="0" cy="0" r="${NODE_CLIP_R}"/>
         </clipPath>
         ${edges}
-        ${dots}
+        ${beams}
         ${this._inverter(busy)}
         <circle class="pf-junction" cx="${JUNCTION.x}" cy="${JUNCTION.y}" r="6"/>
         ${nodes}
@@ -1936,7 +2888,15 @@ function _hmPowerFlowRegister() {
     }
 
     /**
-     * The node layer.  `opts` says which optional branches exist.
+     * The node layer of the storage schematic.
+     *
+     * Every branch of this drawing is a feature of the installation, so all of
+     * them are drawn always - including on a slave, whose own header chip is
+     * then the only thing that says it is a follower.  There are two exceptions,
+     * and both come from §32 「状态事件」 rather than from a reading:
+     * `opts.battery` drops the 微储 node on a model with no storage, and
+     * `has_meter: false` replaces 电网 + 负载 with one 「电网&负载」 node, because
+     * such a unit cannot tell the two apart.
      *
      * Each node is the vendor app's own artwork, embedded as a data URI: the
      * icon carries the ring too, so nothing is drawn on top of it.  A branch
@@ -1949,7 +2909,7 @@ function _hmPowerFlowRegister() {
      * square can never cover a connector that runs past it.
      *
      * There used to be a small arrow head on each diagonal branch showing which
-     * way the power went.  It is gone: the pearls already say that, and the
+     * way the power went.  It is gone: the streak already says that, and the
      * arrow only added a second, coarser copy of the same information - the user
      * asked for it to be removed.
      */
@@ -1974,93 +2934,59 @@ function _hmPowerFlowRegister() {
           </g>`);
       };
 
+      /* Every branch of the schematic is drawn unconditionally (see
+         `_svgSystem`), so the only thing `opts` still decides is whether the
+         storage node exists - it is the one branch that is genuinely absent on a
+         micro inverter with no battery.
+
+         The two PV captions carry a qualifier because the words 光伏1 / 光伏2
+         mean something *different* here than they do on the Device tab, where
+         「PV1」..「PV4」 are the unit's own DC connectors.  Here 光伏1 is the
+         generation of the devices in this system and 光伏2 is generation from
+         outside it; a reader who takes 光伏2 for "the second connector" would
+         misread the house.  The parenthesis is short enough to fit under the
+         node and says it without a legend. */
       node(NODE_COL_L, NODE_ROW_TOP, "pv", working(d.pv),
-        reading(d.pv), t("PV1", "光伏1"));
+        reading(d.pv), t("PV1 (in system)", "光伏1（系统内）"));
       if (opts.battery) {
         node(NODE_COL_L, NODE_ROW_BOT, "battery", working(d.battery),
           `${reading(d.battery)}${d.soc === null ? "" : `　${num(d.soc).toFixed(2)}%`}`,
           t("Storage", "微储"));
       }
 
-      if (opts.pv2) {
-        node(NODE_COL_M, NODE_ROW_TOP, "pv", working(d.pv2),
-          reading(d.pv2), t("PV2", "光伏2"));
-      }
-      if (opts.grid) {
+      node(NODE_COL_M, NODE_ROW_TOP, "pv", working(d.pv2),
+        reading(d.pv2), t("PV2 (external)", "光伏2（系统外）"));
+      if (d.meter === false) {
+        /* No meter: one lumped 「电网&负载」 node where 电网 used to be.  It has
+           no 电网输入 / 电网输出 pill - the reading is the unit's AC port, which
+           cannot be attributed to either side of a border the firmware cannot
+           see - and it prints the magnitude, so the number matches the vendor
+           app's own dashboard.  See `_svgSystem` for the connector. */
+        node(NODE_COL_R, NODE_ROW_TOP, "gridload", working(d.gridPort),
+          reading(d.gridPort), t("Grid & Load", "电网&负载"));
+      } else {
         const g = num(d.grid);
         const importing = g > 0;
+        /* The caption follows the *reading*, never the role: this view draws the
+           installation, so a unit without a meter has to be labelled the same
+           way as one with it or the picture would say master/slave twice (once
+           here and once in the header chip).  The sign is already normalised to
+           the grid convention in `_data` - including its own-port fallback,
+           which negates `grid_on_p` - so "positive means importing" holds for
+           both cases and the wording stays true. */
         // At ~0 W neither direction is true, so the node just says 电网.
         const caption = Math.abs(g) < MIN_FLOW
           ? t("Grid", "电网")
-          : (importing ? t("Grid in", "电网输入") : t("Grid out", "电网输出"));
+          : (importing ? t("Grid In", "电网输入") : t("Grid Out", "电网输出"));
         node(NODE_COL_R, NODE_ROW_TOP, "grid", working(d.grid),
           reading(d.grid), caption);
-      }
-      if (opts.lamp) {
         node(NODE_COL_M, NODE_ROW_BOT, "load", working(d.load),
           reading(d.load), t("Load", "负载"));
       }
-      if (opts.plug) {
-        node(NODE_COL_R, NODE_ROW_BOT, "plug", working(d.smartPlug),
-          reading(d.smartPlug), t("Smart plug", "智能插座"));
-      }
+      node(NODE_COL_R, NODE_ROW_BOT, "plug", working(d.smartPlug),
+        reading(d.smartPlug), t("Smart Plug", "智能插座"));
 
       return parts.join("");
-    }
-
-    /** Wall clock in ms; overridable so the preview harness can fast forward. */
-    _now() {
-      return Date.now();
-    }
-
-    /**
-     * Bottom right node of the diagram.
-     *
-     * With a meter it is the grid: `sys_grid_p` (`> 0` = drawing from the grid,
-     * `< 0` = feeding back), and it wears the 电网输入/电网输出 pill.  Without
-     * one the firmware has no way to tell the grid from the house, so the node
-     * becomes 「电网&负载」 and shows the device level on-grid port power
-     * `grid_on_p` instead — with no pill at all, because that combined reading
-     * cannot be attributed to either side (the vendor app shows it the same
-     * way).  Its sign convention is also the other way round: `< 0` = drawing
-     * from the grid.
-     *
-     * `reverse` describes the connector: the grid line is drawn from the house
-     * out to the grid, so importing has to run it backwards.
-     */
-    /**
-     * The grid is now a plain node on the schematic: `sys_grid_p`, `> 0` =
-     * drawing from the grid, `< 0` = feeding back.  The old 电网&负载 variant
-     * (and the meter detection that decided between them) went away with the
-     * house drawing - the card no longer guesses whether a meter is installed.
-     */
-    _gridNode(d) {
-      const power = d.grid;
-      const importing = power > 0;
-      return {
-        caption: importing ? this._t("Grid in", "电网输入") : this._t("Grid out", "电网输出"),
-        value: fmtW(power),
-        power,
-        color: importing ? COLORS.grid : COLORS.grid_out,
-        reverse: importing,
-      };
-    }
-
-    /** Map the firmware's `bat_sts` string to a label + pill style. */
-    _batteryStatus(d) {
-      const table = {
-        charge: { cls: "ok", en: "Charging", zh: "充电" },
-        discharge: { cls: "warn", en: "Discharging", zh: "放电" },
-        lock: { cls: "warn", en: "Locked", zh: "锁定" },
-        standby: { cls: "", en: "Standby", zh: "待机" },
-      };
-      let key = d.status;
-      if (!table[key]) {
-        if (Math.abs(d.battery) < MIN_FLOW) key = "standby";
-        else key = d.battery < 0 ? "charge" : "discharge";
-      }
-      const entry = table[key] || table.standby;
-      return { key, cls: entry.cls, text: this._t(entry.en, entry.zh) };
     }
 
     /**
@@ -2125,6 +3051,9 @@ function _hmPowerFlowRegister() {
             .value=${config.language || ""} @change=${this._changed("language")}></ha-textfield>
           <ha-textfield label="temperature_entity" .value=${config.temperature_entity || ""}
             @change=${this._changed("temperature_entity")}></ha-textfield>
+          <ha-textfield label="alarm_entity (optional - draws the condition badge)"
+            .value=${config.alarm_entity || ""}
+            @change=${this._changed("alarm_entity")}></ha-textfield>
           <ha-textfield label="max_width (px)" .value=${config.max_width || ""}
             @change=${this._changed("max_width")}></ha-textfield>
           <ha-textfield label="flow_speed (default 1, 0.5 = slower)"
@@ -2153,7 +3082,7 @@ function _hmPowerFlowRegister() {
           <label class="sw">
             <ha-switch .checked=${config.show_grid !== false}
               @change=${this._toggle("show_grid")}></ha-switch>
-            <span>show_grid (inverter layout: draw the 并网端口 output node)</span>
+            <span>show_grid (inverter layout: draw the grid port output node)</span>
           </label>
           <label class="sw">
             <ha-switch .checked=${config.dim_when_idle === false}

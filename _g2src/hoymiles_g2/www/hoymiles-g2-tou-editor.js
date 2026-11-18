@@ -21,21 +21,33 @@ function _hmTouRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -44,40 +56,37 @@ function _hmTouRegister() {
    * dashboard keeps working) or a language map:
    *
    *   title:
-   *     en: TOU plan
-   *     zh: 分时计划
+   *     en: Battery packs
+   *     zh: 电池包
    *
    * That is what lets the text *you* write follow the UI language too, instead
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   const WEEK = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const WEEK_ZH = { Mon: "周一", Tue: "周二", Wed: "周三", Thu: "周四", Fri: "周五", Sat: "周六", Sun: "周日" };
   const MODE_LABEL = {
-    1: { en: "Force charge", zh: "强制充电" },
-    2: { en: "PV charge", zh: "光伏充电" },
+    1: { en: "Force Charge", zh: "强制充电" },
+    2: { en: "PV Charge", zh: "光伏充电" },
     4: { en: "Discharge", zh: "放电" },
   };
   const TS_MAX = 96;
 
   function slug(id) {
     return String(id).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  }
+  /* Only letters and digits, so `MSA-280520260806`, `msa_280520260806` and the
+   * user-renamed forms all collapse to the same string - the join used below to
+   * find entities whose id no longer matches the conventional pattern. */
+  function norm(name) {
+    return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
   function tsToTime(ts) {
     const m = Math.max(0, Math.min(TS_MAX, Number(ts) || 0)) * 15;
@@ -218,14 +227,35 @@ function _hmTouRegister() {
       if (!this._log) this._log = [];
     }
 
-    _t(en, zh) { return hmLang(this._hass, this._config) === "zh" ? zh : en; }
+    /** One of the two strings the card carries, in the current language. */
+    _t(en, zh) {
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
+    }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
     _dev() { return this._config.dev_id; }
     _weekLabel(day) { return this._t(day, WEEK_ZH[day]); }
+
+    connectedCallback() {
+      super.connectedCallback();
+      /* The toolbar language switch only writes localStorage and fires
+         `hoymiles-language`; it never touches `hass.language`, so without this
+         the card would keep its old wording until a page reload. */
+      I18N.watch(this);
+    }
+
+    disconnectedCallback() {
+      I18N.unwatch(this);
+      super.disconnectedCallback();
+    }
 
     /**
      * Resolve an entity id for this device.
@@ -243,6 +273,22 @@ function _hmTouRegister() {
       const prefix = `${domain}.${dev}`;
       for (const entityId of Object.keys(states)) {
         if (entityId.startsWith(prefix) && entityId.endsWith(idSuffix)) return entityId;
+      }
+
+      // A renamed device: Home Assistant rewrites every entity id to the new
+      // name, so the `<slug(dev_id)>_` prefix above stops matching.  The
+      // serial never changes, so look for the suffix right after it.  This is
+      // the only strategy that can rescue a rename - the unique_id scan below
+      // is a last resort and cannot help, because the frontend's entity
+      // registry (`hass.entities`) does not carry `unique_id` unless the
+      // connection requested extended fields.
+      const marker = norm(this._dev());
+      const wanted = norm(idSuffix);
+      for (const entityId of Object.keys(states)) {
+        const flat = norm(entityId);
+        const at = marker ? flat.indexOf(marker) : -1;
+        if (at < 0) continue;
+        if (flat.slice(at + marker.length) === wanted) return entityId;
       }
 
       if (uniqueSuffix) {
@@ -370,7 +416,7 @@ function _hmTouRegister() {
             week: this._draft.week.map((v, i) => (WEEK[i] === attrs.week ? dayIdx : v)),
             days: { ...this._draft.days, [dayIdx]: attrs.day_plan.map((s) => ({ ...s })) },
           };
-          this._logLine("ok", `${week} -> day${dayIdx} · ${attrs.day_plan.length} ${this._t("segments", "段")}`);
+          this._logLine("ok", `${week} -> day${dayIdx} · ${attrs.day_plan.length} ${this._t("Segments", "段")}`);
         } else {
           const reason = attrs.err_msg || (state ? state.state : "no status");
           this._logLine("err", `${week}: ${reason}`);
@@ -402,7 +448,7 @@ function _hmTouRegister() {
         await this._setMode("tou_plan");
         const today = WEEK[(new Date().getDay() + 6) % 7];
         await this._getPlan(today);
-        this._logLine("ok", this._t("saved and activated", "保存并激活完成"));
+        this._logLine("ok", this._t("Saved and activated", "保存并激活完成"));
       } catch (err) {
         this._logLine("err", `save failed: ${err.message || err}`);
       }
@@ -450,7 +496,7 @@ function _hmTouRegister() {
           ${locked ? html`
             <div class="notice">
               <span>
-                ${this._t("Read-only: EMS mode is ", "只读：EMS 模式为 ")}
+                ${this._t("Read-only: EMS Mode is ", "只读：EMS 模式为 ")}
                 <b>${mode}</b>${this._t(", not tou_plan.", "，不是 tou_plan。")}
               </span>
               <button class="btn primary" @click=${() => this._setMode("tou_plan")}>
@@ -460,13 +506,13 @@ function _hmTouRegister() {
           <div class="wrap ${locked ? "locked" : ""}"
                aria-disabled=${locked ? "true" : "false"}>
             <div class="head">
-              <div class="title">${this._text(this._config.title) || this._t("TOU plan", "分时计划")}</div>
+              <div class="title">${this._text(this._config.title) || this._t("TOU Plan", "分时计划")}</div>
               <div class="sub">${this._dev()} · EMS: ${mode || "?"}</div>
             </div>
 
             <div class="bar">
               <button class="btn" @click=${() => this._getPlan(WEEK[(new Date().getDay() + 6) % 7])}>
-                ${this._t("Load today", "载入今天")}
+                ${this._t("Load Today", "载入今天")}
               </button>
               <button class="btn" @click=${() => this._getPlan("Mon")}>${this._t("Load Mon", "载入周一")}</button>
               <button class="btn primary" @click=${() => this._saveAll()}>
@@ -474,11 +520,11 @@ function _hmTouRegister() {
               </button>
             </div>
 
-            <div class="group-title">${this._t("Week plan", "周计划")}</div>
+            <div class="group-title">${this._t("Week Plan", "周计划")}</div>
             <div class="group">
               <div class="tblwrap">
                 <table class="wplan">
-                  <thead><tr><th>${this._t("Day", "星期")}</th><th>${this._t("Day plan", "日计划")}</th></tr></thead>
+                  <thead><tr><th>${this._t("Day", "星期")}</th><th>${this._t("Day Plan", "日计划")}</th></tr></thead>
                   <tbody>
                     ${WEEK.map((name, index) => html`
                       <tr>
@@ -502,7 +548,7 @@ function _hmTouRegister() {
               </div>
             </div>
 
-            <div class="group-title">${this._t("Day plan editor", "日计划编辑")}</div>
+            <div class="group-title">${this._t("Day Plan Editor", "日计划编辑")}</div>
             <div class="seg" style="margin-bottom:10px">
               ${[1, 2, 3, 4, 5, 6, 7, 8].map((idx) => html`
                 <button class="tab ${idx === day ? "on" : ""}" @click=${() => {
@@ -533,7 +579,7 @@ function _hmTouRegister() {
                         <select @change=${(e) => this._setSegment(day, index, "mode", Number(e.target.value))}>
                           ${[1, 2, 4].map((m) => html`
                             <option value=${m} ?selected=${Number(seg.mode) === m}>
-                              ${MODE_LABEL[m][hmLang(this._hass, this._config)]}
+                              ${this._t(MODE_LABEL[m].en, MODE_LABEL[m].zh)}
                             </option>
                           `)}
                         </select>
@@ -559,7 +605,7 @@ function _hmTouRegister() {
             </div>
             <div class="bar" style="margin-top:8px">
               <button class="btn" @click=${() => this._addSegment(day)}>
-                ${this._t("+ Add segment", "+ 添加时段")}
+                ${this._t("+ Add Segment", "+ 添加时段")}
               </button>
             </div>
 
@@ -567,9 +613,9 @@ function _hmTouRegister() {
             <div class="group">
               <div class="log">
                 <div class="chip">
-                  ${this._t("status", "回显")}: ${statusState ? statusState.state : "-"} ·
-                  ${this._t("day ack", "日应答")}: ${(this._hass.states[this._dayAckEntity()] || {}).state || "-"} ·
-                  ${this._t("week ack", "周应答")}: ${(this._hass.states[this._weekAckEntity()] || {}).state || "-"}
+                  ${this._t("Status", "回显")}: ${statusState ? statusState.state : "-"} ·
+                  ${this._t("Day ack", "日应答")}: ${(this._hass.states[this._dayAckEntity()] || {}).state || "-"} ·
+                  ${this._t("Week ack", "周应答")}: ${(this._hass.states[this._weekAckEntity()] || {}).state || "-"}
                 </div>
                 ${(this._log || []).map((entry) => html`<div class=${entry.cls}>${entry.line}</div>`)}
               </div>
