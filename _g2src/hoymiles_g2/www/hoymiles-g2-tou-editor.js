@@ -1,11 +1,11 @@
 /* ============================================================================
  * Hoymiles Micro Storage — TOU (time-of-use) plan editor
  * ----------------------------------------------------------------------------
- * Lovelace card bundled with the `hoymiles_g2` custom integration.
+ * Lovelace card bundled with the `hoymiles` custom integration.
  * Protocol: 《禾迈微储MQTT协议开发指南》V0.5.1 §16 ~ §21
  *
  * The card talks to the device through the integration services
- * (hoymiles_g2.set_tou_day_plan / set_tou_week_plan / get_tou_plan / set_ems_mode)
+ * (hoymiles.set_tou_day_plan / set_tou_week_plan / get_tou_plan / set_ems_mode)
  * and falls back to `mqtt.publish` when the integration is not installed.
  *
  * Card config:
@@ -87,6 +87,24 @@ function _hmTouRegister() {
    * find entities whose id no longer matches the conventional pattern. */
   function norm(name) {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+  /**
+   * Drop the `_2` / `_3` … Home Assistant appends to a colliding entity id.
+   *
+   * HA does not fail a registration whose derived `entity_id` is taken; it
+   * numbers it.  A unit whose serial was registered once before therefore has
+   * every id one suffix away from the plain one this card derives, so the joins
+   * and prefix tests below have to look past that number.  Only a trailing
+   * `_<digits>` is removed, so a key that legitimately ends in digits
+   * (`pv1_power`) is untouched.
+   */
+  function stripAuditSuffix(value) {
+    const text = String(value == null ? "" : value);
+    const at = text.lastIndexOf("_");
+    if (at <= 0) return text;
+    const tail = text.slice(at + 1);
+    if (!/^[0-9]+$/.test(tail) || /^0+$/.test(tail)) return text;
+    return text.slice(0, at);
   }
   function tsToTime(ts) {
     const m = Math.max(0, Math.min(TS_MAX, Number(ts) || 0)) * 15;
@@ -259,8 +277,14 @@ function _hmTouRegister() {
 
     /**
      * Resolve an entity id for this device.
-     * Tries, in order: exact conventional id, entity_id suffix match,
-     * unique_id suffix match (used by the firmware discovery entities).
+     * Tries, in order: exact conventional id, entity_id suffix match, the same
+     * with Home Assistant's `_2` disambiguation number stripped, a match on the
+     * serial (for a renamed device), and finally the registry `name`.
+     *
+     * The numbered pass matters because HA does not fail a registration whose
+     * derived `entity_id` is taken - it appends `_2`, `_3` … - so a unit
+     * registered once before has every id one suffix away from the one this
+     * card derives, and the editor showed an empty plan for such a device.
      */
     _resolveEntity({ domain, idSuffix, uniqueSuffix }) {
       const states = (this._hass && this._hass.states) || {};
@@ -271,25 +295,38 @@ function _hmTouRegister() {
       if (states[conventional]) return conventional;
 
       const prefix = `${domain}.${dev}`;
-      for (const entityId of Object.keys(states)) {
-        if (entityId.startsWith(prefix) && entityId.endsWith(idSuffix)) return entityId;
-      }
-
-      // A renamed device: Home Assistant rewrites every entity id to the new
-      // name, so the `<slug(dev_id)>_` prefix above stops matching.  The
-      // serial never changes, so look for the suffix right after it.  This is
-      // the only strategy that can rescue a rename - the unique_id scan below
-      // is a last resort and cannot help, because the frontend's entity
-      // registry (`hass.entities`) does not carry `unique_id` unless the
-      // connection requested extended fields.
-      const marker = norm(this._dev());
       const wanted = norm(idSuffix);
+
+      // 1. normalized exact match on the tail after `<domain>.<dev>_`.
+      let found = null;
+      for (const entityId of Object.keys(states)) {
+        if (!entityId.startsWith(prefix)) continue;
+        if (norm(entityId.slice(prefix.length + 1)) !== wanted) continue;
+        if (!found || entityId.length < found.length) found = entityId;
+      }
+      if (found) return found;
+
+      // 2. the same, tolerating the disambiguation number.
+      for (const entityId of Object.keys(states)) {
+        if (!entityId.startsWith(prefix)) continue;
+        if (norm(stripAuditSuffix(entityId.slice(prefix.length + 1))) !== wanted) continue;
+        if (!found || entityId.length < found.length) found = entityId;
+      }
+      if (found) return found;
+
+      // 3. A renamed device: Home Assistant rewrites every entity id to the new
+      //    name, so the `<slug(dev_id)>_` prefix above stops matching.  The
+      //    serial never changes, so look for the suffix right after it.
+      const marker = norm(this._dev());
       for (const entityId of Object.keys(states)) {
         const flat = norm(entityId);
         const at = marker ? flat.indexOf(marker) : -1;
         if (at < 0) continue;
-        if (flat.slice(at + marker.length) === wanted) return entityId;
+        const tail = flat.slice(at + marker.length);
+        if (tail !== wanted && norm(stripAuditSuffix(tail)) !== wanted) continue;
+        if (!found || entityId.length < found.length) found = entityId;
       }
+      if (found) return found;
 
       if (uniqueSuffix) {
         for (const [entityId, entry] of Object.entries(entities)) {
@@ -328,7 +365,7 @@ function _hmTouRegister() {
 
     _hasIntegration() {
       const services = (this._hass && this._hass.services) || {};
-      return !!(services.hoymiles_g2 && services.hoymiles_g2.set_tou_day_plan);
+      return !!(services.hoymiles && services.hoymiles.set_tou_day_plan);
     }
 
     _logLine(cls, text) {
@@ -345,7 +382,7 @@ function _hmTouRegister() {
     async _setMode(mode) {
       try {
         if (this._hasIntegration()) {
-          await this._hass.callService("hoymiles_g2", "set_ems_mode", {
+          await this._hass.callService("hoymiles", "set_ems_mode", {
             dev_id: this._dev(), mode,
           });
         } else {
@@ -364,7 +401,7 @@ function _hmTouRegister() {
 
     async _sendDayPlan(dayIdx, segments) {
       if (this._hasIntegration()) {
-        await this._hass.callService("hoymiles_g2", "set_tou_day_plan", {
+        await this._hass.callService("hoymiles", "set_tou_day_plan", {
           dev_id: this._dev(), day_idx: dayIdx, day_plan: segments,
         });
       } else {
@@ -376,7 +413,7 @@ function _hmTouRegister() {
 
     async _sendWeekPlan(weekPlan) {
       if (this._hasIntegration()) {
-        await this._hass.callService("hoymiles_g2", "set_tou_week_plan", {
+        await this._hass.callService("hoymiles", "set_tou_week_plan", {
           dev_id: this._dev(), week_plan: weekPlan,
         });
       } else {
@@ -393,7 +430,7 @@ function _hmTouRegister() {
         const beforeUpdate = before ? before.last_updated : null;
 
         if (this._hasIntegration()) {
-          await this._hass.callService("hoymiles_g2", "get_tou_plan", { dev_id: this._dev(), week });
+          await this._hass.callService("hoymiles", "get_tou_plan", { dev_id: this._dev(), week });
         } else {
           await this._publish(`homeassistant/sensor/${this._dev()}/tou_plan/get`, { week });
         }

@@ -172,17 +172,17 @@ function _hmControlRegister() {
 
   /* Rated AC output of **one unit**, in watts, by product id.
    *
-   * This is the only honest upper bound on a power set-point, and it cannot be
-   * read off the firmware.  Measured: `RMI-4161A0209FF6/power_ctrl/config`
-   * declares `min 0 / max 3000` while the *same* serial declares `0 / 1000`
-   * under the `MI-` prefix it used before - because a `master` publishes the
-   * **whole installation's** capability, and its `slave` adds the rest.  A
-   * unit that can physically produce 1000 W was therefore offered a 3000 W
-   * slider, and a `slave` that publishes no `power_ctrl` object at all fell
-   * back to whatever `output_power` happened to say.
+   * This is only the **fallback** for the power set-point range (see
+   * `_powerRange`): whatever `power_ctrl` itself declares wins, and this table
+   * is what is left when the device declares nothing at all.  It matters
+   * because a range with no upper bound cannot be drawn - the slider needs a
+   * number before the first `power_ctrl/config` arrives.
    *
-   * The product id (the four digits of the serial body, the same key the PV
-   * count uses) is the only stable answer.  Values measured off
+   * It is worth knowing what "one unit" means, because a *master* can declare
+   * the **whole installation's** capability: measured,
+   * `RMI-4161A0209FF6/power_ctrl/config` declares `min 0 / max 3000` while the
+   * *same* serial declares `0 / 1000` under the `MI-` prefix it used before,
+   * because a `master` adds its `slave`'s share.  Values measured off
    * `output_power/config` while each unit ran stand-alone:
    *
    *   1650  HiFlow           800 W
@@ -229,12 +229,12 @@ function _hmControlRegister() {
    * single stream carries both directions:
    *
    *   homeassistant/<component>/<dev_id>/...   firmware + integration topics
-   *   hoymiles_g2/<dev_id>/...                    integration bookkeeping
+   *   hoymiles/<dev_id>/...                    integration bookkeeping
    *                                            (availability, EMS mode echo)
    *
    * Direction is read off the topic: Home Assistant writes to the command side
    * (`/set`, `/command`, `/trigger`, `/get`), the device publishes everything
-   * else. The `hoymiles_g2/` family is the integration's own, so it counts as
+   * else. The `hoymiles/` family is the integration's own, so it counts as
    * downlink too. This is a heuristic, but a topic cannot be told apart from
    * its payload, and the alternative (hard-coding every topic of the protocol)
    * would silently miss new ones.
@@ -613,33 +613,47 @@ function _hmControlRegister() {
 
     static get styles() {
       return css`
-        /* iOS-style settings layout: grouped cards, right-aligned controls,
-           hairline separators that stop short of the card edge. */
+        /* Card grid, the same vocabulary the micro storage page uses: every
+           control family owns its own <ha-card>, the header is a small
+           uppercase label, and the rows inside are separated by hairlines
+           instead of being boxed in a grey block.  The two cards therefore
+           read as one system, whichever device the page belongs to. */
         :host { display: block; }
-        ha-card { padding: 14px 16px 16px; }
+        .grid { display: grid; gap: 14px; align-items: start;
+                grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        @media (max-width: 760px) {
+          .grid { grid-template-columns: minmax(0, 1fr); }
+        }
+        .grid > .wide { grid-column: 1 / -1; }
+
+        ha-card { padding: 15px 17px 17px; border-radius: 16px; }
+
+        /* Only drawn when the card was given an explicit title; the generated
+           dashboard leaves it out, so the page header is the only title. */
         .head { display: flex; align-items: baseline; gap: 10px;
-                flex-wrap: wrap; margin-bottom: 12px; }
+                flex-wrap: wrap; margin-bottom: 14px; }
+        .head:only-child { margin-bottom: 0; }
         .head .title { font-size: 17px; font-weight: 600;
                        color: var(--primary-text-color); }
         .head .sub { font-size: 12.5px; color: var(--secondary-text-color); }
 
-        .group { background: var(--secondary-background-color, rgba(120,120,128,.08));
-                 border-radius: 14px; overflow: hidden; margin-bottom: 14px; }
-        .group-title { font-size: 12.5px; font-weight: 500;
-                       color: var(--secondary-text-color);
-                       padding: 0 6px 6px; }
-        .group-wrapper:not(:first-of-type) { margin-top: 16px; }
+        .c-head { display: flex; align-items: center; gap: 9px; margin: 0 0 2px; }
+        .c-head .ct { font-size: 12.5px; font-weight: 600; line-height: 1.25;
+                      letter-spacing: .05em; text-transform: uppercase;
+                      color: var(--primary-text-color); }
 
         .item { display: flex; align-items: center; gap: 12px;
-                padding: 11px 14px; min-height: 52px;
+                padding: 11px 0; min-height: 52px;
                 box-sizing: border-box; position: relative; }
-        /* The group clips its content (overflow: hidden), so a row that does not
-           fit has to wrap instead of spilling: when the card is narrow the
-           control moves to its own line below the label. Without this the
-           segmented control was cut off once the dashboard column shrank. */
+        /* The card is narrow once the two-column grid splits, so a row that does
+           not fit has to wrap instead of spilling: the control moves to its own
+           line below the label. Without this the segmented control was cut off
+           once the dashboard column shrank. */
         .item:not(.stack) { flex-wrap: wrap; }
+        /* Separators run the full card width now that the rows are not sitting
+           inside a padded grey box. */
         .item + .item::before {
-          content: ""; position: absolute; top: 0; left: 14px; right: 0;
+          content: ""; position: absolute; top: 0; left: 0; right: 0;
           height: 1px; background: var(--divider-color); opacity: .7;
         }
         .item .ico { flex: 0 0 auto; width: 24px; text-align: center;
@@ -781,14 +795,14 @@ function _hmControlRegister() {
            scroll container so the card never jumps. */
         .log-block { border-top: 1px solid var(--divider-color); }
         .log-head { display: flex; align-items: center; gap: 8px;
-                    flex-wrap: wrap; padding: 10px 14px 6px; }
+                    flex-wrap: wrap; padding: 10px 0 6px; }
         .log-head .log-title { font-size: 12.5px; font-weight: 500;
                                color: var(--primary-text-color); }
         .log-head .log-count { font-size: 12px; margin-right: auto;
                                color: var(--secondary-text-color);
                                font-variant-numeric: tabular-nums; }
         .log-list { display: flex; flex-direction: column; gap: 6px;
-                    max-height: 340px; overflow: auto; padding: 0 14px 8px; }
+                    max-height: 340px; overflow: auto; padding: 0 0 8px; }
         .log-row { font-size: 12px; border-radius: 10px; padding: 6px 8px;
                    background: var(--secondary-background-color, rgba(120,120,128,.10)); }
         .log-row .log-meta { display: flex; align-items: center; gap: 6px;
@@ -825,7 +839,7 @@ function _hmControlRegister() {
                                    font-family: ui-monospace, SFMono-Regular, Menlo,
                                    Consolas, monospace;
                                    color: var(--secondary-text-color); }
-        .log-hint { padding: 0 14px 10px; font-size: 12px;
+        .log-hint { padding: 0 0 10px; font-size: 12px;
                     color: var(--secondary-text-color); }
         .log-hint.err { color: var(--error-color); }
         .btn.small { padding: 5px 10px; font-size: 12.5px; }
@@ -879,7 +893,10 @@ function _hmControlRegister() {
     }
 
     getCardSize() {
-      return 13;
+      /* A grid of independent cards, the same estimate the storage page uses:
+         roughly two columns of three rows on a desktop dashboard. Lovelace only
+         uses this as a hint. */
+      return 10;
     }
 
     connectedCallback() {
@@ -935,7 +952,7 @@ function _hmControlRegister() {
      * Resolve an entity by protocol key.
      *
      * The firmware's MQTT discovery uses `<dev_id>_<key>` unique ids, while the
-     * integration's own entities use `hoymiles_g2_<dev_id>_<key>`; entity ids are
+     * integration's own entities use `hoymiles_<dev_id>_<key>`; entity ids are
      * slugified from the *name*, so they are matched normalized.
      */
     /**
@@ -1011,7 +1028,7 @@ function _hmControlRegister() {
       let found = null;
       const wantUid = new Set([
         `${this._dev()}_${key}`,
-        `hoymiles_g2_${this._dev()}_${key}`,
+        `hoymiles_${this._dev()}_${key}`,
       ]);
       for (const [entityId, entry] of Object.entries(hass.entities || {})) {
         if (!entry || !entityId.startsWith(`${domain}.`)) continue;
@@ -1264,7 +1281,7 @@ function _hmControlRegister() {
       if (!hass || !hass.entities || !hass.devices) return [];
 
       /* One unit, two devices. This integration registers
-       * `hoymiles_g2` -> `RMI-4161A0209FF6`; MQTT discovery registers
+       * `hoymiles` -> `RMI-4161A0209FF6`; MQTT discovery registers
        * `mqtt` -> `4161A0209FF6` (no model prefix) for the same serial. The
        * control objects - switch, select, number, button - arrive over MQTT
        * discovery, so they hang off the *second* device. Looking only at the
@@ -1279,7 +1296,7 @@ function _hmControlRegister() {
         for (const pair of ids) {
           if (!Array.isArray(pair) || pair.length < 2) continue;
           const scope = String(pair[0]).toLowerCase();
-          if (scope !== "hoymiles_g2" && scope !== "mqtt") continue;
+          if (scope !== "hoymiles" && scope !== "mqtt") continue;
           const value = String(pair[1]).toLowerCase();
           if (value === dev || value === bare) { deviceIds.add(id); break; }
         }
@@ -1760,7 +1777,7 @@ function _hmControlRegister() {
       this._timerBusy = true;
       this.requestUpdate();
       try {
-        await this._hass.callService("hoymiles_g2", "start_power_ctrl_keepalive", {
+        await this._hass.callService("hoymiles", "start_power_ctrl_keepalive", {
           dev_id: this._dev(),
           power,
           period: this._timerPeriodValue(),
@@ -1783,7 +1800,7 @@ function _hmControlRegister() {
       this._timerBusy = true;
       this.requestUpdate();
       try {
-        await this._hass.callService("hoymiles_g2", "stop_power_ctrl_keepalive", {
+        await this._hass.callService("hoymiles", "stop_power_ctrl_keepalive", {
           dev_id: this._dev(),
         });
         this._syncKeepalive();
@@ -2010,17 +2027,17 @@ function _hmControlRegister() {
 
     /** The two wildcards that cover this device: its tree, and ours. */
     _logTopics() {
-      return [this._topic("+/<dev_id>/#"), `hoymiles_g2/${this._dev()}/#`];
+      return [this._topic("+/<dev_id>/#"), `hoymiles/${this._dev()}/#`];
     }
 
     /**
      * Which way does a message go? Home Assistant writes to the command side of
      * a topic (`/set`, `/command`, `/trigger`, `/get`); everything else on the
-     * device's tree is published by the device itself. The `hoymiles_g2/` family
+     * device's tree is published by the device itself. The `hoymiles/` family
      * belongs to the integration, which is also this end of the link.
      */
     _logDown(topic) {
-      if (String(topic).startsWith("hoymiles_g2/")) return true;
+      if (String(topic).startsWith("hoymiles/")) return true;
       return LOG_DOWNLINK.test(String(topic));
     }
 
@@ -2096,15 +2113,29 @@ function _hmControlRegister() {
       const retain = Boolean(msg && msg.retain);
       const now = new Date();
       const pad = (n) => String(n).padStart(2, "0");
+      /* The receipt clock is read in the *device's* region, the same clock the
+         rest of the dashboard uses: a log stamped in the browser's zone would
+         disagree with the alarm list beside it on a laptop that travels. */
+      const clock = this._clockOf(now);
       return {
         topic,
         down,
         retain,
         text: this._logPayload(payload),
-        clock: retain
-          ? "—"
-          : `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`,
+        clock: retain ? "—" : `${pad(clock.hour)}:${pad(clock.minute)}:${pad(clock.second)}`,
       };
+    }
+
+    /** `HH:MM:SS` parts of one instant, in the configured region. */
+    _clockOf(when) {
+      const api = window.HoymilesG2Region;
+      if (api && typeof api.partsIn === "function") {
+        const parts = api.partsIn(when, api.zone());
+        if (parts) {
+          return { hour: parts.hour, minute: parts.minute, second: parts.second };
+        }
+      }
+      return { hour: when.getHours(), minute: when.getMinutes(), second: when.getSeconds() };
     }
 
     /**
@@ -2380,56 +2411,83 @@ function _hmControlRegister() {
         ? this._config.show_switch !== false
         : this._hasEntity("switch", "switch");
 
-      return html`
-        <ha-card>
-          <div class="head">
-            <div class="title">${this._text(this._config.title) || this._t("Control", "控制")}</div>
-            ${this._config.subtitle === false ? "" : html`
-              <div class="sub">${this._t(
-                "Commands are sent straight to the device",
-                "指令直接下发到设备",
-              )}</div>`}
-          </div>
-          ${this._group(this._t("Power & Mode", "电源与模式"), [
+      /* Layout, the same one the micro storage page uses: a grid of cards, one
+         per control family, instead of a single card holding grey blocks.  A
+         device that answers some of these families simply has fewer cards.
+         `|| ""` on the title: a config without one resolves to undefined, and
+         an undefined title would still emit an empty card on top of the grid. */
+      const title = this._text(this._config.title) || "";
+      const subtitle = this._config.subtitle === false ? "" : this._t(
+        "Commands are sent straight to the device",
+        "指令直接下发到设备",
+      );
+      const cards = [
+        this._group(
+          this._t("Power & Mode", "电源与模式"),
+          [
             showSwitch ? this._switchItem() : "",
             showEms ? this._emsItem() : "",
-          ])}
-          ${this._group(this._t("Power Settings", "功率设置"), [
+          ],
+          "",
+        ),
+        this._group(
+          this._t("Power Settings", "功率设置"),
+          [
             showPowerCtrl ? this._powerCtrlItem() : "",
             showPowerCtrl ? this._timerItem() : "",
             showOutput ? this._outputItem() : "",
             showPhase ? this._phaseItem() : "",
-          ])}
-          ${this._group(this._t("Plan & Maintenance", "计划与维护"), [
+          ],
+          "",
+        ),
+        this._group(
+          this._t("Plan & Maintenance", "计划与维护"),
+          [
             showTou ? this._touItem() : "",
             showReboot ? this._rebootItem() : "",
             showBlePinReset ? this._blePinResetItem() : "",
             showFactoryReset ? this._factoryResetItem() : "",
             showLog ? html`${this._logItem()}${this._logOpen ? this._logPanel() : ""}` : "",
-          ])}
-          ${this._toast === "" ? "" : html`
-            <div class="toast ${this._toastError ? "err" : ""}">${this._toast}</div>`}
-        </ha-card>
+          ],
+          "wide",
+        ),
+      ].filter((card) => card !== "");
+
+      return html`
+        <div class="grid">
+          ${title === ""
+            ? ""
+            : html`
+              <ha-card class="wide">
+                <div class="head">
+                  <div class="title">${title}</div>
+                  ${subtitle === "" ? "" : html`<div class="sub">${subtitle}</div>`}
+                </div>
+              </ha-card>`}
+          ${cards}
+        </div>
+        ${this._toast === "" ? "" : html`
+          <div class="toast ${this._toastError ? "err" : ""}">${this._toast}</div>`}
       `;
     }
 
-    /** One grouped block, like an iOS settings section.
+    /** One card per control family, the way the storage page groups its rows.
      *
-     * A group whose every row was dropped draws nothing at all.  The role gate
-     * above can empty a whole group - a follower has no "Power Settings" left -
-     * and an empty rounded box with its header still in place reads as a broken
-     * card rather than as "this unit has no such feature".
+     * A family whose every row was dropped draws nothing at all.  The role gate
+     * above can empty a whole family - a follower has no "Power Settings" left -
+     * and an empty card with its header still in place reads as a broken page
+     * rather than as "this unit has no such feature".
      */
-    _group(title, items) {
+    _group(title, items, cls) {
       const rows = (items || []).filter(
         (item) => item !== "" && item !== null && item !== undefined,
       );
       if (!rows.length) return "";
       return html`
-        <div class="group-wrapper">
-          ${title ? html`<div class="group-title">${title}</div>` : ""}
-          <div class="group">${rows}</div>
-        </div>`;
+        <ha-card class=${cls || ""}>
+          ${title ? html`<div class="c-head"><span class="ct">${title}</span></div>` : ""}
+          ${rows}
+        </ha-card>`;
     }
 
     /**
@@ -2691,46 +2749,35 @@ function _hmControlRegister() {
 
     /** The range the power-control slider offers for **this one unit**.
      *
-     * The lower bound is `power_ctrl`'s declared `min` and always has been: it
-     * is meaningful (`0` on an inverter, which curtails to nothing; negative on
-     * a storage unit, which charges).
+     * Both bounds are `power_ctrl`'s own declaration, and nothing else.  That is
+     * the entity the row writes to, so its `min` / `max` is by definition the
+     * range the firmware will accept for that write - the slider can neither
+     * offer a value the device would clamp away nor hide one it would take.
      *
-     * The upper bound cannot come from the device at all, and two earlier
-     * attempts to read it off a topic were both wrong:
+     * The lower bound is meaningful: `0` on an inverter, which curtails to
+     * nothing; negative on a storage unit, which charges.
      *
-     * * `output_power`'s `max` describes the **installation**, not the unit. On
-     *   `RMI-4161A0209FF6` (`master`) it declares `max 3000` while the same
-     *   serial declares `1000` under the `MI-` prefix it used before - the
-     *   3000 W is this unit plus its `slave`. A 1000 W unit was offered a
-     *   3000 W set-point, and on a `slave` - which publishes **no**
-     *   `output_power` object at all - the substitution collapsed the range to
-     *   `-1000 ~ 0`.
-     * * `power_ctrl`'s own `max` is the *transient* limit, not the capability:
-     *   the firmware rewrites it after every `output_power` command, and
-     *   `RMI-1650A028FC22` currently declares `132` while the hardware does
-     *   800 W. Bounding to it would make the row unable to ask for more than
-     *   the unit happens to be doing.
+     * `output_power` is deliberately **not** consulted any more.  It is a
+     * different setting (the installation-level output ceiling, which a `master`
+     * publishes on behalf of the whole set) and its declared `max` is `6000` on
+     * a `master` - five to six times what one box can deliver.  Dragging the
+     * power slider to the far end then sent a set-point the unit cannot hold, so
+     * the row looked broken instead of look useful.  `_outputItem` still shows,
+     * and writes, `output_power`'s own range - the two rows are separate
+     * settings and are now drawn from separate declarations.
      *
-     * So the upper bound is the model's rated output (`RATED_W_BY_PID`) and
-     * `power_ctrl`'s declared `max` only stands in when the model is unknown.
-     * A slider spanning the rated range while the device momentarily refuses to
-     * exceed the declared `max` is the honest drawing: the firmware accepts such
-     * a value regardless (measured - publishing 700 while the declared `max` was
-     * 234 was honoured and the device output 715 W).
+     * The fallback only applies when the entity is genuinely absent - before its
+     * first discovery, or on a device that publishes no `power_ctrl` object -
+     * and it has to be the right shape for the model: a micro inverter curtails
+     * to `0` and never goes negative, whereas a storage unit charges below zero.
      */
     _powerRange() {
       const rated = this._ratedWatts();
-      /* The fallback is only reached when the entity is genuinely absent - a
-         `slave` publishes no `power_ctrl` object at all - and it has to be the
-         right shape for the model: a micro inverter curtails to `0` and never
-         goes negative, whereas a storage unit charges below zero. */
-      const declared = this._bounds(
+      return this._bounds(
         "power_ctrl",
         rated === null ? -1000 : 0,
         rated === null ? 2000 : rated,
       );
-      const hi = rated !== null && rated > declared.lo ? rated : declared.hi;
-      return { lo: declared.lo, hi };
     }
 
     /** Sub-line of the EMS row: the mode shown, plus the device's own report when
@@ -2826,10 +2873,8 @@ function _hmControlRegister() {
         sub,
         /* The row is stacked for the same reason the two sliders are: the
            segment plus the number box plus the unit do not fit beside the name
-           at every width. Unstacked they wrapped onto a second line, the row
-           grew taller than `.item` allows and `.group { overflow: hidden }`
-           clipped the sub-line away entirely - which is why turning the timer
-           on showed nothing but the word 定时下发. */
+           at every width. Unstacked they wrapped onto a second line and the
+           control ended up squeezed against a one-line name. */
         stack: true,
         ctrl: html`
           ${this._segment(

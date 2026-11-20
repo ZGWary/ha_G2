@@ -94,6 +94,13 @@
         "data": {
           "confirm": "Confirm reboot"
         }
+      },
+      "region": {
+        "title": "Region",
+        "description": "The time zone this device's day is measured in. Today's yield resets at this zone's midnight and every displayed time follows it. Choose the first entry to follow Home Assistant, or type any IANA zone name such as Europe/Berlin.",
+        "data": {
+          "region": "Region"
+        }
       }
     },
     "abort": {

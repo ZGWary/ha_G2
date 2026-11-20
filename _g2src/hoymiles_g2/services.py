@@ -54,6 +54,8 @@ from .const import (
     TOU_TS_MAX,
     TOU_WEEKDAYS,
     is_inverter_dev_id,
+    CONF_REGION,
+    REGION_CHOICES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,6 +75,13 @@ SERVICE_STOP_POWER_CTRL_KEEPALIVE = "stop_power_ctrl_keepalive"
 # Options Flow has a `hass` of its own and reads `lovelace` directly.
 SERVICE_GET_OPTIONAL_CHARTS = "get_optional_charts"
 SERVICE_SET_OPTIONAL_CHARTS = "set_optional_charts"
+# The region (time zone) the device's day is measured in.  Two services for the
+# same reason as the charts above: the toolbar switch needs the choice list and
+# the current value to render, and a way to change it.  Stored in the config
+# entry's options because the coordinator makes server-side decisions with it -
+# a per-browser value could not decide whether an outage crossed midnight.
+SERVICE_GET_REGION = "get_region"
+SERVICE_SET_REGION = "set_region"
 
 DAY_PLAN_ITEM = vol.Schema(
     {
@@ -175,6 +184,20 @@ SCHEMA_SET_OPTIONAL_CHARTS = vol.Schema(
     }
 )
 
+SCHEMA_GET_REGION = vol.Schema({**DEVICE_FIELDS})
+
+# ``region`` is free text, not an enum of REGION_CHOICES: the list is a
+# convenience for the dropdown, and a unit installed somewhere the list does not
+# cover (or a Home Assistant installed without the full tz database) must still
+# be settable.  ``""`` means "follow Home Assistant".
+SCHEMA_SET_REGION = vol.Schema(
+    {
+        **DEVICE_FIELDS,
+        vol.Required(CONF_REGION): vol.Any(cv.string, None),
+    }
+)
+
+
 _PHASE_POWER = vol.All(
     vol.Coerce(int), vol.Range(min=PHASE_POWER_MIN, max=PHASE_POWER_MAX)
 )
@@ -256,6 +279,24 @@ def _require_capability(hass: HomeAssistant, dev_id: str, capability: str) -> No
         "would be ignored by the device. Known topics: "
         f"{', '.join(sorted(coordinator.capabilities)) or 'none'}"
     )
+
+
+def _inverter_entries(hass: HomeAssistant) -> list[tuple[str, Any]]:
+    """Every configured micro-inverter entry as ``(dev_id, entry)``.
+
+    Ordered by entry creation, so the first element is stable across reloads.
+    Only inverter PIDs are returned: a storage unit shares the ``hoymiles``
+    domain but has nothing to do with the region switch, and rewriting its
+    options would be a change nobody asked for.
+    """
+    from .const import CONF_DEV_ID  # noqa: PLC0415
+
+    found: list[tuple[str, Any]] = []
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        dev_id = str(entry.data.get(CONF_DEV_ID, ""))
+        if dev_id and is_inverter_dev_id(dev_id):
+            found.append((dev_id, entry))
+    return found
 
 
 async def async_setup_services(hass: HomeAssistant) -> None:
@@ -368,6 +409,110 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         await keepalive.async_stop()
 
+    async def _handle_get_region(call: ServiceCall) -> dict[str, Any]:
+        from . import region  # noqa: PLC0415
+
+        choices = [
+            {"value": value, "label_en": label_en, "label_zh": label_zh}
+            for value, label_en, label_zh in REGION_CHOICES
+        ]
+        ha_zone = str(hass.config.time_zone)
+
+        # ``dev_id`` is optional on purpose: the toolbar switch is one control
+        # for the whole installation, and requiring a device there would mean
+        # the browser has to know which inverter a dashboard happens to show.
+        # Without it the answer describes the *installation*: the choice of the
+        # first inverter entry (all of them are written together by
+        # ``set_region``), plus the list and HA's own zone.
+        raw = call.data.get(ATTR_DEV_ID) or call.data.get(ATTR_DEVICE_ID)
+        if raw:
+            dev_id = _resolve_dev_id(hass, dict(call.data))
+            entry = region.entry_of(hass, dev_id)
+            if entry is None:
+                raise HomeAssistantError(f"Device {dev_id} is not loaded")
+            return {
+                "dev_id": dev_id,
+                "region": region.zone_name(entry),
+                "ha_zone": ha_zone,
+                "choices": choices,
+            }
+
+        entries = _inverter_entries(hass)
+        if not entries:
+            raise HomeAssistantError("No micro-inverter entry is configured")
+        dev_id, entry = entries[0]
+
+        # ``ha_zone`` lets the switch label the default entry with something
+        # meaningful ("跟随 Home Assistant (Asia/Shanghai)") instead of a bare
+        # "default"; the browser cannot read the server's zone otherwise.
+        return {
+            "dev_id": dev_id,
+            "region": region.zone_name(entry),
+            "ha_zone": ha_zone,
+            "choices": choices,
+        }
+
+
+    async def _handle_set_region(call: ServiceCall) -> dict[str, Any]:
+        from . import region  # noqa: PLC0415
+
+        raw_region = call.data.get(CONF_REGION)
+        wanted = raw_region.strip() if isinstance(raw_region, str) else ""
+
+        # Reject an unresolvable name instead of storing it: it would silently
+        # fall back to the server zone and look like the setting was ignored.
+        if wanted and region.resolve(wanted) is None:
+            raise HomeAssistantError(
+                f"{wanted!r} is not a time zone this system knows "
+                "(expected an IANA name such as 'Asia/Shanghai')"
+            )
+
+        # An explicit ``dev_id`` targets that one device (the options flow);
+        # without one the switch writes every inverter entry, which is what
+        # "one roof, one time zone" means and keeps the toolbar control global.
+        if call.data.get(ATTR_DEV_ID) or call.data.get(ATTR_DEVICE_ID):
+            dev_id = _resolve_dev_id(hass, dict(call.data))
+            entry = region.entry_of(hass, dev_id)
+            if entry is None:
+                raise HomeAssistantError(f"Device {dev_id} is not loaded")
+            targets = [(dev_id, entry)]
+        else:
+            targets = _inverter_entries(hass)
+            if not targets:
+                raise HomeAssistantError("No micro-inverter entry is configured")
+
+        applied: list[str] = []
+        for dev_id, entry in targets:
+            previous = region.zone_name(entry)
+            if wanted != previous:
+                # Options, not data: these are user preferences that modify
+                # behaviour rather than describe the hardware, and
+                # ``async_update_entry`` with options does not count as a
+                # reconfiguration.
+                hass.config_entries.async_update_entry(
+                    entry, options={**entry.options, CONF_REGION: wanted}
+                )
+                _LOGGER.info(
+                    "Hoymiles %s: region changed %s -> %s",
+                    dev_id,
+                    previous or "Home Assistant",
+                    wanted or "Home Assistant",
+                )
+
+            coordinator = _find_coordinator(hass, dev_id)
+            if coordinator is not None and hasattr(coordinator, "async_apply_region"):
+                await coordinator.async_apply_region()
+            applied.append(dev_id)
+
+        first = targets[0]
+        return {
+            "dev_id": first[0],
+            "region": region.zone_name(first[1]),
+            "ha_zone": str(hass.config.time_zone),
+            "dev_ids": applied,
+        }
+
+
     async def _handle_get_optional_charts(call: ServiceCall) -> dict[str, Any]:
         from . import lovelace  # noqa: PLC0415
 
@@ -444,5 +589,19 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         SERVICE_SET_OPTIONAL_CHARTS,
         _handle_set_optional_charts,
         SCHEMA_SET_OPTIONAL_CHARTS,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_REGION,
+        _handle_get_region,
+        SCHEMA_GET_REGION,
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_REGION,
+        _handle_set_region,
+        SCHEMA_SET_REGION,
         supports_response=SupportsResponse.OPTIONAL,
     )

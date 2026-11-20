@@ -94,6 +94,13 @@
         "data": {
           "confirm": "确认重启"
         }
+      },
+      "region": {
+        "title": "地区",
+        "description": "该设备计算“今日”所用的时区。今日发电量在此地区的零点清零，界面上所有时间也按此地区显示。选择第一项表示跟随 Home Assistant，也可以直接输入任意 IANA 时区名（例如 Europe/Berlin）。",
+        "data": {
+          "region": "地区"
+        }
       }
     },
     "abort": {

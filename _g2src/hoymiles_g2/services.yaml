@@ -299,3 +299,48 @@ set_optional_charts:
       selector:
         object:
 
+
+get_region:
+  name: Get region
+  description: Return the time zone this device's day is measured in, and whether it follows Home Assistant.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles_g2
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "RMI-4161A0209FF6"
+      selector:
+        text:
+
+set_region:
+  name: Set region
+  description: Set the time zone this device's day is measured in. Empty means follow Home Assistant.
+  fields:
+    device_id:
+      name: Device
+      description: Target device picked from the device registry. Alternative to Device ID.
+      required: false
+      selector:
+        device:
+          integration: hoymiles_g2
+    dev_id:
+      name: Device ID
+      description: Device identifier, in the form client_prefix-SN. Optional when a device is selected.
+      required: false
+      example: "RMI-4161A0209FF6"
+      selector:
+        text:
+    region:
+      name: Region
+      description: IANA time zone name such as Europe/Berlin. Leave empty to follow Home Assistant.
+      required: true
+      example: "Europe/Berlin"
+      selector:
+        text:

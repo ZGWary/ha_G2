@@ -140,6 +140,14 @@ function _hmAlarmRegister() {
                 border: 1px solid rgba(219, 68, 55, 0.35); }
         .nm { font-size: 13px; color: var(--primary-text-color);
               overflow-wrap: anywhere; }
+        /* 智能设备离线 names the device it is about, so the serial is the only
+           actionable part of that row.  It sits under the alarm name in the
+           same secondary colour the timestamp uses, and is set in the
+           tabular-numeric stack so two serials line up digit for digit. */
+        .sn { grid-column: 2; font-size: 11.5px;
+              color: var(--secondary-text-color);
+              font-variant-numeric: tabular-nums;
+              letter-spacing: 0.02em; overflow-wrap: anywhere; }
         .time { grid-column: 2; font-size: 11.5px;
                 color: var(--secondary-text-color);
                 font-variant-numeric: tabular-nums; }
@@ -290,10 +298,18 @@ function _hmAlarmRegister() {
         const cn = (item && (item.name_zh || item.name)) || fallback;
         const name = zh ? cn : en;
         const time = hmStamp(item && item.time);
+        /* ``sn`` is the serial of the device the alarm is about.  It is the
+           whole point of a 「智能设备离线」 report - the gateway raises that code
+           on behalf of a subordinate, and the serial is the only thing that
+           says which one - so it is printed whenever the payload carries it and
+           skipped entirely when it does not.  An older firmware that omits the
+           field therefore renders exactly the row it always did. */
+        const sn = item && typeof item.sn === "string" ? item.sn.trim() : "";
         return html`
           <div class="row">
             ${code ? html`<span class="code">${esc(code)}</span>` : html`<span></span>`}
             <span class="nm">${esc(name)}</span>
+            ${sn ? html`<span class="sn">${esc(sn)}</span>` : ""}
             ${time ? html`<span class="time">${esc(time)}</span>` : ""}
           </div>`;
       });

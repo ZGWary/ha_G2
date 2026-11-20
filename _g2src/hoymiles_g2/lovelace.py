@@ -1,11 +1,13 @@
 """Best-effort Lovelace dashboard creation for a Hoymiles MS-G2 device.
 
 Home Assistant's ``lovelace`` component does not expose a public API for
-creating a storage dashboard, so this module reaches into its internals
-(``DashboardsCollection`` and ``LovelaceStorage``) the same way the built-in
-map panel does.  Those internals are deprecated in core and slated for removal,
-so *every* operation here is wrapped and must never raise - a failed dashboard
-is logged and skipped, never allowed to break device setup.
+creating a storage dashboard, so this module goes through the
+``lovelace/dashboards/*`` websocket commands (see :class:`_CommandConnection`
+for why only those reach the collection the running instance actually uses)
+and keeps its own ``LovelaceStorage`` for the card config.  Those internals are
+deprecated in core and slated for removal, so *every* operation here is wrapped
+and must never raise - a failed dashboard is logged and skipped, never allowed
+to break device setup.
 
 The dashboard mirrors the official integration's G3-prefixed panels: three
 views (system / device / control) built from the bundled cards, keyed to the
@@ -28,12 +30,14 @@ built in Python and could not follow the language selector.  It now only feeds
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import re
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 
 from .const import DOMAIN, ROLE_SLAVE, is_inverter_dev_id, model_from_dev_id
 
@@ -182,8 +186,100 @@ _ROLE_SYSTEM_KEY = "g2_role_system_view"
 #                  adds are chart cards the user picks from data, not from
 #                  curves.  The stored title is rewritten for every dashboard
 #                  that still carries the old one
+#   23             the System view of a micro inverter stops describing *this
+#                  unit* and starts describing *the installation*.  Three
+#                  changes travel together, because any one of them alone would
+#                  leave the tab self-contradictory:
+#                    * the schematic is drawn with
+#                      ``variant: inverter-system`` - no 光伏2 branch, a negative
+#                      负载 folded into 光伏, value labels over the rings instead
+#                      of under them
+#                    * the 光伏功率 curve reads ``system_plug_power``
+#                      (``sys_plug_p``, the AC side, which is what the vendor app
+#                      reports) instead of ``system_pv_power`` (``sys_pv_p``, the
+#                      DC side).  Measured on the same second: 100.6 W against
+#                      133.3 W
+#                    * 今日发电 reads ``plant_pv_energy_today``, the aggregated
+#                      master + slaves figure, because the firmware only ever
+#                      reports each unit's own share (measured 387 / 148 / 613 Wh
+#                      on one installation)
+#   24             the System power chart of a micro inverter stops pinning
+#                  ``symmetric: False``.  电网 输出[+]/输入[-] is a signed series by
+#                  definition, and a bottom-up ``0..max`` axis clamped every
+#                  negative reading to the baseline: the day the house exported,
+#                  the grid curve simply vanished below zero instead of turning
+#                  over.  The option is now left out so ``hoymiles-g2-history-
+#                  chart`` decides per render (mirrored as soon as any series
+#                  dips below zero), which is the rule every other card already
+#                  follows - and it keeps the full height on a solar-only day
+#   25             the stored dashboard's entity ids are repaired against the
+#                  live entity registry.  A HiFlow whose serial collides with an
+#                  earlier one ends up with every entity suffixed ``_2`` (and a
+#                  single-input body publishes no ``pv2_power`` at all), while
+#                  the generator derives the ids from the serial alone - so a
+#                  stored dashboard pointed at entities that do not exist and
+#                  every card read 「该时间段没有统计数据」.  See
+#                  :func:`_migrate_stale_entities`
+#   26             the System tab's 总发电量 stops showing this unit's share and
+#                  starts showing the installation's.  ``pvs[].et`` is a per-unit
+#                  counter and the protocol never adds units up, so the card used
+#                  to show 2 944 Wh of a true 6 100 Wh with nothing saying so.
+#                  The gauge and the 「发电量」 chart now read
+#                  ``plant_pv_energy_total`` (master + ``role: slave`` units); the
+#                  Device tab keeps the per-unit counter.  See
+#                  :func:`_migrate_plant_energy_total`
+#   27             the System tab's two energy tiles stop sitting side by side
+#                  and stack, each read as one line (``compact: true``), so the
+#                  schematic beside them takes three quarters of the row instead
+#                  of half.  Two full tiles arranged horizontally spent a whole
+#                  card each on a column that could hold both.  See
+#                  :func:`_migrate_system_tile_stack`
+#   28             that row's 3:1 split is rewritten from "tracks of a nested
+#                  grid" to "columns of the section".  Revision 27 wrote
+#                  ``_nested_grid(cards, 4)`` with ``grid_options: {columns: 3}``
+#                  / ``{columns: 1}`` on the two children, which HA 2026.5.4
+#                  renders as a flat 1:1: ``hui-grid-card`` gives each child one
+#                  track and ignores ``grid_options`` on them.  The schematic and
+#                  the tile stack are now plain siblings split by
+#                  ``grid_options``, the same mechanism the Device view has used
+#                  since revision 18.  See
+#                  :func:`_migrate_system_tile_stack`
+#   29             that split is written as 27 + 9 instead of 36 + 12.  The
+#                  numbers are *tracks*, and ``hui-sections-view`` gives a
+#                  ``column_span: 4`` section only as many tracks as the view
+#                  actually fits - 36 on a 1440 px window, not the configured
+#                  48.  A schematic asking for 36 filled the row by itself and
+#                  pushed the tiles onto the next line; 27 + 9 sums to exactly
+#                  the row and keeps the ratio.  See
+#                  :func:`_migrate_system_tile_stack`
+#   30             revisions 23 to 29 are re-run over every dashboard, this time
+#                  recognising entity ids Home Assistant numbered (``_2``) and
+#                  the names revisions 23 / 26 replaced.  A unit whose serial
+#                  collided with an earlier registration has
+#                  ``sensor.<slug>_system_pv_power_2`` where the generator
+#                  wrote ``sensor.<slug>_system_pv_power``, and revisions 23
+#                  onwards compared the stored id *exactly*.  The result was a
+#                  dashboard that silently kept the pre-revision layout: the
+#                  two energy tiles still side by side in a nested grid, the
+#                  schematic still without ``variant: inverter-system`` (so 光伏2
+#                  was drawn and the AC plug figure was not read), and 今日发电 /
+#                  总发电量 still pointing at this unit instead of the
+#                  installation.  Every such comparison now goes through
+#                  :func:`_strip_suffix`, and the ids written back are the ones
+#                  the registry actually holds.  See
+#                  :func:`_migrate_plant_view`, :func:`_migrate_plant_energy_total`
+#                  and :func:`_migrate_system_tile_stack`
+#   31             that 3:1 split is narrowed to two thirds of the row - 18 + 6
+#                  instead of 27 + 9 - because the schematic was still too tall.
+#                  Its drawing is an SVG at ``width: 100%; height: auto``, so its
+#                  height is a pure function of its width; the card therefore
+#                  has to become *narrower* to become shorter, and doing it
+#                  through the cell rather than through ``max_width`` is what
+#                  scales the whole card (header, padding and drawing) instead of
+#                  leaving a small picture in a wide one.  See
+#                  :func:`_migrate_system_tile_stack`
 _LAYOUT_KEY = "g2_layout"
-_LAYOUT_VERSION = 22
+_LAYOUT_VERSION = 31
 
 # The view titles an earlier release wrote.  Used together with the absence of
 # ``icon`` / ``max_columns`` as the fingerprint of an untouched old dashboard, so
@@ -253,6 +349,55 @@ _SECTION_COLUMNS = 48
 # never touched by the migrations.
 _DEVICE_FLOW_MAX_WIDTH = 0
 
+# The System tab's first row, in columns of the section it lives in: three
+# quarters for the schematic, one quarter for the two energy tiles stacked in
+# it.  The tiles lost their side-by-side arrangement in revision 27 - two
+# full-height cards for two numbers, arranged horizontally, spent a whole card
+# each on a column that could hold both - and the width they gave up went to the
+# drawing, whose cap is raised below to match.
+#
+# These are the Device view's 24 / 24 mechanism, not tracks of a nested grid.
+# Revision 27 wrote the 3:1 ratio as ``_nested_grid(cards, 4)`` with
+# ``grid_options: {columns: 3}`` on the schematic and ``{columns: 1}`` on the
+# tile stack, which reads correctly and measures as a flat 1:1 on HA 2026.5.4:
+# ``hui-grid-card`` lays its children out with ``grid-column: auto`` and never
+# reads ``grid_options`` from them, so both cards took exactly one of its four
+# tracks.  A *section* does honour ``grid_options`` - ``_FLOW_COLUMNS`` /
+# ``_ALARM_COLUMNS`` below have relied on it since revision 18 - so the pair is
+# written as two plain siblings of one section instead.
+#
+# 27 + 9 is 36, the width of the section when ``hui-sections-view`` renders it
+# at its *effective* span rather than the configured 4: on a 1440 px window the
+# view fits three columns, so the grid section owns ``12 * 3`` tracks and the
+# pair fills the row exactly at a 3:1 ratio.  A narrower window clamps the
+# schematic to the track count (``grid-column: span min(--column-size,
+# --grid-column-count)``) and drops the tiles onto the next row, which is a
+# sane degradation to "schematic above, tiles below".
+#
+# Revision 31 cuts both numbers to two thirds - 18 + 6, still 3:1, still summing
+# to the row.  The card was simply too tall, and with the drawing being an SVG
+# at ``width: 100%; height: auto`` its height is a pure function of its width
+# (700 x 360 in the compact profile), so the *only* way to shorten it without
+# distorting the schematic - or leaving a small picture floating in a wide card,
+# which a ``max_width`` cap does - is to give the card a narrower cell.  Two
+# thirds of the columns is two thirds of the width is two thirds of the height,
+# i.e. the whole card scales as one piece, and the tiles that share the row
+# shrink with it.
+#
+# Measured before the change: 830 x 459 px at a 1440 px window and 750 x 418 at
+# 824 px.  After it: 551 x 316 and 561 x 320 - two thirds of the width and, as
+# predicted, two thirds of the height.  The two windows now agree on the card's
+# size, which they did not before: a span of >= the track count clamps to the
+# full row, so 27 columns was two thirds of the row on a wide window and all of
+# it on a narrow one, and the same dashboard drew the schematic at two sizes.
+_SYSTEM_FLOW_COLUMNS = 18
+_SYSTEM_TILES_COLUMNS = 6
+# The drawing cap for that cell.  It used to be 700 px beside two half-width
+# tiles, then 960 px once the tiles dropped to a quarter of the row.  Both were
+# chosen to *not* bind, and 960 still does not - it is only the "unset" sentinel
+# the migrations write, and the narrower cell is what sizes the drawing now.
+_SYSTEM_FLOW_MAX_WIDTH = 960
+
 # Entity ids are ``sensor.<slug(dev_id)>_<key>``.  Only keys whose display name
 # slugifies back to the key are safe to reference explicitly below - a few
 # (``grid_on_power_5m`` -> "Grid On Power (5 min)", ``ems_mode_running`` ->
@@ -290,6 +435,62 @@ def _entity(dev_id: str, key: str) -> str:
     return f"sensor.{_slug(dev_id)}_{key}"
 
 
+def _strip_suffix(entity_id: Any) -> str:
+    """Drop the ``_2`` / ``_3`` … Home Assistant appended to an ``entity_id``.
+
+    Home Assistant numbers a colliding ``entity_id`` instead of failing, so a
+    unit whose serial was registered once before ends up with every entity at
+    ``sensor.<slug>_<key>_2`` while the generator - which derives the id from
+    the serial alone - writes ``sensor.<slug>_<key>``.  The migrations compare
+    stored ids against generated ones, so they have to look past that number:
+    ``_strip_suffix("sensor.x_foo_2")`` is ``"sensor.x_foo"``, and an id
+    without one is returned unchanged (so anything else, including
+    ``..._power_5_min``, is untouched).
+    """
+    if not isinstance(entity_id, str):
+        return entity_id
+    base, sep, tail = entity_id.rpartition("_")
+    if sep and tail.isdigit() and tail != "0":
+        return base
+    return entity_id
+
+
+def _registry_entity(hass: HomeAssistant, dev_id: str, key: str) -> str | None:
+    """The ``entity_id`` the registry holds for ``unique_id = <domain>_<dev>_<key>``.
+
+    ``None`` when the entry is not registered (yet), which is different from
+    "registered under the conventional name" - the caller has to know whether it
+    is looking at a fact or a guess.
+    """
+    wanted = f"{DOMAIN}_{dev_id}_{key}"
+
+    try:
+        from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
+
+        registry = er.async_get(hass)
+    except Exception:  # noqa: BLE001 - a card is never worth breaking setup for
+        return None
+
+    if registry is None:
+        return None
+
+    try:
+        entry = registry.async_get_entity_id("sensor", DOMAIN, wanted)
+        if entry:
+            return entry
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        for candidate in list(registry.entities.values()):
+            if candidate.unique_id == wanted and candidate.entity_id:
+                return candidate.entity_id
+    except Exception:  # noqa: BLE001
+        pass
+
+    return None
+
+
 def _resolve_entity(hass: HomeAssistant, dev_id: str, key: str) -> str:
     """The real ``entity_id`` of this device's ``key`` sensor.
 
@@ -299,24 +500,7 @@ def _resolve_entity(hass: HomeAssistant, dev_id: str, key: str) -> str:
     fallback for a device whose platform has not registered the entity yet,
     which is the only case where nothing better exists.
     """
-    wanted = f"{DOMAIN}_{dev_id}_{key}"
-
-    try:
-        from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
-
-        registry = er.async_get(hass)
-    except Exception:  # noqa: BLE001 - a card is never worth breaking setup for
-        registry = None
-
-    if registry is not None:
-        try:
-            for entry in list(registry.entities.values()):
-                if entry.unique_id == wanted and entry.entity_id:
-                    return entry.entity_id
-        except Exception:  # noqa: BLE001
-            pass
-
-    return _entity(dev_id, key)
+    return _registry_entity(hass, dev_id, key) or _entity(dev_id, key)
 
 
 def _t(en: str, zh: str) -> dict[str, str]:
@@ -513,6 +697,129 @@ def _read_json_file(path: str) -> Any:
         return json.load(handle)
 
 
+_COMMANDS = "websocket_api"
+# A dashboard command is a bookkeeping write; if it has not answered by now the
+# frontend is gone and waiting longer would hold up device setup for nothing.
+_COMMAND_TIMEOUT = 10.0
+
+
+class _CommandUser:
+    """The only attributes the dashboard commands read from a connection."""
+
+    id = "hoymiles-dashboard"
+    is_admin = True
+    is_owner = True
+    is_active = True
+    system_generated = False
+
+
+class _CommandConnection:
+    """Just enough of an ``ActiveConnection`` to run one command in-process.
+
+    ``lovelace`` keeps its ``DashboardsCollection`` in a local variable of
+    ``async_setup``: it never reaches ``hass.data``.  ``LovelaceData`` holds the
+    per-``url_path`` configs, *not* the collection itself, so building a
+    ``DashboardsCollection(hass)`` of our own gives a second object with a
+    private copy of the data.  Whatever that copy creates is written to disk,
+    while the object the delete button talks to never hears about it: the entry
+    sits in the sidebar and in *Settings -> Dashboards*, and
+    ``lovelace/dashboards/delete`` answers ``not_found``.  Worse, the next time
+    Home Assistant saves that file itself it writes its own items and the entry
+    is gone from disk.
+
+    The commands registered under ``lovelace/dashboards/*`` are the only
+    surviving references to the live collection, so calling one of them is the
+    only way to make a dashboard written here an ordinary dashboard: Home
+    Assistant persists it, registers its panel, and keeps it in the collection
+    that delete, update and rename act on.
+
+    The connection is not a socket.  ``send_result``/``send_error`` resolve the
+    future the caller awaits, which turns the command into a plain ``await``.
+    """
+
+    subscriptions: dict[int, Any] = {}
+
+    def __init__(self, future: asyncio.Future[Any]) -> None:
+        """Wire the replies to ``future``."""
+        self._future = future
+        self.user = _CommandUser()
+
+    def send_result(self, msg_id: int, data: Any = None) -> None:
+        """Deliver the command's answer."""
+        if not self._future.done():
+            self._future.set_result(data)
+
+    def send_error(self, msg_id: int, code: str, message: str) -> None:
+        """Turn the command's error reply into the caller's exception."""
+        if not self._future.done():
+            self._future.set_exception(HomeAssistantError(f"{code}: {message}"))
+
+    def async_handle_exception(self, msg: dict[str, Any], err: Exception) -> None:
+        """Surface an exception raised *inside* the command."""
+        if not self._future.done():
+            self._future.set_exception(err)
+
+    def send_message(self, msg: Any) -> None:
+        """Ignore unsolicited events; nothing here subscribes."""
+
+
+async def _async_lovelace_command(
+    hass: HomeAssistant, command: str, payload: dict[str, Any]
+) -> Any:
+    """Run one ``lovelace/dashboards/*`` command and return its reply.
+
+    Raises when the command is unknown, answers with an error, or does not
+    answer in time - every caller decides for itself whether that is worth a
+    log line, because a dashboard must never take down device setup.
+    """
+    handlers = hass.data.get(_COMMANDS)
+    entry = handlers.get(command) if isinstance(handlers, dict) else None
+    # ``websocket_api.async_register_command`` stores ``(handler, schema)``.
+    handler = entry[0] if isinstance(entry, tuple) else entry
+    if handler is None:
+        raise HomeAssistantError(f"Home Assistant has no {command} command")
+
+    future: asyncio.Future[Any] = hass.loop.create_future()
+    handler(hass, _CommandConnection(future), {"id": 1, "type": command, **payload})
+    return await asyncio.wait_for(future, _COMMAND_TIMEOUT)
+
+
+async def _async_dashboard_items(hass: HomeAssistant) -> list[dict[str, Any]]:
+    """Return every dashboard entry Home Assistant currently holds.
+
+    An empty list is returned on any failure, which makes every caller treat the
+    dashboard as absent and rebuild it - the same thing a first install does.
+    """
+    try:
+        items = await _async_lovelace_command(hass, "lovelace/dashboards/list", {})
+    except Exception:  # noqa: BLE001 - a dashboard is never worth breaking setup
+        _LOGGER.warning("Could not list dashboards", exc_info=True)
+        return []
+    return [item for item in items or [] if isinstance(item, dict)]
+
+
+def _dashboard_store(hass: HomeAssistant, item: dict[str, Any]) -> Any:
+    """Return the ``LovelaceStorage`` Home Assistant uses for ``item``.
+
+    The live object is preferred: saving through a second ``LovelaceStorage``
+    for the same key writes the right file but leaves the copy the frontend
+    reads untouched until the next restart.  One is built only when the entry is
+    not in the registry yet - a dashboard this process has not registered.
+    """
+    from homeassistant.components.lovelace.const import CONF_URL_PATH  # noqa: PLC0415
+    from homeassistant.components.lovelace.dashboard import (  # noqa: PLC0415
+        LovelaceStorage,
+    )
+
+    lovelace_data = hass.data.get("lovelace")
+    dashboards = getattr(lovelace_data, "dashboards", None)
+    if isinstance(dashboards, dict):
+        store = dashboards.get(item.get(CONF_URL_PATH))
+        if store is not None:
+            return store
+    return LovelaceStorage(hass, item)
+
+
 async def async_ensure_dashboard(
     hass: HomeAssistant,
     dev_id: str,
@@ -538,13 +845,9 @@ async def async_ensure_dashboard(
     model = _resolve_model(hass, dev_id)
 
     try:
-        from homeassistant.components import frontend  # noqa: PLC0415
-        from homeassistant.components.lovelace import dashboard  # noqa: PLC0415
         from homeassistant.components.lovelace.const import (  # noqa: PLC0415
             CONF_ALLOW_SINGLE_WORD,
             CONF_ICON,
-            CONF_REQUIRE_ADMIN,
-            CONF_SHOW_IN_SIDEBAR,
             CONF_TITLE,
             CONF_URL_PATH,
         )
@@ -578,17 +881,14 @@ async def async_ensure_dashboard(
         )
         return
 
-    try:
-        collection = dashboard.DashboardsCollection(hass)
-        await collection.async_load()
-        existing = None
-        for candidate in collection.async_items():
-            if candidate.get(CONF_URL_PATH) == url_path:
-                existing = candidate
-                break
-    except Exception:  # noqa: BLE001 - never break setup because of a dashboard
-        _LOGGER.warning("Could not inspect dashboards collection for %s", dev_id, exc_info=True)
-        return
+    # Nothing in the live registry under this slug, so ask the collection itself:
+    # the dashboard may have been created by an earlier release, before this
+    # process registered any panel.
+    existing = None
+    for candidate in await _async_dashboard_items(hass):
+        if candidate.get(CONF_URL_PATH) == url_path:
+            existing = candidate
+            break
 
     if existing is not None:
         # Already created by an earlier version.  The views and the name are the
@@ -597,36 +897,46 @@ async def async_ensure_dashboard(
         _LOGGER.debug("Dashboard %s already in storage", url_path)
         current = existing.get(CONF_TITLE) or ""
         if _is_generated_title(current, dev_id):
-            await _async_rename(collection, existing, url_path, title)
+            await _async_rename(hass, existing, url_path, title)
         # An icon an older release generated is migrated the same way, and only
         # while it is still that exact icon: a user who picked their own keeps
         # it, and re-running this is a no-op.
         if (existing.get(CONF_ICON) or "") == _LEGACY_DASHBOARD_ICON:
-            await _async_reicon(collection, existing, url_path)
+            await _async_reicon(hass, existing, url_path)
         # The view set is the user's, but the role gate is not a preference: a
         # follower has no System data to draw.  Applied to whatever is stored.
         await _async_sync_role(
-            hass, dashboard.LovelaceStorage(hass, existing), dev_id, url_path, role
+            hass, _dashboard_store(hass, existing), dev_id, url_path, role
         )
         return
 
-    # Create the dashboard entry in ``.storage/lovelace_dashboards``.
+    # Create the dashboard entry through the live collection, which persists it
+    # to ``.storage/lovelace_dashboards``, registers the sidebar panel and keeps
+    # it in the object delete/update act on.  See :class:`_CommandConnection`.
     try:
-        item = await collection.async_create_item(
+        item = await _async_lovelace_command(
+            hass,
+            "lovelace/dashboards/create",
             {
                 CONF_ALLOW_SINGLE_WORD: True,
                 CONF_ICON: DASHBOARD_ICON,
                 CONF_TITLE: title,
                 CONF_URL_PATH: url_path,
-            }
+            },
         )
     except Exception:  # noqa: BLE001
         _LOGGER.warning("Could not create dashboard entry for %s", dev_id, exc_info=True)
         return
 
-    # Persist the views into ``.storage/lovelace.<id>``.
+    if not isinstance(item, dict):
+        _LOGGER.warning("Dashboard entry for %s came back empty", dev_id)
+        return
+
+    # Persist the views into ``.storage/lovelace.<id>``.  The store comes from
+    # the live registry, which the create above just populated, so the frontend
+    # sees the cards without waiting for a restart.
+    store = _dashboard_store(hass, item)
     try:
-        store = dashboard.LovelaceStorage(hass, item)
         await store.async_save(
             {
                 "views": _build_views(
@@ -638,7 +948,9 @@ async def async_ensure_dashboard(
     except Exception:  # noqa: BLE001
         _LOGGER.warning("Could not save dashboard views for %s", dev_id, exc_info=True)
         try:
-            await collection.async_delete_item(item["id"])
+            await _async_lovelace_command(
+                hass, "lovelace/dashboards/delete", {"dashboard_id": item["id"]}
+            )
         except Exception:  # noqa: BLE001
             pass
         return
@@ -648,26 +960,6 @@ async def async_ensure_dashboard(
     # fresh install usually has not seen ``event/state`` yet, and the sync has to
     # be able to run the moment it does (see ``async_sync_role``).
     await _async_sync_role(hass, store, dev_id, url_path, role)
-
-    # Adopt the new store into the live registry, then register the sidebar
-    # panel.  ``async_register_built_in_panel`` is a plain @callback, so it is
-    # called synchronously (never awaited).
-    dashboards[url_path] = store
-
-    try:
-        frontend.async_register_built_in_panel(
-            hass,
-            "lovelace",
-            sidebar_title=title,
-            sidebar_icon=DASHBOARD_ICON,
-            frontend_url_path=url_path,
-            config={"mode": "storage"},
-            require_admin=item.get(CONF_REQUIRE_ADMIN, False),
-            show_in_sidebar=item.get(CONF_SHOW_IN_SIDEBAR, True),
-        )
-    except Exception:  # noqa: BLE001
-        _LOGGER.warning("Could not register dashboard panel for %s", dev_id, exc_info=True)
-        return
 
     _LOGGER.info("Created Lovelace dashboard %s (%s)", url_path, title)
 
@@ -680,31 +972,27 @@ async def _async_migrate_title(
     The live dashboards dict is populated from storage before this integration's
     platforms are set up, so the fast path - not the storage branch - is where an
     existing dashboard is usually seen.  The title therefore has to be checked
-    here, which means reading the dashboards collection; a per-process memo keeps
-    that to a single read per device instead of one per reload.  After the first
-    run the stored title equals ``dev_id`` and nothing further happens.
+    here, which means reading the dashboards collection.  After the first run
+    the stored title equals ``dev_id`` and nothing further happens.
     """
     if url_path in _TITLE_CHECKED:
         return
     _TITLE_CHECKED.add(url_path)
 
     try:
-        from homeassistant.components.lovelace import dashboard  # noqa: PLC0415
         from homeassistant.components.lovelace.const import (  # noqa: PLC0415
             CONF_ICON,
             CONF_TITLE,
             CONF_URL_PATH,
         )
 
-        collection = dashboard.DashboardsCollection(hass)
-        await collection.async_load()
-        for item in collection.async_items():
+        for item in await _async_dashboard_items(hass):
             if item.get(CONF_URL_PATH) != url_path:
                 continue
             if _is_generated_title(item.get(CONF_TITLE) or "", dev_id):
-                await _async_rename(hass, collection, item, url_path, title)
+                await _async_rename(hass, item, url_path, title)
             if (item.get(CONF_ICON) or "") == _LEGACY_DASHBOARD_ICON:
-                await _async_reicon(hass, collection, item, url_path)
+                await _async_reicon(hass, item, url_path)
             return
     except Exception:  # noqa: BLE001 - a title is never worth breaking setup for
         _LOGGER.debug("Could not inspect dashboard title for %s", url_path, exc_info=True)
@@ -712,7 +1000,6 @@ async def _async_migrate_title(
 
 async def _async_rename(
     hass: HomeAssistant,
-    collection: Any,
     item: dict[str, Any],
     url_path: str,
     title: str,
@@ -725,18 +1012,23 @@ async def _async_rename(
     try:
         from homeassistant.components.lovelace.const import CONF_TITLE  # noqa: PLC0415
 
-        await collection.async_update_item(item["id"], {CONF_TITLE: title})
+        updated = await _async_lovelace_command(
+            hass,
+            "lovelace/dashboards/update",
+            {"dashboard_id": item["id"], CONF_TITLE: title},
+        )
     except Exception:  # noqa: BLE001
         _LOGGER.debug("Could not retitle dashboard %s", url_path, exc_info=True)
         return
 
+    if isinstance(updated, dict):
+        item.update(updated)
     _LOGGER.info("Migrated dashboard %s title to %s", url_path, title)
     _sync_sidebar_title(hass, url_path, title)
 
 
 async def _async_reicon(
     hass: HomeAssistant,
-    collection: Any,
     item: dict[str, Any],
     url_path: str,
 ) -> None:
@@ -744,17 +1036,23 @@ async def _async_reicon(
 
     Only ever reached while the stored icon is exactly the one an earlier
     release generated, so a user-chosen icon is never overwritten, and running
-    it again is a no-op.  The panel is re-registered afterwards because that is
-    the only supported way to change the icon drawn in the sidebar.
+    it again is a no-op.  Home Assistant re-registers the panel from the change
+    listener after the update, which is how the icon reaches the sidebar.
     """
     try:
         from homeassistant.components.lovelace.const import CONF_ICON  # noqa: PLC0415
 
-        await collection.async_update_item(item["id"], {CONF_ICON: DASHBOARD_ICON})
+        updated = await _async_lovelace_command(
+            hass,
+            "lovelace/dashboards/update",
+            {"dashboard_id": item["id"], CONF_ICON: DASHBOARD_ICON},
+        )
     except Exception:  # noqa: BLE001
         _LOGGER.debug("Could not re-icon dashboard %s", url_path, exc_info=True)
         return
 
+    if isinstance(updated, dict):
+        item.update(updated)
     _LOGGER.info("Migrated dashboard %s icon to %s", url_path, DASHBOARD_ICON)
     _sync_sidebar_title(hass, url_path, item.get("title") or url_path)
 
@@ -765,7 +1063,7 @@ async def _async_find_store(hass: HomeAssistant, url_path: str) -> Any:
     The live registry is preferred because it is the object the frontend reads:
     saving through a second ``LovelaceStorage`` for the same key would write the
     right file but leave the loaded copy in memory untouched until a restart.
-    The collection is only consulted when the registry has no entry for the slug
+    The collection is only asked when the registry has no entry for the slug
     (a dashboard created by an earlier release, before the registry was
     populated in this process).
     """
@@ -777,14 +1075,11 @@ async def _async_find_store(hass: HomeAssistant, url_path: str) -> Any:
             return store
 
     try:
-        from homeassistant.components.lovelace import dashboard  # noqa: PLC0415
         from homeassistant.components.lovelace.const import CONF_URL_PATH  # noqa: PLC0415
 
-        collection = dashboard.DashboardsCollection(hass)
-        await collection.async_load()
-        for item in collection.async_items():
+        for item in await _async_dashboard_items(hass):
             if item.get(CONF_URL_PATH) == url_path:
-                return dashboard.LovelaceStorage(hass, item)
+                return _dashboard_store(hass, item)
     except Exception:  # noqa: BLE001 - a dashboard is never worth breaking setup
         _LOGGER.debug("Could not locate dashboard %s", url_path, exc_info=True)
 
@@ -983,6 +1278,11 @@ async def _async_upgrade_layout(
         changed = _migrate_optional_entities(config, hass, dev_id) or changed
         changed = _migrate_chart_options_card(config, dev_id) or changed
         changed = _migrate_chart_options_title(config) or changed
+        changed = _migrate_plant_view(config, dev_id) or changed
+        changed = _migrate_system_power_axis(config, dev_id) or changed
+        changed = _migrate_stale_entities(config, hass, dev_id) or changed
+        changed = _migrate_plant_energy_total(config, dev_id) or changed
+        changed = _migrate_system_tile_stack(config, dev_id) or changed
         if not changed:
             # Nothing matched, so the dashboard is not one of ours at the
             # revision being migrated (a hand-built dashboard, or a layout from
@@ -1063,10 +1363,11 @@ def _migrate_energy_total_card(config: dict[str, Any], dev_id: str) -> bool:
       ``sensor.<slug>_system_pv_energy_today``, never a title or an index, so a
       user who renamed or reordered things still gets the card in the right
       place;
-    * the new card is only added where the layout has no ``pv_energy_total``
-      gauge yet, which makes the migration idempotent and keeps a card the user
-      removed from coming back;
-    * only micro inverters are touched, because ``pv_energy_total`` is created
+    * the new card is only added where the layout has neither a
+      ``plant_pv_energy_total`` nor a legacy ``pv_energy_total`` gauge yet,
+      which makes the migration idempotent and keeps a card the user removed
+      from coming back;
+    * only micro inverters are touched, because the lifetime counter is created
       with ``requires_absent=CAP_SYSTEM_STATE`` and does not exist on a storage
       unit.
     """
@@ -1078,12 +1379,17 @@ def _migrate_energy_total_card(config: dict[str, Any], dev_id: str) -> bool:
         return False
 
     today_entity = _entity(dev_id, "system_pv_energy_today")
-    total_entity = _entity(dev_id, "pv_energy_total")
+    total_entities = {
+        _entity(dev_id, "plant_pv_energy_total"),
+        _entity(dev_id, "pv_energy_total"),
+    }
 
     # Never add the card twice: an install that has been through this migration
-    # already (or was generated fresh) must be left alone.
+    # already (or was generated fresh) must be left alone.  Both the current and
+    # the pre-rev.26 entity count as "already there", so an upgraded dashboard is
+    # not given a second, per-unit card beside the aggregated one.
     for card in _walk_cards(views):
-        if isinstance(card, dict) and card.get("entity") == total_entity:
+        if isinstance(card, dict) and card.get("entity") in total_entities:
             return False
 
     added = False
@@ -1578,6 +1884,547 @@ def _migrate_system_energy_chart(config: dict[str, Any], dev_id: str) -> bool:
     return False
 
 
+def _migrate_plant_view(config: dict[str, Any], dev_id: str) -> bool:
+    """Re-point the System tab of a micro inverter at the installation; rev. 23.
+
+    Three things change together on that tab, and doing any one of them alone
+    would leave it self-contradictory (a plant-wide 今日发电 beside a per-unit
+    curve, or a schematic without 光伏2 beside a curve that still plots it):
+
+    1. the ``hoymiles-g2-power-flow`` card of the **system** view gets
+       ``variant: inverter-system``;
+    2. the 光伏功率 series of the system power chart moves from
+       ``system_pv_power`` to ``system_plug_power``;
+    3. the 今日发电 gauge moves from ``system_pv_energy_today`` to
+       ``plant_pv_energy_today``.
+
+    Only the ``system`` view is edited.  The Device tab keeps both the plain
+    schematic (``variant: inverter``) and the per-unit entities, because that tab
+    is about this unit - and a stored dashboard may legitimately have a System
+    tab that a slave never got (``_async_sync_role`` removes it), in which case
+    there is nothing here to do.
+
+    Each step is independent and idempotent: a card the user removed, re-added or
+    re-pointed is left as they left it, and a second run returns ``False``.  The
+    stored ids are compared through :func:`_strip_suffix` since revision 30, so a
+    unit whose entities Home Assistant numbered (``_2``) is recognised too; the
+    ids written back are the plain ones, and :func:`_migrate_stale_entities` -
+    which runs after this - maps them onto the numbered ids that really exist.
+    """
+    if not _is_inverter(dev_id):
+        return False
+
+    views = config.get("views")
+    if not isinstance(views, list):
+        return False
+
+    old_pv = _entity(dev_id, "system_pv_power")
+    new_pv = _entity(dev_id, "system_plug_power")
+    old_today = _entity(dev_id, "system_pv_energy_today")
+    new_today = _entity(dev_id, "plant_pv_energy_today")
+
+    changed = False
+
+    for view in views:
+        if not isinstance(view, dict) or view.get("path") != "system":
+            continue
+
+        for card in _walk_cards(view.get("sections") or []):
+            if not isinstance(card, dict):
+                continue
+
+            # 1. the schematic.
+            if (
+                card.get("type") == POWER_FLOW_CARD
+                and card.get("dev_id") == dev_id
+                and card.get("variant") in (None, "")
+            ):
+                card["variant"] = "inverter-system"
+                changed = True
+
+            # 2. the 光伏功率 curve.
+            series = card.get("series")
+            if isinstance(series, list):
+                for item in series:
+                    if not isinstance(item, dict):
+                        continue
+                    if _strip_suffix(item.get("entity")) != old_pv:
+                        continue
+                    item["entity"] = new_pv
+                    changed = True
+
+            # 3. the 今日发电 gauge.
+            if _strip_suffix(card.get("entity")) == old_today:
+                card["entity"] = new_today
+                changed = True
+
+    return changed
+
+
+def _migrate_plant_energy_total(config: dict[str, Any], dev_id: str) -> bool:
+    """Point the System tab's lifetime total at the installation; rev. 26.
+
+    ``pv_energy_total`` is a **per-unit** counter (``pvs[].et`` summed over this
+    body's ports) and the firmware never adds units up, so the System tab's
+    总发电量 used to show the master's share of the roof: on the test
+    installation 2 944 Wh of 6 100 Wh, less than half, and the card gave no hint
+    that it was a part.  Revision 26 adds
+    ``sensor.<slug>_plant_pv_energy_total`` - master plus every ``role: slave``
+    unit - and this migration re-points the two System-tab cards that read the
+    old entity:
+
+    * the 总发电量 gauge beside 今日发电;
+    * the 「发电量」 chart's single series, whose month / year / lifetime tiles are
+      derived from the same statistic.
+
+    Only the ``system`` view is rewritten.  The Device tab correctly keeps the
+    per-unit counter, because that tab is about this unit.
+
+    Each rewrite is gated on the exact old entity id, so a card the user
+    re-pointed themselves is left alone, and a second run returns ``False``.
+    Revision 30 compares through :func:`_strip_suffix`, so a unit whose entities
+    Home Assistant numbered (``_2``) is recognised too.
+    """
+    if not _is_inverter(dev_id):
+        return False
+
+    views = config.get("views")
+    if not isinstance(views, list):
+        return False
+
+    old_total = _entity(dev_id, "pv_energy_total")
+    new_total = _entity(dev_id, "plant_pv_energy_total")
+    changed = False
+
+    for view in views:
+        if not isinstance(view, dict) or view.get("path") != "system":
+            continue
+
+        for card in _walk_cards(view.get("sections") or []):
+            if not isinstance(card, dict):
+                continue
+            # 1. the 总发电量 gauge.
+            if _strip_suffix(card.get("entity")) == old_total:
+                card["entity"] = new_total
+                changed = True
+            # 2. the 发电量 chart's series.
+            series = card.get("series")
+            if isinstance(series, list):
+                for item in series:
+                    if not isinstance(item, dict):
+                        continue
+                    if _strip_suffix(item.get("entity")) != old_total:
+                        continue
+                    item["entity"] = new_total
+                    changed = True
+
+    return changed
+
+
+def _migrate_system_tile_stack(config: dict[str, Any], dev_id: str) -> bool:
+    """Restack the System tab's two energy tiles and widen the schematic; rev. 27.
+
+    Before revision 27 the row was ``_subgrid([flow, _subgrid([today, total])])``
+    - a two-track grid whose right track held a second two-track grid.  Two full
+    tiles placed side by side therefore cost a whole card height each on a
+    column that had room for both, and the schematic was left with half the row
+    and a 700 px cap.
+
+    Revision 27 tells the same two numbers in one quarter of the row instead:
+    the schematic on three quarters, the two tiles stacked on the fourth, each
+    read as one line (``compact: true``).  The drawing's cap follows to
+    ``_SYSTEM_FLOW_MAX_WIDTH``.
+
+    Revision 27 first wrote that 3:1 ratio as tracks of a *nested* grid, which
+    HA 2026.5.4 does not honour - ``hui-grid-card`` gives every child one track
+    and ignores ``grid_options`` on them, so the two cards measured a flat 1:1.
+    The pair is now two plain siblings of the section, split 36 + 12 of its 48
+    columns, which is the mechanism the Device view has used since revision 18.
+    Both the rev.26 shape and the rev.27 nested-grid shape are recognised here;
+    a dashboard already rewritten to the sibling form is left alone.
+
+    The rewrite is recognised by the *shape* it is replacing - a nested grid
+    holding exactly the two energy gauges, either beside the schematic or
+    wrapping it too - and not by the card ids alone, so a user who rearranged
+    the row keeps their arrangement.  A dashboard that is not shaped that way is
+    left untouched and the function returns ``False``.
+
+    Revision 30 makes the pair test tolerant of the two things that kept this
+    from ever firing on a real installation: the ``_2`` Home Assistant appends
+    to a colliding entity id (:func:`_strip_suffix`) and the entity names that
+    revisions 23 and 26 replaced.  Both the current pairs
+    (``plant_pv_energy_today`` / ``plant_pv_energy_total``) and the older ones
+    (``system_pv_energy_today`` / ``pv_energy_total``) count, so the row is
+    restacked whether or not the earlier migrations have already re-pointed it.
+
+    Revision 31 keeps the pair but re-spans it to two thirds of the row.  Note
+    that the span is rewritten in the sibling branch as well - the same
+    ``_span`` calls run for all three recognised shapes - which is what lets a
+    pure width change reach a dashboard that revision 29 had already restacked.
+    That is why this function compares nothing about the stored
+    ``grid_options``: it always rewrites them from the constants, so bumping
+    ``_LAYOUT_VERSION`` is enough to apply a new width.
+    """
+    if not _is_inverter(dev_id):
+        return False
+
+    views = config.get("views")
+    if not isinstance(views, list):
+        return False
+
+    today_names = {
+        _entity(dev_id, "plant_pv_energy_today"),
+        _entity(dev_id, "system_pv_energy_today"),
+    }
+    total_names = {
+        _entity(dev_id, "plant_pv_energy_total"),
+        _entity(dev_id, "pv_energy_total"),
+    }
+
+    def _is_tile_pair(cards: Any) -> bool:
+        """True when this card list is the two energy tiles, 今日 then 总."""
+        if not isinstance(cards, list) or len(cards) != 2:
+            return False
+        entities = [
+            _strip_suffix(card.get("entity"))
+            for card in cards
+            if isinstance(card, dict) and card.get("type") == GAUGE_CARD
+        ]
+        return (
+            len(entities) == 2
+            and entities[0] in today_names
+            and entities[1] in total_names
+        )
+
+    def _is_flow(card: Any) -> bool:
+        return isinstance(card, dict) and card.get("type") == POWER_FLOW_CARD
+
+    changed = False
+
+    for view in views:
+        if not isinstance(view, dict) or view.get("path") != "system":
+            continue
+
+        for section in view.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            cards = section.get("cards")
+            if not isinstance(cards, list):
+                continue
+
+            for index in range(len(cards)):
+                flow: dict[str, Any] | None = None
+                tiles: list[dict[str, Any]] | None = None
+                # ``flatten`` is True for the two older shapes, where the row is
+                # wrapped in a nested grid that has to go away.
+                flatten = False
+
+                outer = cards[index]
+                nxt = cards[index + 1] if index + 1 < len(cards) else None
+
+                if _is_flow(outer) and isinstance(nxt, dict) and nxt.get("type") == "grid":
+                    # Already the sibling form (what this function now writes):
+                    # the schematic and the tile stack are two cards of the
+                    # section.  Only the drawing cap can still need fixing.
+                    if _is_tile_pair(nxt.get("cards")):
+                        flow, tiles = outer, nxt["cards"]
+                elif isinstance(outer, dict) and outer.get("type") == "grid":
+                    # Revisions 26 and 27 both wrapped the row in a nested grid:
+                    # ``[flow, <grid holding the two tiles>]``.  They differed
+                    # only in that grid's ``columns`` and in the ``grid_options``
+                    # the children carried - neither of which is read by a
+                    # nested ``hui-grid-card`` anyway.
+                    inner = outer.get("cards")
+                    if isinstance(inner, list) and len(inner) == 2:
+                        first, second = inner
+                        if (
+                            _is_flow(first)
+                            and isinstance(second, dict)
+                            and second.get("type") == "grid"
+                            and _is_tile_pair(second.get("cards"))
+                        ):
+                            flow, tiles = first, second["cards"]
+                            flatten = True
+
+                if flow is None or tiles is None:
+                    continue
+
+                flow.pop("grid_options", None)
+                flow["max_width"] = _SYSTEM_FLOW_MAX_WIDTH
+                for tile in tiles:
+                    # ``show_arc`` is left in place: a compact tile never draws
+                    # the dial anyway, and keeping it means turning ``compact``
+                    # back off restores the tile exactly as it was.
+                    tile["compact"] = True
+
+                flow = _span(flow, _SYSTEM_FLOW_COLUMNS)
+                stack = _span(_vstack(tiles), _SYSTEM_TILES_COLUMNS)
+                if flatten:
+                    cards[index : index + 1] = [flow, stack]
+                else:
+                    cards[index] = flow
+                    cards[index + 1] = stack
+                changed = True
+                break
+
+    return changed
+
+
+def _migrate_system_power_axis(config: dict[str, Any], dev_id: str) -> bool:
+    """Let the System power chart mirror its axis again; rev. 24.
+
+    That card plots 「光伏功率」, 「电网 输出[+]/输入[-]」 and 「负载功率」, and the middle
+    one is signed by definition: the day the installation exports more than it
+    makes, `system_grid_power` is negative.  The generator used to pin
+    ``symmetric: False`` on it, which forces
+    :mod:`hoymiles-g2-history-chart` onto a bottom-up ``0..max`` axis, so every
+    negative reading was clamped to the baseline - the grid curve did not turn
+    over, it just disappeared below zero.
+
+    Revision 24 stops writing the key, so the chart resolves the axis per render
+    (mirrored exactly when one of its series dips below zero).  A dashboard that
+    already exists keeps the pinned ``False`` - ``_LAYOUT_KEY`` short-circuits
+    :func:`_build_views` - so the key has to be removed here as well.
+
+    Revision 30 goes one step further and pins ``symmetric: true``.  Leaving the
+    key out means "mirror only on the days the series actually goes negative",
+    and 电网 is the one curve on this card that can - so on a day without export
+    the axis collapsed back to ``0..max`` and there was no negative half at all
+    to read an export against.  Pinning the mirror keeps the zero line in the
+    middle where the ownership of the flow is legible: 光伏 above it, 负载 and
+    grid import below.
+
+    Recognition is by *content*, never by title or position: the card is the
+    history chart whose series are exactly the three system power entities.  The
+    old value is only replaced while it is still ``False``, i.e. still what the
+    generator wrote, so a user who deliberately pinned the axis keeps their
+    choice, and a second run is a no-op.
+
+    Revision 30 also compares the series through :func:`_strip_suffix`.  The
+    exact comparison used to find nothing on a unit whose entities Home Assistant
+    numbered, so the pinned ``symmetric: False`` stayed on the stored card and
+    that dashboard's 功率 curve could never draw an export below the baseline -
+    the very defect this migration exists to remove.
+    """
+    if not _is_inverter(dev_id):
+        return False
+
+    views = config.get("views")
+    if not isinstance(views, list):
+        return False
+
+    power_entities = {
+        _entity(dev_id, "system_plug_power"),
+        _entity(dev_id, "system_pv_power"),
+        _entity(dev_id, "system_grid_power"),
+        _entity(dev_id, "system_load_power"),
+    }
+
+    changed = False
+    for card in _walk_cards(views):
+        if not isinstance(card, dict) or card.get("type") != HISTORY_CARD:
+            continue
+        if card.get("symmetric") is not False:
+            continue
+        entities = {_strip_suffix(item) for item in _series_entities(card)}
+        # A grid power series is what makes the mirrored axis necessary.  The
+        # 光伏功率 entity moved between revisions (rev. 23 re-pointed it from
+        # ``system_pv_power`` to ``system_plug_power``), so both are accepted and
+        # the grid one is the requirement.
+        if _entity(dev_id, "system_grid_power") not in entities:
+            continue
+        if not entities & power_entities:
+            continue
+        card["symmetric"] = True
+        changed = True
+
+    return changed
+
+
+def _migrate_stale_entities(
+    config: dict[str, Any], hass: HomeAssistant, dev_id: str
+) -> bool:
+    """Repoint a stored dashboard at the ids the entities actually have; rev. 25.
+
+    Home Assistant appends ``_2`` (``_3`` …) to an ``entity_id`` when the name it
+    derives is already taken.  The generated dashboard is written from
+    :func:`_entity`, which merely *guesses* the conventional id, so a unit whose
+    entity ids were taken - every sensor of ``RMI-1650A02ABA09`` is suffixed
+    because an earlier registration of the same serial still held the plain
+    names - ends up with a dashboard that references entities which never
+    existed.  The symptoms are a 「该时间段没有统计数据。」 curve panel and a port
+    list showing one chip where the hardware has two.
+
+    The repair is deliberately timid:
+
+    * only ``sensor.`` ids built from *this* device's own slug are considered,
+      so another device's cards inside the same dashboard are untouched;
+    * an id is only rewritten when it is neither a live state nor a registered
+      entity **and** exactly one registered entity of this device is that id plus
+      a numeric suffix.  No fuzzy matching, no 「closest」 guess;
+    * everything else - titles, colours, order, hand-added cards - is left as
+      found, so a user's own edits are never reverted.
+    """
+    if not _is_inverter(dev_id):
+        return False
+
+    try:
+        from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
+
+        registry = er.async_get(hass)
+    except Exception:  # noqa: BLE001
+        return False
+    if registry is None:
+        return False
+
+    known: set[str] = set()
+    try:
+        known.update(str(entry.entity_id) for entry in registry.entities.values())
+    except Exception:  # noqa: BLE001
+        return False
+    known.update(str(state.entity_id) for state in hass.states.async_all())
+
+    prefix = f"sensor.{_slug(dev_id)}_"
+    # ``<base>_<n>`` -> candidates.  Only a base with exactly one suffixed id
+    # is unambiguous enough to substitute; one that grew ``_2`` *and* ``_3``
+    # means a duplicate registration we cannot reason about, so it is skipped.
+    candidates: dict[str, list[str]] = {}
+    for entity_id in known:
+        if not entity_id.startswith(prefix):
+            continue
+        base, sep, tail = entity_id.rpartition("_")
+        if sep and tail.isdigit() and tail != "0":
+            candidates.setdefault(base, []).append(entity_id)
+
+    suffixed = {
+        base: found[0] for base, found in candidates.items() if len(found) == 1
+    }
+
+    if not suffixed:
+        return False
+
+    def fix(value: str) -> str:
+        if not isinstance(value, str) or not value.startswith(prefix):
+            return value
+        if value in known:
+            return value
+        return suffixed.get(value, value)
+
+    changed = False
+    for card in _walk_cards(config.get("views") or []):
+        if not isinstance(card, dict):
+            continue
+        for key in ("entity", "entity_id"):
+            current = card.get(key)
+            fixed = fix(current)
+            if fixed != current:
+                card[key] = fixed
+                changed = True
+        series = card.get("series")
+        if isinstance(series, list):
+            for item in series:
+                if not isinstance(item, dict):
+                    continue
+                current = item.get("entity")
+                fixed = fix(current)
+                if fixed != current:
+                    item["entity"] = fixed
+                    changed = True
+        entities = card.get("entities")
+        if isinstance(entities, list):
+            for index, item in enumerate(entities):
+                if isinstance(item, str):
+                    fixed = fix(item)
+                    if fixed != item:
+                        entities[index] = fixed
+                        changed = True
+                elif isinstance(item, dict):
+                    current = item.get("entity")
+                    fixed = fix(current)
+                    if fixed != current:
+                        item["entity"] = fixed
+                        changed = True
+
+    if _migrate_pv_port_series(config, hass, dev_id):
+        changed = True
+
+    return changed
+
+
+def _migrate_pv_port_series(
+    config: dict[str, Any], hass: HomeAssistant, dev_id: str
+) -> bool:
+    """Collapse 「各光伏端口功率」 to the ports this unit really reports; rev. 25.
+
+    The generator writes one curve per port of the *SKU*, taken from
+    ``pv_count_from_dev_id`` rather than from what the firmware publishes.  A
+    ``1650`` therefore got ``PV1`` / ``PV2`` curves while the platform prunes the
+    phantom ports at setup and only creates ``pv1_power`` - so half of that card
+    referenced an entity that never existed and the whole panel fell back to
+    「该时间段没有统计数据。」.
+
+    Rewritten only when the card looks like that port chart *and* is broken:
+    every series must be one of this device's ``pv<N>_power`` sensors, and at
+    least one of them must be unresolvable.  The replacement is the single
+    ``pv_total_power`` curve the current generator emits for such a unit, so a
+    stored dashboard converges on a freshly generated one instead of drifting.
+    A card the user has re-pointed elsewhere is not port-shaped any more and is
+    left alone.
+    """
+    views = config.get("views")
+    if not isinstance(views, list):
+        return False
+
+    total = _resolve_entity(hass, dev_id, "pv_total_power")
+    port_pattern = re.compile(rf"^sensor\.{re.escape(_slug(dev_id))}_pv\d+_power(_\d+)?$")
+
+    changed = False
+    for card in _walk_cards(views):
+        if not isinstance(card, dict) or card.get("type") != HISTORY_CARD:
+            continue
+        series = card.get("series")
+        if not isinstance(series, list) or len(series) < 2:
+            continue
+        names = [s.get("entity") for s in series if isinstance(s, dict)]
+        if len(names) != len(series):
+            continue
+        if not all(isinstance(name, str) and port_pattern.match(name) for name in names):
+            continue
+        if all(_entity_exists(hass, name) for name in names):
+            continue
+
+        card["series"] = [
+            {
+                "entity": total,
+                "name": _t("PV1", "PV1"),
+                "color": card["series"][0].get("color", "#22c55e"),
+            }
+        ]
+        changed = True
+
+    return changed
+
+
+def _entity_exists(hass: HomeAssistant, entity_id: str) -> bool:
+    """True when Home Assistant knows this ``entity_id`` (state or registry)."""
+    if not isinstance(entity_id, str) or not entity_id:
+        return False
+    if hass.states.get(entity_id) is not None:
+        return True
+    try:
+        from homeassistant.helpers import entity_registry as er  # noqa: PLC0415
+
+        registry = er.async_get(hass)
+    except Exception:  # noqa: BLE001
+        return True  # cannot tell; assume fine rather than rewrite blindly
+    if registry is None:
+        return True
+    try:
+        return registry.async_get(entity_id) is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _migrate_drop_heading(config: dict[str, Any]) -> bool:
     """Remove the ``<model> · <family>`` heading card from every view; rev. 11.
 
@@ -2061,15 +2908,49 @@ def _grid(cards: list[dict[str, Any]], column_span: int = 4) -> dict[str, Any]:
     return {"type": "grid", "column_span": column_span, "cards": cards}
 
 
-def _subgrid(cards: list[dict[str, Any]]) -> dict[str, Any]:
-    """A nested two-column grid card, used to place cards side by side."""
+def _nested_grid(cards: list[dict[str, Any]], columns: int = 2) -> dict[str, Any]:
+    """A nested grid card over ``columns`` tracks, spanning the section.
+
+    ``columns`` is the assumption a card makes about the cell it is placed in,
+    and the cards that say nothing take the first free cell in order.
+
+    Note that HA 2026.5.4's ``hui-grid-card`` does **not** read
+    ``grid_options: {columns: N}`` on its children: every child takes exactly one
+    track, so a nested grid cannot express "this one is 3/4 wide and those are
+    1/4".  Use a plain sibling pair of a *section* for that (see
+    ``_SYSTEM_FLOW_COLUMNS``); a nested grid is only good for an even split or a
+    stack.
+    """
     return {
         "type": "grid",
-        "columns": 2,
+        "columns": columns,
         "square": False,
         "grid_options": {"columns": "full"},
         "cards": cards,
     }
+
+
+def _subgrid(cards: list[dict[str, Any]]) -> dict[str, Any]:
+    """A nested two-column grid card, used to place cards side by side."""
+    return _nested_grid(cards, 2)
+
+
+def _vstack(cards: list[dict[str, Any]]) -> dict[str, Any]:
+    """A nested single-column grid card, used to stack cards vertically."""
+    return _nested_grid(cards, 1)
+
+
+def _span(card: dict[str, Any], columns: int) -> dict[str, Any]:
+    """Mark a card as spanning ``columns`` columns of its parent.
+
+    Only meaningful for a card that is a direct child of a *section*, whose
+    width is ``12 * column_span`` columns (48 for the default ``column_span: 4``).
+    A nested ``grid`` card ignores this on its children - see
+    :func:`_nested_grid`.
+    """
+    out = dict(card)
+    out["grid_options"] = {"columns": columns}
+    return out
 
 
 def _full_width(card: dict[str, Any]) -> dict[str, Any]:
@@ -2504,8 +3385,19 @@ def _build_inverter_views(
     # power chart onto the same statistic grid.
     system_energy_group = f"{slug}-energy"
 
+    # The PV curve reads `system_plug_power` (`sys_plug_p`) rather than
+    # `system_pv_power` (`sys_pv_p`).  The two are different measurements and
+    # only one of them answers "how much did my roof make": `sys_pv_p` is the
+    # DC side, i.e. what the panels delivered *into* the units, while
+    # `sys_plug_p` is what the installation delivered at its AC terminals - the
+    # number the vendor app puts on the front page and the one the device
+    # itself reports back when the power set-point is verified.  The two differ
+    # by the units' own conversion and standby losses (measured,
+    # `sys_pv_p` 133.3 W against `sys_plug_p` 100.6 W on the same second), and
+    # the schematic's PV node is read from the same field so the card and the
+    # curve cannot disagree.
     pv_series = {
-        "entity": _entity(dev_id, "system_pv_power"),
+        "entity": _entity(dev_id, "system_plug_power"),
         "name": _t("PV Power", "光伏功率"),
         "color": "#22c55e",
     }
@@ -2520,11 +3412,20 @@ def _build_inverter_views(
         "color": "#f5a623",
     }
 
-    # One curve per port that exists; the colours match the port gauges.
+    # One curve per port that exists; the colours match the port gauges.  A
+    # single-input body gets one curve reading `pv_total_power` instead of
+    # `pv1_power`, because that body reports more than one DC string even
+    # though it exposes one connector (`1650`: `pv1_p` / `pv2_p` carry the same
+    # mirrored reading) and the schematic beside this chart prints the sum.  Two
+    # cards on the same tab disagreeing about the roof by a factor of two is the
+    # one outcome worth avoiding, so the curve follows the node.
     _PORT_COLORS = ("#22c55e", "#4a90d9", "#8b5cf6", "#06b6d4")
     port_series = [
         {
-            "entity": _entity(dev_id, f"pv{port}_power"),
+            "entity": _entity(
+                dev_id,
+                "pv_total_power" if ports == 1 else f"pv{port}_power",
+            ),
             "name": _t(f"PV{port}", f"PV{port}"),
             "color": _PORT_COLORS[(port - 1) % len(_PORT_COLORS)],
         }
@@ -2535,35 +3436,69 @@ def _build_inverter_views(
         "type": "custom:hoymiles-g2-power-flow",
         "dev_id": dev_id,
         "title": _t("My Home", "我的家"),
-        "max_width": 700,
+        "max_width": _SYSTEM_FLOW_MAX_WIDTH,
         "show_title": False,
+        # The System tab draws *the installation*, not this unit, and a grid-tied
+        # HiFlow installation differs from the storage schematic in three ways:
+        # there is no second PV branch (光伏2 is a storage input), a negative
+        # 负载 is generation and belongs on 光伏, and the value labels sit over
+        # the rings because the HiFlow connectors leave the ring downwards.  The
+        # card knows all three under this one name; the storage dashboard never
+        # sets it, so its schematic is untouched.  The Device tab below overrides
+        # it with `"variant": "inverter"` (the per-unit layout) through the
+        # `{**power_flow, ...}` spread.
+        "variant": "inverter-system",
     }
 
     system = _view(
         "system",
         "System",
         [
+            # One row of the section's columns: the schematic takes three
+            # quarters of it, the two energy tiles the remaining quarter,
+            # stacked one above the other.  They used to sit side by side beside
+            # the drawing, which made each of them a full-height card for one
+            # number and left the schematic no wider than 700 px.  Restacked
+            # and half as tall, the two tiles are read top to bottom - today
+            # first, lifetime under it - and the space they gave up went to the
+            # drawing.
+            #
+            # Both cards are plain siblings of one grid section, not children of
+            # a nested ``grid`` card: a ``hui-grid-card`` ignores ``grid_options``
+            # on its children (they all take one track, hence a flat 1:1 split
+            # when revision 27 wrote four), while a *section* honours it exactly.
+            # See ``_SYSTEM_FLOW_COLUMNS``.
             _grid(
                 [
-                    _subgrid(
-                        [
-                            _full_width(power_flow),
-                            _subgrid(
-                                [
-                                    _gauge(
-                                        dev_id,
-                                        "system_pv_energy_today",
-                                        _t("PV Today", "今日发电"),
-                                        "Wh",
-                                        max=2000,
-                                        decimals=0,
-                                        icon="panel",
-                                        show_arc=False,
-                                    ),
-                                    _energy_total_gauge(dev_id),
-                                ]
-                            ),
-                        ]
+                    _span(power_flow, _SYSTEM_FLOW_COLUMNS),
+                    _span(
+                        _vstack(
+                            [
+                                # The installation's yield, not this unit's.
+                                # Every HiFlow reports ``pvs[].ed`` for
+                                # itself and the protocol never adds them up
+                                # (measured 387 / 148 / 613 Wh on three units
+                                # of one installation), so the System tab -
+                                # which describes the installation - reads the
+                                # aggregated entity instead of the per-unit
+                                # one.  The Device tab keeps
+                                # ``system_pv_energy_today``, because that tab
+                                # is about this unit.
+                                _gauge(
+                                    dev_id,
+                                    "plant_pv_energy_today",
+                                    _t("PV Today", "今日发电"),
+                                    "Wh",
+                                    max=2000,
+                                    decimals=0,
+                                    icon="panel",
+                                    show_arc=False,
+                                    compact=True,
+                                ),
+                                _energy_total_gauge(dev_id, compact=True),
+                            ]
+                        ),
+                        _SYSTEM_TILES_COLUMNS,
                     ),
                 ]
             ),
@@ -2575,7 +3510,19 @@ def _build_inverter_views(
                         unit="W",
                         height=330,
                         sync_group=system_group,
-                        symmetric=False,
+                        # Mirrored **always**, not decided per render from the
+                        # data.  ``symmetric=False`` pinned a bottom-up
+                        # ``0..max`` axis, and 电网 is a signed series: the day
+                        # the house exports, every negative grid reading was
+                        # clamped to the baseline and the curve visibly went
+                        # missing below zero.  Leaving the key out (revision 24)
+                        # only mirrored on the days the data actually dipped,
+                        # which made the axis jump between layouts and left no
+                        # negative half to read an export against on a
+                        # consumption-only day.  Pinning ``True`` keeps the zero
+                        # line across the middle where the direction of the flow
+                        # is legible: 光伏 above it, 负载 and grid import below.
+                        symmetric=True,
                         stack=False,
                     )
                 ]
@@ -2586,12 +3533,16 @@ def _build_inverter_views(
                     # month of a year, a smooth curve for a single day.  The
                     # three tiles above it (month / year / lifetime) are derived
                     # from the same lifetime statistic, so no extra sensor is
-                    # needed for "this month" and "this year".
+                    # needed for "this month" and "this year" - and that is why
+                    # this curve reads the *plant* total: three tiles summed
+                    # from one unit's counter while the fourth card of the same
+                    # row shows the installation's would be two answers to one
+                    # question.  The Device tab keeps the per-unit curve.
                     _history(
                         _t("PV Energy", "发电量"),
                         [
                             {
-                                "entity": _entity(dev_id, "pv_energy_total"),
+                                "entity": _entity(dev_id, "plant_pv_energy_total"),
                                 "name": _t("Generation", "发电量"),
                                 "color": "#22c55e",
                             }
@@ -2941,8 +3892,16 @@ def _gauge(
     decimals: int | None = None,
     icon: str | None = None,
     show_arc: bool | None = None,
+    compact: bool = False,
 ) -> dict[str, Any]:
-    """Build a ``hoymiles-g2-gauge`` card for one energy/power/SOC entity."""
+    """Build a ``hoymiles-g2-gauge`` card for one energy/power/SOC entity.
+
+    ``compact`` asks the card for its one-line reading - name on the left, value
+    on the right - which is roughly half the height of a full tile.  It exists
+    for the System tab, where 「今日发电」 and 「总发电量」 are stacked in a narrow
+    column beside the schematic: two full tiles there would be taller than the
+    drawing next to them and leave a gap under it.
+    """
     card: dict[str, Any] = {
         "type": "custom:hoymiles-g2-gauge",
         "entity": _entity(dev_id, key),
@@ -2964,20 +3923,21 @@ def _gauge(
         card["icon"] = icon
     if show_arc is not None:
         card["show_arc"] = show_arc
+    if compact:
+        card["compact"] = True
     return card
 
 
-def _energy_total_gauge(dev_id: str) -> dict[str, Any]:
+def _energy_total_gauge(dev_id: str, *, compact: bool = False) -> dict[str, Any]:
     """The lifetime PV energy card that sits to the right of "today".
 
     Same card and the same visual format as the "today" gauge next to it - a
     number with a unit and no arc - because the two are read together.  Three
     things do differ, all deliberately:
 
-    * **kWh, not Wh.**  ``pv_energy_total`` is a lifetime counter; the
-      micro inverter measured here reports 1 593 161 Wh, which is seven digits
-      and overflows a half-width card on a phone.  Scaled to kWh it reads
-      ``1 593.2``.
+    * **kWh, not Wh.**  A lifetime counter is seven digits on the test
+      installation's largest unit alone, which overflows a half-width card on a
+      phone.  Scaled to kWh it reads ``6.1`` for the three units together.
     * **A different icon.**  "Today" uses ☀️; repeating the sun on the adjacent
       card makes the two indistinguishable at a glance.  This one uses the
       vendor app's "All" ring - a broken circle with the word inside - which
@@ -2989,16 +3949,25 @@ def _energy_total_gauge(dev_id: str) -> dict[str, Any]:
 
     ``show_arc`` stays off for the same reason as its sibling: a lifetime total
     has no meaningful ceiling, so a percentage of ``max`` would be invented.
+
+    The entity is ``plant_pv_energy_total``, **not** ``pv_energy_total``.
+    ``et`` is a per-unit counter and the protocol never adds units up, so the
+    per-unit figure showed the master's share of the roof - on the test
+    installation 2.9 of 6.1 kWh, less than half, with nothing on the card saying
+    so.  This card sits on the System tab, which describes the installation, so
+    it reads the aggregated entity; the Device tab keeps the per-unit
+    ``pv_energy_total`` beside the per-unit 今日发电.
     """
     return _gauge(
         dev_id,
-        "pv_energy_total",
+        "plant_pv_energy_total",
         _t("PV Total", "总发电量"),
         "kWh",
         scale=0.001,
         decimals=1,
         icon="all",
         show_arc=False,
+        compact=compact,
     )
 
 

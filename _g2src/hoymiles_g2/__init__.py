@@ -1,4 +1,15 @@
-"""The Hoymiles Micro Storage integration."""
+"""The micro inverter family of the Hoymiles integration.
+
+``async_setup_inverter_entry`` is what the integration's own ``async_setup_entry``
+calls when a config entry's PID belongs to a grid-tied micro inverter
+(``1650`` / ``4160`` / ``4161`` / ``4162``).  A storage unit never reaches this
+module, so nothing in here can change how a storage device is set up.
+
+The modules below are the ones the standalone ``hoymiles_g2`` integration used,
+moved into a subpackage unchanged apart from the domain they report to - they
+share the parent's ``hass.data`` bucket, device registry entries and services,
+because the user installed one integration, not two.
+"""
 
 from __future__ import annotations
 
@@ -10,23 +21,29 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 
 from .const import (
+    CONF_CREATE_DASHBOARD,
     CONF_DEV_ID,
     DOMAIN,
     FRONTEND_ASSETS,
     FRONTEND_IMAGES,
     FRONTEND_URL,
+    PAYLOAD_AVAILABLE,
     PLATFORMS,
+    T_HA_STATUS,
 )
 from .coordinator import HoymilesCoordinator
 from .discovery_override import FirmwareDiscoveryPatcher
 from .keepalive import PowerCtrlKeepAlive
+from .mqtt_util import async_publish
 from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Hoymiles Micro Storage from a config entry."""
+async def _async_setup_inverter_entry_impl(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> bool:
+    """Set up a micro inverter from a config entry."""
     dev_id: str = entry.data[CONF_DEV_ID]
 
     coordinator = HoymilesCoordinator(hass, dev_id)
@@ -65,6 +82,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(coordinator.async_add_listener(_maybe_prune))
     _maybe_prune()
 
+    # Both subscriptions above are in place, so the device's answer to the
+    # online notice lands on a listener instead of bouncing off an unsubscribed
+    # topic.
+    await _async_announce_ha_online(hass, dev_id)
+
     # Re-publishes `power_ctrl` so the firmware's ~60 s lease stays in force.
     # It lives here rather than in the card, because a browser timer stops the
     # moment the dashboard is closed - exactly when the lease still needs
@@ -95,14 +117,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await async_setup_services(hass)
 
     # Best-effort: materialise the device's Lovelace dashboard on first setup,
-    # mirroring the official integration's auto-generated panel.  Never raises.
+    # the same way the storage family does it.  Never raises.
     # ``pv_count`` is resolved from the product code even before the first
     # ``device/state`` arrives, so a fresh install picks the right layout.
+    #
+    # ``create_dashboard`` is the answer the shared config flow collected; a
+    # missing key means "yes", exactly like the storage path.
     from . import lovelace  # noqa: PLC0415
 
-    await lovelace.async_ensure_dashboard(
-        hass, dev_id, coordinator.pv_count, coordinator.role
-    )
+    if entry.data.get(CONF_CREATE_DASHBOARD, True):
+        await lovelace.async_ensure_dashboard(
+            hass, dev_id, coordinator.pv_count, coordinator.role
+        )
     # The role rides on ``event/state``, which the device publishes on its own
     # schedule - frequently *after* this point.  The dashboard is written now
     # because waiting for it would delay setup by an unbounded amount of time,
@@ -111,6 +137,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _async_track_role(hass, entry, coordinator, dev_id, lovelace)
 
     return True
+
+
+async def _async_announce_ha_online(hass: HomeAssistant, dev_id: str) -> None:
+    """Publish ``homeassistant/status = online`` so the device re-announces.
+
+    The firmware only rebuilds its discovery payloads - and re-publishes its own
+    MQTT/MQTTS topics for the current round - after it reads ``online`` on this
+    topic.  Home Assistant publishes that message once, when its MQTT
+    integration starts, which leaves a window: a unit that was asleep, or whose
+    broker session dropped, at that moment stays silent for the rest of the
+    process and the entities it would have re-registered never come back.
+
+    Sending it again on every config-entry setup (startup, reload, and the
+    options flow's re-run) closes that window.  The topic is a broadcast - every
+    device family subscribes to it - so the extra publish costs one packet per
+    inverter and is harmless to units that are already talking.
+
+    ``qos=1`` and ``retain=False`` as the protocol specifies.  Never raises: a
+    device that sleeps through this one is retried on the next setup, and
+    nothing about entity creation depends on it.
+    """
+    try:
+        await async_publish(
+            hass, T_HA_STATUS, PAYLOAD_AVAILABLE, qos=1, retain=False
+        )
+        _LOGGER.debug("Announced Home Assistant online for %s", dev_id)
+    except Exception:  # noqa: BLE001 - never break setup over a notification
+        _LOGGER.debug(
+            "Could not announce Home Assistant online for %s", dev_id, exc_info=True
+        )
 
 
 @callback
@@ -148,8 +204,10 @@ def _async_track_role(
     entry.async_on_unload(coordinator.async_add_listener(_apply))
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
+async def _async_unload_inverter_entry_impl(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> bool:
+    """Unload a micro inverter config entry."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         entry_data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
@@ -182,8 +240,10 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     body as soon as it is.  The ``?v=`` query string is kept as well: it is a
     second line of defence and makes the URL self-documenting.
     """
+    # A key of its own: the storage family registers its own assets under
+    # ``_frontend_registered``, and either family may be set up first.
     domain_data = hass.data.setdefault(DOMAIN, {})
-    if domain_data.get("_frontend_registered"):
+    if domain_data.get("_inverter_frontend_registered"):
         return
 
     # Reading ``www/`` (existence checks and mtimes) is blocking IO, so it runs
@@ -233,8 +293,8 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
         _LOGGER.warning("Unable to register the Hoymiles frontend cards", exc_info=True)
         return
 
-    domain_data["_frontend_registered"] = True
-    _LOGGER.debug("Registered frontend assets: %s", [url for url, _p, _v in assets])
+    domain_data["_inverter_frontend_registered"] = True
+    _LOGGER.debug("Registered inverter frontend assets: %s", [url for url, _p, _v in assets])
 
 
 def _register_asset_routes(http: Any, assets: list[tuple[str, str, int]]) -> bool:
@@ -290,3 +350,19 @@ def _asset_version(path: Path) -> int:
         return int(path.stat().st_mtime)
     except OSError:  # pragma: no cover - unreadable file, not worth failing over
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant looks for exactly ``async_setup_entry`` / ``async_unload_entry``.
+# This package carries micro inverters only, so both simply forward: the storage
+# family lives in its own integration and has its own entry points.
+# ---------------------------------------------------------------------------
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up a Hoymiles micro inverter from a config entry."""
+    return await _async_setup_inverter_entry_impl(hass, entry)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a Hoymiles micro inverter config entry."""
+    return await _async_unload_inverter_entry_impl(hass, entry)
+

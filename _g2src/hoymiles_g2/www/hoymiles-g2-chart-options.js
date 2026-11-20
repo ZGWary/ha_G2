@@ -6,7 +6,7 @@
  * The Device view of a micro inverter draws a fixed set of curves.  A few more
  * readings exist (`grid_on_current`, `grid_on_frequency`, ...) and each of them
  * can be shown as a chart card of its own - but the only way to choose used to
- * be *Settings -> Devices & Services -> hoymiles_g2 -> Configure*, which is a
+ * be *Settings -> Devices & Services -> Hoymiles -> Configure*, which is a
  * long way round for a switch that belongs on the page it changes.
  *
  * This card is that switch, and nothing else: five rows, one per opt-in chart.
@@ -292,19 +292,30 @@ function _hmChartOptionsRegister() {
         :host { display: block; }
         ha-card { padding: 12px 14px 14px; height: 100%; box-sizing: border-box; }
         .head { display: flex; align-items: center; gap: 8px;
-                color: var(--primary-text-color); margin-bottom: 4px; }
+                color: var(--primary-text-color); margin-bottom: 8px; }
         .name { font-size: 15px; font-weight: 500; line-height: 1.3; }
-        .hint { font-size: 12.5px; color: var(--secondary-text-color);
-                line-height: 1.45; margin: 0 0 8px; }
-        .rows { display: flex; flex-direction: column; }
-        .row { display: grid; grid-template-columns: 10px 1fr auto;
-               gap: 10px; align-items: center; padding: 7px 0;
-               border-top: 1px solid var(--divider-color, rgba(0, 0, 0, 0.12)); }
-        .row:first-child { border-top: 0; }
-        .dot { width: 10px; height: 10px; border-radius: 50%; }
-        .label { font-size: 13.5px; color: var(--primary-text-color); }
-        .unit { font-size: 11.5px; color: var(--secondary-text-color);
-                margin-left: 6px; font-variant-numeric: tabular-nums; }
+        /* The choices are pills, not switch rows: one line of chips takes a
+         * third of the height a stacked list of five rows needed, and the
+         * on/off state reads from the chip itself (bold + coloured outline). */
+        .chips { display: flex; flex-wrap: wrap; gap: 8px 10px; }
+        .li { display: inline-flex; align-items: center; gap: 7px;
+              font-size: 12.5px; color: var(--primary-text-color);
+              cursor: pointer; border-radius: 999px; padding: 4px 13px 4px 5px;
+              background: var(--secondary-background-color, rgba(127,127,127,0.12));
+              transition: opacity .15s, background .15s, box-shadow .15s;
+              user-select: none; appearance: none; border: 0;
+              font-family: inherit; line-height: 1.35; text-align: left; }
+        .li:hover { box-shadow: inset 0 0 0 1px var(--divider-color); }
+        .li.off { opacity: 0.38; }
+        .li.on { font-weight: 600;
+                 box-shadow: inset 0 0 0 1px var(--primary-color); }
+        .li:disabled { cursor: default; }
+        .li:disabled:not(.on) { opacity: 0.28; }
+        .dot { width: 17px; height: 17px; border-radius: 50%; flex: 0 0 auto;
+               box-sizing: border-box;
+               border: 2px solid var(--card-background-color, #fff); }
+        .unit { font-size: 11px; color: var(--secondary-text-color);
+                margin-left: 1px; font-variant-numeric: tabular-nums; }
         .err { font-size: 12.5px; color: var(--error-color, #db4437);
                margin-top: 8px; overflow-wrap: anywhere; }
         .note { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px;
@@ -344,7 +355,9 @@ function _hmChartOptionsRegister() {
     }
 
     getCardSize() {
-      return 3;
+      /* Title plus one or two rows of chips - the toggles no longer stack, so
+       * the card is roughly half the height it used to claim. */
+      return 2;
     }
 
     _dev() {
@@ -360,7 +373,7 @@ function _hmChartOptionsRegister() {
       const hass = this._hass;
       if (!hass || typeof hass.callService !== "function") return null;
       const result = await hass.callService(
-        "hoymiles_g2",
+        "hoymiles",
         service,
         data,
         undefined,
@@ -480,30 +493,26 @@ function _hmChartOptionsRegister() {
 
       const ready = this._draft != null;
 
-      const rows = CHARTS.map((item) => html`
-        <div class="row">
-          <span class="dot" style="background:${item.color}"></span>
-          <span class="label">
-            ${hmText({ en: item.en, zh: item.zh }, hmLang(this._hass, this._config))}
+      /* A chip is ticked when its key is present.  Clicking a ticked chip again
+       * clears it, which is exactly what `_toggle(key, false)` already does. */
+      const chips = CHARTS.map((item) => {
+        const on = this._on(item.key);
+        return html`
+          <button
+            class="li ${on ? "on" : "off"}"
+            ?disabled=${!ready || this._busy}
+            aria-pressed=${on ? "true" : "false"}
+            @click=${() => this._toggle(item.key, !on)}>
+            <span class="dot" style="background:${item.color}"></span>
+            <span>${hmText({ en: item.en, zh: item.zh }, hmLang(this._hass, this._config))}</span>
             <span class="unit">${esc(item.unit)}</span>
-          </span>
-          <ha-switch
-            .checked=${this._on(item.key)}
-            .disabled=${!ready || this._busy}
-            @change=${(e) => this._toggle(item.key, e.target.checked)}>
-          </ha-switch>
-        </div>`);
+          </button>`;
+      });
 
       return html`
         <ha-card>
           <div class="head"><div class="name">${esc(title)}</div></div>
-          <p class="hint">
-            ${this._t(
-              "Tick the readings you want. A card added this way shows up on this page as soon as you tick it, and its curve is recorded from that moment on.",
-              "勾选想要的数据，对应的数据卡片会在勾选后出现在本页，卡片从勾选的那一刻开始记录。"
-            )}
-          </p>
-          <div class="rows">${rows}</div>
+          <div class="chips">${chips}</div>
           ${this._applying
             ? html`<div class="note">${this._t("Applying…", "正在应用…")}</div>`
             : this._saved

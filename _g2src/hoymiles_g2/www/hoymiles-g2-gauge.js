@@ -33,6 +33,13 @@
  *   show_arc: false           # optional, drop the arch and its percentage
  *                             #   altogether - the card is then just the
  *                             #   readout (default true)
+ *   compact: true             # optional, read the tile sideways: the name and
+ *                             #   the reading share one line instead of
+ *                             #   stacking, so the card is roughly half as
+ *                             #   tall.  Meant for a stack of tiles in a
+ *                             #   narrow column (the System tab's 今日/总发电量)
+ *                             #   where the full tile costs more height than
+ *                             #   the numbers are worth.  No arch in this mode.
  *
  * The arch shows the value as a share of `max`.  When the interesting number is
  * a ratio between entities rather than a share of a made-up ceiling, give the
@@ -408,6 +415,24 @@ function _hmGaugeRegister() {
         .cap { font-size: 12.5px; fill: var(--secondary-text-color); }
         .na { font-size: 13px; color: var(--secondary-text-color);
               text-align: center; padding: 24px 0; }
+
+        /* Compact tile: one line, name on the left and the reading on the
+           right, roughly half the height of a full tile.  Used where a narrow
+           column has to carry two numbers without spending a whole card each.
+           The row is centred vertically because the cell it lands in is usually
+           half of a taller neighbour, and one line pinned to the top of that
+           box reads as a layout mistake rather than as a small tile. */
+        ha-card.compact { padding: 10px 16px; justify-content: center; }
+        .row { display: flex; align-items: center; gap: 10px; min-height: 26px; }
+        .row .name { font-size: 13.5px; font-weight: 500; flex: 1 1 auto;
+                     min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                     white-space: nowrap; }
+        .row .readout { margin: 0; flex: 0 0 auto; gap: 4px; }
+        .row .value { font-size: 26px; font-weight: 700; }
+        .row .unit { font-size: 13px; }
+        .row .icon { flex: 0 0 auto; }
+        .row .icon .badge { width: 28px; height: 28px; }
+        .row .icon ha-icon { --mdc-icon-size: 18px; }
       `;
     }
 
@@ -442,7 +467,21 @@ connectedCallback() {
     }
 
     getCardSize() {
-      return 3;
+      /* A compact tile is one text line plus its padding, i.e. one row of a
+         sections grid instead of three. */
+      return this._compact() ? 1 : 3;
+    }
+
+    /** True when the tile is asked to render as one line.
+     *
+     * The visual editor stores every field as the string the user typed, so
+     * ``"true"`` has to mean the same as ``true`` here; YAML hands over a real
+     * boolean.  ``false`` and anything else keeps the full tile - the option is
+     * opt-in, never a surprise.
+     */
+    _compact() {
+      const value = this._config && this._config.compact;
+      return value === true || value === "true";
     }
 
     /* ---------------------------- the numbers ---------------------------- */
@@ -545,6 +584,25 @@ connectedCallback() {
       // empty space where they used to be.  Checked against `false` so an absent
       // option keeps the arch.
       const dial = this._config.show_arc === false ? "" : this._arc(frac, dialHasValue);
+
+      /* Compact mode: the same two pieces of information on one line.  It is a
+         different tree rather than a CSS variant because the order changes - the
+         reading has to come after the name for a flex row to lay it out right,
+         and the arch is never drawn (a tile this short has no room for one). */
+      if (this._compact()) {
+        return html`
+          <ha-card class="compact">
+            <div class="row">
+              <div class="name">${esc(name)}</div>
+              <div class="readout">
+                <span class="value">${shown}</span>
+                ${unit === "" || value == null ? "" : html`<span class="unit">${esc(unit)}</span>`}
+              </div>
+              ${icon === "" ? "" : html`<div class="icon">${this._iconMarkup(icon)}</div>`}
+            </div>
+          </ha-card>
+        `;
+      }
 
       return html`
         <ha-card>
@@ -688,6 +746,9 @@ connectedCallback() {
           <ha-textfield label="show_arc (false = drop the arc and its percentage)"
             .value=${config.show_arc === false ? "false" : ""}
             @change=${this._changed("show_arc")}></ha-textfield>
+          <ha-textfield label="compact (true = name and reading on one line, half height)"
+            .value=${config.compact === true ? "true" : ""}
+            @change=${this._changed("compact")}></ha-textfield>
           <ha-textfield label="percent_numerator (numerator of the arc percentage)"
             .value=${config.percent_numerator || ""}
             @change=${this._changed("percent_numerator")}></ha-textfield>

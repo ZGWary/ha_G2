@@ -20,15 +20,20 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
 )
 
-from . import mqtt_util
+from . import mqtt_util, region
 from .const import (
     CONF_DEV_ID,
+    CONF_REGION,
+    DOMAIN,
     EMS_MODES,
+    is_inverter_dev_id,
+    REGION_CHOICES,
     T_EMS_MODE_CMD,
     T_REBOOT,
     T_TOU_DAY_SET,
@@ -41,7 +46,6 @@ from .const import (
     TOU_SOC_MIN,
     TOU_TS_MAX,
     TOU_WEEKDAYS,
-    is_inverter_dev_id,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -91,6 +95,7 @@ class HoymilesOptionsFlow(OptionsFlow):
         return self.async_show_menu(
             step_id="init",
             menu_options=[
+                "region",
                 "charts",
                 "day_plan",
                 "week_plan",
@@ -103,6 +108,74 @@ class HoymilesOptionsFlow(OptionsFlow):
     # ------------------------------------------------------------------
     # optional device charts
     # ------------------------------------------------------------------
+    async def async_step_region(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Choose the time zone this device's day is measured in.
+
+        Same option the toolbar switch writes, offered here as well because a
+        wizard is the discoverable place for it and because the toolbar is not
+        present on every dashboard.  ``custom_value`` is deliberate: the list is
+        a shortlist of common markets, not an enumeration of the tz database, and
+        a unit installed somewhere else must still be settable.
+        """
+        if user_input is not None:
+            raw = user_input.get(CONF_REGION)
+            wanted = raw.strip() if isinstance(raw, str) else ""
+            if wanted and region.resolve(wanted) is None:
+                return self.async_show_form(
+                    step_id="region",
+                    data_schema=self._region_schema(wanted),
+                    errors={CONF_REGION: "invalid_region"},
+                )
+
+            entry = self.config_entry
+            if region.zone_name(entry) != wanted:
+                self.hass.config_entries.async_update_entry(
+                    entry, options={**entry.options, CONF_REGION: wanted}
+                )
+                _LOGGER.info(
+                    "Hoymiles %s: region changed to %s (options flow)",
+                    self._dev_id,
+                    wanted or "Home Assistant",
+                )
+
+            # The day may already have turned over in the new zone and the
+            # midnight timer was armed for the old one.
+            coordinator = self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            if isinstance(coordinator, dict):
+                coord = coordinator.get("coordinator")
+                if coord is not None and hasattr(coord, "async_apply_region"):
+                    await coord.async_apply_region()
+            return self.async_create_entry(title="", data={})
+
+        return self.async_show_form(
+            step_id="region",
+            data_schema=self._region_schema(region.zone_name(self.config_entry)),
+        )
+    def _region_schema(self, current: str) -> vol.Schema:
+        """The dropdown, with "follow Home Assistant" as the first choice."""
+        options = [SelectOptionDict(value="", label="* 跟随 Home Assistant")]
+        options.extend(
+            SelectOptionDict(value=value, label=f"{label_en} / {label_zh}")
+            for value, label_en, label_zh in REGION_CHOICES
+        )
+        # A stored zone outside the shortlist must still show up as the selected
+        # value, otherwise opening the wizard would silently rewrite it to "".
+        if current and all(opt["value"] != current for opt in options):
+            options.append(SelectOptionDict(value=current, label=current))
+        return vol.Schema(
+            {
+                vol.Optional(CONF_REGION, default=current): SelectSelector(
+                    SelectSelectorConfig(
+                        options=options,
+                        mode=SelectSelectorMode.DROPDOWN,
+                        custom_value=True,
+                    )
+                )
+            }
+        )
+
     async def async_step_charts(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:

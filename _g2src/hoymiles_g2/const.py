@@ -1,4 +1,10 @@
-"""Constants for the Hoymiles Micro Storage integration.
+"""Constants for the micro inverter family of the Hoymiles integration.
+
+Everything here belongs to the grid-tied HiFlow micro inverters (PID ``1650`` /
+``4160`` / ``4161`` / ``4162``).  It is a subpackage of the storage integration on
+purpose: the two families share the MQTT transport and nothing else, so the
+inverter code lives in its own namespace and is only imported when a config entry
+carries an inverter PID (see ``const.device_family`` in the parent package).
 
 All MQTT topics follow《禾迈微储MQTT协议开发指南》V0.5.1.
 ``dev_id`` is ``"<client_prefix>-<SN>"`` (or just the SN when no prefix is set).
@@ -8,11 +14,75 @@ from __future__ import annotations
 
 from typing import Final
 
+# The domain is the *integration's* domain, not the subpackage's: entities,
+# devices, services and the ``hass.data`` bucket all belong to the one integration
+# the user installed.  The PID, not the import path, decides which code path runs.
+# This is the standalone ``hoymiles_g2`` package, so the symbols the
+# subpackage version re-exported from its parent package are defined below,
+# lifted verbatim from this package's own history.
 DOMAIN: Final = "hoymiles_g2"
+# Was re-exported from the parent package; the standalone package owns it.
+CONF_CREATE_DASHBOARD: Final = "create_dashboard"
+
 MANUFACTURER: Final = "Hoymiles"
 NAME: Final = "Hoymiles MS-G2"
 
 CONF_DEV_ID: Final = "dev_id"
+
+# ---------------------------------------------------------------------------
+# Region / time zone
+# ---------------------------------------------------------------------------
+# The unit has no clock this integration can read, and Home Assistant's own
+# time zone describes where the *server* runs, not where the roof is.  A unit
+# installed two time zones away from its Home Assistant therefore rolls its own
+# 「今日」 counters over at a midnight nobody on this side can see, and every
+# timestamp the cards print is off by the same offset.
+#
+# The choice lives in the config entry's **options** (one per device, not one per
+# browser) because the coordinator needs it: deciding that an outage crossed
+# midnight is a comparison of calendar *days*, and the day has to be the day at
+# the roof.  The toolbar switch only writes it; see
+# ``inverter/www/hoymiles-g2-region.js`` and the ``set_region`` service.
+CONF_REGION: Final = "region"
+# Empty means "follow the Home Assistant installation's time zone", which is what
+# every entry that predates this option gets - and the right answer for the
+# common case of a unit on the same premises as Home Assistant.
+DEFAULT_REGION: Final = ""
+
+# The regions the toolbar offers, as ``(IANA name, English label, 中文标签)``.
+#
+# Deliberately a fixed list rather than every zone of the tz database: the list
+# is what a dropdown can show, and these are the markets the firmware ships to.
+# A zone outside it can still be set through the service / the options flow,
+# which validates against ``zoneinfo`` rather than against this tuple - the list
+# is a convenience, not the contract.
+REGION_CHOICES: Final = (
+    ("Asia/Shanghai", "China (UTC+8)", "中国 (UTC+8)"),
+    ("Asia/Hong_Kong", "Hong Kong (UTC+8)", "香港 (UTC+8)"),
+    ("Asia/Taipei", "Taiwan (UTC+8)", "台湾 (UTC+8)"),
+    ("Asia/Tokyo", "Japan (UTC+9)", "日本 (UTC+9)"),
+    ("Asia/Seoul", "Korea (UTC+9)", "韩国 (UTC+9)"),
+    ("Asia/Singapore", "Singapore (UTC+8)", "新加坡 (UTC+8)"),
+    ("Asia/Bangkok", "Thailand (UTC+7)", "泰国 (UTC+7)"),
+    ("Asia/Jakarta", "Indonesia (UTC+7)", "印尼 (UTC+7)"),
+    ("Asia/Kolkata", "India (UTC+5:30)", "印度 (UTC+5:30)"),
+    ("Asia/Dubai", "UAE (UTC+4)", "阿联酋 (UTC+4)"),
+    ("Australia/Sydney", "Australia East (UTC+10/11)", "澳洲东部 (UTC+10/11)"),
+    ("Australia/Perth", "Australia West (UTC+8)", "澳洲西部 (UTC+8)"),
+    ("Europe/London", "United Kingdom (UTC+0/1)", "英国 (UTC+0/1)"),
+    ("Europe/Berlin", "Germany (UTC+1/2)", "德国 (UTC+1/2)"),
+    ("Europe/Amsterdam", "Netherlands (UTC+1/2)", "荷兰 (UTC+1/2)"),
+    ("Europe/Madrid", "Spain (UTC+1/2)", "西班牙 (UTC+1/2)"),
+    ("Europe/Rome", "Italy (UTC+1/2)", "意大利 (UTC+1/2)"),
+    ("Europe/Warsaw", "Poland (UTC+1/2)", "波兰 (UTC+1/2)"),
+    ("Europe/Athens", "Greece (UTC+2/3)", "希腊 (UTC+2/3)"),
+    ("America/New_York", "US Eastern (UTC-5/-4)", "美国东部 (UTC-5/-4)"),
+    ("America/Chicago", "US Central (UTC-6/-5)", "美国中部 (UTC-6/-5)"),
+    ("America/Denver", "US Mountain (UTC-7/-6)", "美国山地 (UTC-7/-6)"),
+    ("America/Los_Angeles", "US Pacific (UTC-8/-7)", "美国太平洋 (UTC-8/-7)"),
+    ("America/Sao_Paulo", "Brazil (UTC-3)", "巴西 (UTC-3)"),
+    ("Africa/Johannesburg", "South Africa (UTC+2)", "南非 (UTC+2)"),
+)
 
 PLATFORMS: Final = ["sensor", "binary_sensor", "number"]
 
@@ -50,6 +120,11 @@ T_TOU_STATUS: Final = "homeassistant/sensor/{dev_id}/tou_plan/status"
 
 # Discovery topic used for auto-discovery in the config flow.
 T_DISCOVERY: Final = "homeassistant/switch/+/config"
+
+# Liveness wildcard used by the config flow.  ``quick/state`` is pushed once a
+# second while the device is connected, so it - unlike the retained discovery
+# configs - tells a currently reachable device apart from a stale one.
+T_QUICK_WILDCARD: Final = "homeassistant/sensor/+/quick/state"
 
 # ---------------------------------------------------------------------------
 # Firmware discovery patching (see discovery_override.py)
@@ -91,9 +166,20 @@ LEGACY_DISCOVERY_OBJECTS: Final = (
 
 # Availability topic owned by the integration.  It is only referenced by the
 # patched discovery payloads, so it never collides with firmware topics.
-T_AVAILABILITY: Final = "hoymiles_g2/{dev_id}/availability"
+T_AVAILABILITY: Final = "hoymiles/{dev_id}/availability"
 PAYLOAD_AVAILABLE: Final = "online"
 PAYLOAD_NOT_AVAILABLE: Final = "offline"
+
+# Broadcast topic the firmware subscribes to ("HA online notice", protocol §2).
+# Reading ``online`` is what makes a device rebuild its discovery payloads and
+# re-publish its own MQTT/MQTTS topics for this round; ``offline`` means Home
+# Assistant is going away and may be ignored.  Every device family - storage and
+# inverter alike - subscribes to it, so the topic carries no device id.
+#
+# Home Assistant publishes this itself when its MQTT integration starts, but a
+# device that was unreachable at that moment has missed it until the next
+# restart.  Sending it once per config-entry setup closes that window.
+T_HA_STATUS: Final = "homeassistant/status"
 
 # State topic owned by the integration for the EMS mode select.  The firmware
 # select has no state_topic of its own, so it would read "unknown" after every
@@ -103,11 +189,11 @@ PAYLOAD_NOT_AVAILABLE: Final = "offline"
 # It cannot point at ``system/state`` directly: that topic is only pushed every
 # 5 minutes, and the bundled TOU card gates its UI on the select state, so a
 # freshly issued command would take up to 5 minutes to show up.
-T_EMS_MODE_STATE: Final = "hoymiles_g2/{dev_id}/ems_mode/state"
+T_EMS_MODE_STATE: Final = "hoymiles/{dev_id}/ems_mode/state"
 
 # Running state of the power-control keep-alive (see keepalive.py), retained so
 # a dashboard reload reads the truth instead of guessing from a local timer.
-T_POWER_CTRL_KEEPALIVE: Final = "hoymiles_g2/{dev_id}/power_ctrl/keepalive"
+T_POWER_CTRL_KEEPALIVE: Final = "hoymiles/{dev_id}/power_ctrl/keepalive"
 
 # Period bounds for the keep-alive.  ``power_ctrl`` is a lease the firmware drops
 # after roughly 60 s, so the floor is short enough to stay well inside it and the
@@ -270,18 +356,13 @@ SOURCE_CAPABILITY: Final = {
 # ---------------------------------------------------------------------------
 # PV input count
 # ---------------------------------------------------------------------------
-# The four digits right after the client prefix are the **PID** - the firmware's
-# product identification number - and every discriminating decision is made on
-# them rather than on the prefix.
-#
-# The prefix in front of the serial (``RMI-``, ``MSA-``, ...) is a *user
-# setting*: it is the MQTT client prefix and the user may change it to anything.
-# So ``RMI-`` cannot be used to recognise a device, and neither can the firmware's
-# model string, which names a whole family ("HiFlow" covers both the 1-input 1650
-# and the 1-input 4160).  The PID is stable, is present in every spelling of the
-# serial, and - unlike ``device/state["pv_num"]`` - is known *before* the first
-# payload arrives, which matters because entities are created during setup.
-#
+# ``PID_PV_COUNT``, ``INVERTER_PIDS``, ``STORAGE_PIDS``, ``KNOWN_PIDS``,
+# ``PV_COUNT_BY_CODE``, ``PV_COUNT_MAX`` and the ``serial_pid`` /
+# ``is_inverter_dev_id`` / ``pv_count_from_dev_id`` helpers are imported from
+# the parent package: the PID model is what decides *which* code path serves a
+# device, so it has to live where the dispatch happens.  Re-exported here
+# because every module below spells ``from .const import ...``.
+
 # Mirrors ``IV_PV_COUNT_BY_CODE`` in ``www/hoymiles-g2-power-flow.js``; keep
 # both tables in sync (see ``docs/hoymiles_g2-hiflow.md``).
 PID_PV_COUNT: Final[dict[str, int]] = {
@@ -386,22 +467,37 @@ def model_from_dev_id(dev_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Availability / staleness (protocol §22 pushes every 1 s, §23/§24 every 5 min)
 # ---------------------------------------------------------------------------
-# How often the availability watchdog re-evaluates source freshness.
-AVAILABILITY_WATCHDOG_SECONDS: Final = 30
+# How often the availability watchdog re-evaluates source freshness.  Short
+# against the one minute window below, so a disconnected device is noticed
+# between 60 and 75 seconds after its last message instead of up to 90.
+AVAILABILITY_WATCHDOG_SECONDS: Final = 15
 
 # A ``system/state`` report arriving right after an EMS mode command may still
 # carry the previous mode (the topic is only pushed every 5 minutes).  Such
 # reports are ignored for this long so the select does not flip back.
 EMS_MODE_ECHO_GUARD_SECONDS: Final = 30
 
+# One minute without a per-second ``quick/state`` frame means the device is not
+# talking to the broker any more.
+QUICK_STALE_SECONDS: Final = 60
+
+# How long a freshly set up entry may wait for its first ``quick/state`` before
+# the retained ``online`` it inherited from the previous run is distrusted.
+# Without this a device that was already unplugged when Home Assistant started
+# would keep the retained verdict forever, because nothing ever contradicts it.
+AVAILABILITY_STARTUP_GRACE_SECONDS: Final = 90
+
 # A source is alive while its last message is younger than its window.
 # Event driven topics (TOU ack/status, and ``event/state`` which is only pushed
 # on connect and on change) are excluded on purpose: giving them a window would
 # declare a healthy device offline the moment nothing changed for long enough.
+#
+# Only ``quick/state`` is listed: it is the sole proof of life, because it is
+# pushed once a second.  ``device/state`` and ``system/state`` arrive every five
+# minutes, so any window over them has to be generous - and 11 minutes over them
+# was exactly what kept an unplugged device looking online.
 SOURCE_STALE_SECONDS: Final = {
-    SRC_QUICK: 120,
-    SRC_DEVICE: 660,
-    SRC_SYSTEM: 660,
+    SRC_QUICK: QUICK_STALE_SECONDS,
 }
 
 # TOU ack status codes (protocol §17 / §19)
@@ -647,8 +743,23 @@ PACK_LIST_CARD_FILENAME: Final = "hoymiles-g2-pack-list.js"
 ALARM_CARD_FILENAME: Final = "hoymiles-g2-alarm.js"
 # The five opt-in curves of the Device view, switchable from that page itself.
 CHART_OPTIONS_CARD_FILENAME: Final = "hoymiles-g2-chart-options.js"
+# The region (time zone) switch of the toolbar.  Toolkit-level rather than a
+# card: it decides which calendar day the backend calls "today", so it has to
+# be reachable from every dashboard, and its value lives in the config entry's
+# options rather than in ``localStorage``.  See ``region.py``.
+REGION_SWITCH_FILENAME: Final = "hoymiles-g2-region.js"
+# The language switch of the micro-inverter dashboards.  A separate control from
+# the region one on purpose: the language is a per-browser reading preference,
+# the region is a per-device fact.  The storage package injects its own
+# ``hoymiles-lang.js``, which is not present when only micro inverters are set up.
+LANG_SWITCH_FILENAME: Final = "hoymiles-g2-lang.js"
 FRONTEND_ASSETS: Final = (
     I18N_CARD_FILENAME,
+    # Both switches label themselves in the current card language, so they come
+    # right after i18n; the language one first, because the region switch places
+    # itself to the right of whatever language control it finds.
+    LANG_SWITCH_FILENAME,
+    REGION_SWITCH_FILENAME,
     CARD_FILENAME,
     SANKEY_CARD_FILENAME,
     POWER_FLOW_CARD_FILENAME,

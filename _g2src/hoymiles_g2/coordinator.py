@@ -14,11 +14,16 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import (
+    async_track_point_in_time,
+    async_track_time_interval,
+)
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
-from . import mqtt_util
+from . import mqtt_util, region
 from .const import (
+    AVAILABILITY_STARTUP_GRACE_SECONDS,
     AVAILABILITY_WATCHDOG_SECONDS,
     DOMAIN,
     EMS_MODE_ECHO_GUARD_SECONDS,
@@ -81,6 +86,32 @@ SUBSCRIPTIONS: tuple[tuple[str, str, int], ...] = (
 CAPABILITIES_TIMEOUT_SECONDS: Final = 3.0
 
 
+def _today_counter_of(payload: dict[str, Any]) -> float | None:
+    """Sum of the per-port 「今日」 energy counters in one ``device/state``.
+
+    The firmware reports today's yield per PV input (``pvs[].ed``, Wh) and has no
+    aggregate of its own, so the sum over whatever the payload contains is the
+    number ``system_pv_energy_today`` / ``pv<n>_energy_today`` / the plant gauge
+    are all built from.  ``None`` when the payload carries no usable entry, which
+    keeps "this build does not report it" out of the accounting below.
+    """
+    items = payload.get("pvs")
+    if not isinstance(items, list):
+        return None
+
+    total = 0.0
+    seen = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("ed")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        total += float(value)
+        seen = True
+    return total if seen else None
+
+
 class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Push-driven coordinator backed by MQTT subscriptions."""
 
@@ -103,6 +134,8 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ems_mode_command_time = 0.0
         self._unsubscribes: list[Any] = []
         self._last_seen: dict[str, float] = {}
+        # When setup finished, so the ``None`` verdict below can expire.
+        self._startup_time = time.monotonic()
         # None = no verdict yet.  Staying available until proven silent keeps a
         # Home Assistant restart from blanking out every entity instantly.
         self._available: bool | None = None
@@ -160,6 +193,178 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Cached product name.  ``None`` = not resolved yet, ``""`` = resolved to
         # nothing (so the registry is not scanned again on every access).
         self._model: str | None = None
+        # Local calendar day the device's 「今日」 counters were last known to
+        # describe.  ``None`` until this process watched the unit go silent.  See
+        # ``today_counters_stale``.
+        self._offline_day: dt_util.dt.date | None = None
+        # True once this process saw the device go silent and then come back on a
+        # later local calendar day.  While it is set, every 「今日」 counter this
+        # unit reports still describes the day it went offline, so the sensors
+        # answer ``0`` instead of last night's figure.
+        self._today_stale: bool = False
+        # The 「今日」 figure the device came back with.  It is the reference a
+        # genuine rollover is detected against: the counter has to fall *below*
+        # it before the verdict above can be cleared.
+        self._today_returned_value: float | None = None
+        # The counter as it stood just before the device went silent.  Comparing
+        # the figure it comes back with against this is what tells "kept
+        # yesterday's total" apart from "rolled over by itself while it was off
+        # the network" - the second case needs no correction at all.
+        self._today_offline_value: float | None = None
+        # The local day the verdict above was made on.  Reaching the *next* day
+        # with a live device means any rollover has to have happened by now, so
+        # the flag is released unconditionally - the only thing worse than a
+        # missed reset is one that never lets go.
+        self._today_stale_day: dt_util.dt.date | None = None
+        # The region this midnight timer was armed for, so a region change can
+        # re-arm it without comparing timestamps.  See ``_async_arm_day_timer``.
+        self._day_timer_zone: str | None = None
+        # The last region day the timer fired for, so the one-off fire after a
+        # restart on the same day does not stamp a verdict twice.
+        self._day_timer_day: dt_util.dt.date | None = None
+        # Cancel handle for the midnight timer, and the instant it was armed for
+        # (``None`` = not armed).  See ``_async_arm_day_timer``.
+        self._day_timer_unsub: Any = None
+        self._day_timer_fire_at: Any = None
+
+    # ------------------------------------------------------------------
+    # region (time zone)
+    # ------------------------------------------------------------------
+    @property
+    def region_tz(self) -> Any:
+        """The time zone the device's day is measured in, or ``None``.
+
+        ``None`` means "follow Home Assistant", which is what an entry with no
+        region option gets.  Read from the config entry on every access rather
+        than cached in ``__init__``: the toolbar switch and the options flow both
+        change it while the device is already set up, and a cached copy would
+        keep the old day until the next restart.
+        """
+        return region.tz_of(region.entry_of(self.hass, self.dev_id))
+
+    @property
+    def region_name(self) -> str:
+        """The configured region (``""`` = follow Home Assistant)."""
+        return region.zone_for_dev_id(self.hass, self.dev_id)
+
+    def _today_date(self) -> Any:
+        """Which calendar day it is at the device, not at the server."""
+        return region.today(self.region_tz)
+
+    @callback
+    def _async_arm_day_timer(self) -> None:
+        """(Re-)arm the timer that fires at the device's next local midnight.
+
+        The reconnect path can only notice a day change *after* the fact, and only
+        if the unit went offline.  A unit that stays reachable the whole time -
+        the normal case for a roof unit that never loses Wi-Fi - would keep
+        showing yesterday's 「今日发电」 until the firmware deigned to reset its
+        own counter, which on at least one SKU is many minutes after midnight.
+        Firing on the region's midnight is what the user asked for: 「根据时区的
+        零点主动清零」.
+
+        Re-armed on every region change, because the instant is a property of the
+        zone, and on every setup, because a restart in the middle of the day must
+        still catch tonight's midnight.
+        """
+        zone_name = self.region_name
+        if self._day_timer_unsub is not None:
+            same_zone = self._day_timer_zone == zone_name
+            if same_zone and self._day_timer_fire_at is not None:
+                return
+            self._day_timer_unsub()
+            self._day_timer_unsub = None
+        self._day_timer_zone = zone_name
+
+        fire_at = region.next_midnight(self.region_tz)
+        self._day_timer_fire_at = fire_at
+        self._day_timer_unsub = async_track_point_in_time(
+            self.hass, self._async_midnight_rollover, fire_at
+        )
+        _LOGGER.debug(
+            "Hoymiles %s: 今日 reset scheduled for %s (region %s)",
+            self.dev_id,
+            fire_at.isoformat(),
+            zone_name or "Home Assistant",
+        )
+
+    async def _async_midnight_rollover(self, _now: Any = None) -> None:
+        """Run at the device's local midnight: declare the old counters stale.
+
+        Marking rather than clearing is deliberate.  At 00:00 the unit is still
+        reporting last night's total, and it is the *sensor* that must read 0
+        until a smaller figure proves the firmware noticed.  Clearing here would
+        flash yesterday's total for as long as the firmware takes to reset.
+        """
+        self._day_timer_unsub = None
+        self._day_timer_fire_at = None
+        today = self._today_date()
+        if self._day_timer_day == today:
+            # Already stamped for this day - the restart-on-the-same-day case.
+            self._async_arm_day_timer()
+            return
+        self._day_timer_day = today
+
+        if self._inverter_with_today_counters():
+            value = _today_counter_of(self._today_counters_payload())
+            if value is not None and value > 0:
+                # The unit has not reset yet (this is the whole point of the
+                # timer), so hold the old figure rather than show it as today's.
+                self._today_stale = True
+                self._today_returned_value = value
+                self._today_stale_day = today
+                _LOGGER.info(
+                    "Hoymiles %s: local midnight reached (%s), its 今日 counters "
+                    "still read %.0f Wh; today's yield reads 0 until the device "
+                    "rolls over",
+                    self.dev_id,
+                    today.isoformat(),
+                    value,
+                )
+            else:
+                self._today_stale = False
+                self._today_stale_day = None
+                self._today_returned_value = None
+                _LOGGER.debug(
+                    "Hoymiles %s: local midnight reached (%s), counters already "
+                    "at zero",
+                    self.dev_id,
+                    today.isoformat(),
+                )
+        self._offline_day = None
+        self._today_offline_value = None
+
+        if self._available:
+            self.async_set_updated_data(dict(self.data))
+
+        self._async_arm_day_timer()
+
+    async def async_apply_region(self) -> None:
+        """Re-evaluate the day after the region option changed.
+
+        Called by ``hoymiles.set_region``.  The region itself needs no cache - the
+        properties read the config entry live - but two derived things do need a
+        nudge: the midnight timer was armed for the *old* zone, and a day that
+        has already turned over in the new zone must take effect now rather than
+        at the next report.
+        """
+        self._async_arm_day_timer()
+        today = self._today_date()
+        stale_day = self._today_stale_day
+        if stale_day is not None and today > stale_day:
+            # The verdict was made on a day the new zone has already left behind,
+            # so its reference value no longer constrains anything.
+            self._today_stale = False
+            self._today_returned_value = None
+            self._today_stale_day = None
+            _LOGGER.info(
+                "Hoymiles %s: region changed to %s, which already passed %s; "
+                "today's yield is live again",
+                self.dev_id,
+                self.region_name or "Home Assistant",
+                stale_day.isoformat(),
+            )
+        self.async_set_updated_data(dict(self.data))
 
     # ------------------------------------------------------------------
     # availability
@@ -317,6 +522,213 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.dev_id,
             self.session,
         )
+
+    # ------------------------------------------------------------------
+    # the device's own 「今日」 counters
+    # ------------------------------------------------------------------
+    @property
+    def today_counters_stale(self) -> bool:
+        """True while this unit's 「今日」 counters describe a *previous* day.
+
+        A micro inverter has no clock the integration can read - it keeps its own
+        date and rolls ``pvs[].ed`` over at *its* midnight - so a device that was
+        off the network across midnight comes back still reporting the day it
+        went offline.  Nothing in the protocol contradicts that figure: the
+        payload has the same shape, the numbers are plausible, and the only
+        evidence is that this process watched the unit go silent on one local
+        day and reappear on the next.
+
+        So the verdict is made once, at the reconnect (see
+        ``_async_publish_availability``), and stands until the device publishes a
+        counter that proves it noticed the new day - a figure *lower* than the one
+        it came back with, which is exactly what a rollover looks like.  Every
+        「今日」 sensor and the plant-wide aggregate consult this, which is what
+        makes 今日发电 appear to reset by itself instead of holding yesterday's
+        yield until the sun comes up.
+
+        Deliberately process-local: the flag describes one observed outage, and a
+        Home Assistant restart is treated as "no evidence" rather than as "assume
+        it happened", because a restart says nothing at all about the device.
+        """
+        return self._today_stale
+
+    @property
+    def today_counters_day(self) -> Any:
+        """The local day the offline stretch began on, or ``None``."""
+        return self._offline_day
+
+    @callback
+    def _async_mark_offline_day(self) -> None:
+        """Remember which local calendar day the device went silent on.
+
+        Recorded when the availability verdict flips to ``False``, which is the
+        only moment the integration can still say *when* the outage started - the
+        watchdog proves it after ``SOURCE_STALE_SECONDS``, long before any
+        consumer asks.  Comparing this against the day of the reconnect is what
+        identifies the one case the device's own 「今日」 counters cannot handle: an
+        outage that crossed midnight.
+
+        Kept if one is already recorded: a unit that flaps can flip the verdict
+        down more than once, and overwriting the earlier day with today's would
+        destroy the evidence that the outage started yesterday.
+        """
+        if self._offline_day is not None:
+            return
+        # The day *at the roof*: "crossed midnight while it was away" has to be
+        # judged against the device's own calendar, not the server's.  See
+        # ``region.py``.
+        self._offline_day = self._today_date()
+        # The counter as it stands now is the last figure from the day the unit
+        # was still reachable; it is what the reading at reconnect is compared
+        # against.  Recorded here rather than on every message because the
+        # handlers run again during the reconnect burst, which would overwrite
+        # the evidence with the very value it is meant to qualify.
+        self._today_offline_value = _today_counter_of(self._today_counters_payload())
+
+    @callback
+    def _async_note_online_day(self) -> None:
+        """Decide whether a returning device's 「今日」 counters are yesterday's.
+
+        A micro inverter has no clock this integration can read - it keeps its own
+        date and rolls ``pvs[].ed`` over at *its* midnight - so a unit that was off
+        the network across midnight comes back still reporting the day it went
+        offline.  Nothing in the payload contradicts that: the shape is identical,
+        the numbers are plausible, and the only evidence available is that this
+        process watched the unit fall silent on one local day and reappear on
+        another.
+
+        Called on every live message because that is when the verdict can be
+        *cleared* (the counter falling below the figure it came back with - see
+        ``_async_track_today``); setting it happens on the reconnect itself, in
+        ``_async_publish_availability``, where the outage is still visible.
+        """
+        if not self._today_stale:
+            return
+        self._async_track_today()
+
+    @callback
+    def _async_check_rollover(self) -> None:
+        """Flag the 「今日」 counters when the device returns after midnight."""
+        offline_day = self._offline_day
+        offline_value = self._today_offline_value
+        self._offline_day = None
+        self._today_offline_value = None
+        if offline_day is None:
+            return
+
+        today = self._today_date()
+        if today <= offline_day:
+            # Same day, or a clock that went backwards: the counters are still
+            # about today, so nothing is stale.
+            return
+        if not self._inverter_with_today_counters():
+            return
+
+        value = _today_counter_of(self._today_counters_payload())
+        if value is None or value <= 0:
+            # Nothing was produced before the outage, so there is no figure to
+            # suppress - and flagging it anyway would be unrecoverable: the only
+            # way out is a counter *below* the reference, and nothing is below 0.
+            return
+        if offline_value is not None and value < offline_value:
+            # The unit was reachable up to some figure, went quiet across
+            # midnight, and came back reporting *less*: it rolled its own
+            # counter over without any help.  Zeroing a correct reading would be
+            # exactly the bug this whole mechanism exists to avoid.
+            _LOGGER.debug(
+                "Hoymiles %s was offline across midnight but rolled its 今日 "
+                "counters over by itself (%.0f -> %.0f Wh)",
+                self.dev_id,
+                offline_value,
+                value,
+            )
+            return
+
+        self._today_stale = True
+        self._today_returned_value = value
+        self._today_stale_day = today
+        _LOGGER.info(
+            "Hoymiles %s was offline across midnight (%s -> %s); its 今日 counters "
+            "still describe %s (%.0f Wh) and will read 0 until the device rolls "
+            "them over",
+            self.dev_id,
+            offline_day.isoformat(),
+            today.isoformat(),
+            offline_day.isoformat(),
+            value,
+        )
+
+    @callback
+    def _inverter_with_today_counters(self) -> bool:
+        """True when today's yield comes from the per-port ``pvs[].ed`` counters.
+
+        A storage unit answers today's yield from ``system/state`` (``pv_e``),
+        which the firmware rolls over itself and which this integration has no
+        reason to second-guess.  Gating on the payload - the per-port counter
+        present *and* ``pv_e`` absent - rather than on the model mirrors exactly
+        the precedence ``s_or_pv`` applies, so the verdict can only ever apply to
+        the figure the sensors are actually reading.
+        """
+        system = self.data.get(SRC_SYSTEM)
+        if isinstance(system, dict) and system.get("pv_e") is not None:
+            return False
+        return _today_counter_of(self._today_counters_payload()) is not None
+
+    def _today_counters_payload(self) -> dict[str, Any]:
+        """The ``device/state`` payload the per-port counters live in."""
+        payload = self.data.get(SRC_DEVICE)
+        return payload if isinstance(payload, dict) else {}
+
+    @callback
+    def _async_track_today(self) -> None:
+        """Clear the stale verdict once the device proves it noticed the new day.
+
+        The only evidence available is the counter itself: a unit that has just
+        rolled over reports a *smaller* 「今日」 figure than the one it came back
+        with, because it went from "yesterday, complete" to "today, a few minutes
+        in".  Watching for exactly that (and nothing else) means a unit that keeps
+        repeating yesterday's number is never silently treated as fresh, while a
+        unit that genuinely reset is believed immediately - without waiting for
+        the integration to guess a time.
+        """
+        if not self._today_stale:
+            return
+
+        # Safety valve: a unit that stays reachable past the day the verdict was
+        # made must have rolled over somewhere in between, whatever its counter
+        # says.  Without this, a firmware that never resets ``pvs[].ed`` (or a
+        # counter that happens to sit exactly at its old value) would pin 今日发电
+        # to 0 for good.
+        stale_day = self._today_stale_day
+        today = self._today_date()
+        if stale_day is not None and today > stale_day:
+            self._today_stale = False
+            self._today_stale_day = None
+            self._today_returned_value = None
+            _LOGGER.info(
+                "Hoymiles %s stayed online past %s, so its 今日 counters are "
+                "assumed rolled over; today's yield is live again",
+                self.dev_id,
+                stale_day.isoformat(),
+            )
+            return
+
+        value = _today_counter_of(self._today_counters_payload())
+        if value is None:
+            return
+
+        returned = self._today_returned_value
+        if returned is None or value < returned:
+            self._today_stale = False
+            self._today_stale_day = None
+            self._today_returned_value = None
+            _LOGGER.info(
+                "Hoymiles %s rolled its 今日 counters over to %s (%.0f Wh); "
+                "today's yield is live again",
+                self.dev_id,
+                today.isoformat(),
+                value,
+            )
 
     @property
     def pv_count(self) -> int:
@@ -598,11 +1010,23 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Mark the coordinator as healthy so CoordinatorEntity is available.
         self.async_set_updated_data(dict(self.data))
 
+        # 「今日发电」 must drop to zero at the *device's* midnight, not whenever
+        # the firmware happens to report a reset - see ``_async_arm_day_timer``.
+        self._async_arm_day_timer()
+
     async def async_shutdown(self) -> None:
         """Cancel all subscriptions and leave a usable retained state."""
         for unsub in self._unsubscribes:
             unsub()
         self._unsubscribes.clear()
+
+        # The midnight timer lives outside ``_unsubscribes`` because it is
+        # re-armed on every region change; without this it would keep a dead
+        # coordinator alive until midnight and then fire into a removed entry.
+        if self._day_timer_unsub is not None:
+            self._day_timer_unsub()
+            self._day_timer_unsub = None
+            self._day_timer_fire_at = None
 
         # The patched discovery payloads keep pointing at our availability topic
         # even after this entry is gone.  Publishing "online" while the device was
@@ -679,7 +1103,7 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if unknown:
             _LOGGER.warning(
                 "Phase output power: %s had no known value yet and defaults to %s W. "
-                "Set all three phases, or use hoymiles_g2.set_phase_output_power, for "
+                "Set all three phases, or use hoymiles.set_phase_output_power, for "
                 "full control.",
                 ", ".join(unknown),
                 PHASE_POWER_MIN,
@@ -762,10 +1186,16 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if last_seen is not None and (now - last_seen) <= window:
                 return True
 
-        # Never seen anything at all: leave the retained value alone instead of
-        # declaring a healthy device offline right after Home Assistant started.
+        # Never seen anything at all: leave the retained value alone for a while
+        # instead of declaring a healthy device offline right after Home
+        # Assistant started - the subscriptions are not even live yet.  The
+        # grace period is what keeps that from becoming permanent: a device that
+        # was already unplugged when Home Assistant started never publishes
+        # anything, so without it the stale retained ``online`` would stand.
         if not self._last_seen:
-            return None
+            if (now - self._startup_time) <= AVAILABILITY_STARTUP_GRACE_SECONDS:
+                return None
+            return False
 
         return False
 
@@ -784,6 +1214,10 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._declared.clear()
             self._live_seen = False
             self._inventory_live = False
+            # Remember *when* it fell silent: comparing this day against the day
+            # it comes back is the only way to know its 「今日」 counters crossed a
+            # midnight while it was away.  See ``today_counters_stale``.
+            self._async_mark_offline_day()
 
         # A transition from a PROVEN-offline state back to available is a
         # reconnect: the device is about to re-publish its whole topic set, so
@@ -801,6 +1235,17 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.dev_id,
                 self.session,
             )
+
+        # Coming back after the local date rolled over is the one case where the
+        # device's own 「今日」 counters are provably wrong: an offline unit keeps
+        # the day it went silent in memory and republishes that day's figure on
+        # its first message after the reconnect, so 今日发电 would show
+        # yesterday's yield all morning.  Flagging it here (and clearing the flag
+        # in ``_async_track_today`` the moment a fresh counter arrives) is what
+        # lets ``today_counters_stale`` say "this number is yesterday's" to every
+        # consumer, including the plant-wide aggregate on the System tab.
+        if available and was_available is False:
+            self._async_check_rollover()
 
         try:
             await mqtt_util.async_publish(
@@ -853,6 +1298,12 @@ class HoymilesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data[key] = payload
             self.async_set_updated_data(data)
 
+            # 「今日」 accounting.  A live message is also the only clock this
+            # integration can read on the device's behalf: a counter that drops
+            # below the figure the unit came back with proves it rolled over by
+            # itself, and that is what clears the stale verdict.
+            if live:
+                self._async_note_online_day()
             # A fresh message can only ever flip the verdict to available; the
             # watchdog is responsible for the opposite direction.
             if key in SOURCE_STALE_SECONDS and self._available is not True:

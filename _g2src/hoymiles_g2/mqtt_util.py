@@ -106,12 +106,23 @@ async def async_wait_for_message(
 
 
 async def async_discover_dev_ids(
-    hass: HomeAssistant, *, timeout: float = 3.0
+    hass: HomeAssistant, *, timeout: float = 5.0
 ) -> list[str]:
-    """Collect device ids from retained discovery topics.
+    """Collect device ids that are alive on the broker right now.
 
-    The firmware publishes ``homeassistant/switch/<dev_id>/config`` on connect,
-    so simply subscribing for a few seconds surfaces every reachable device.
+    Two subscriptions are needed, and the second one is what makes this honest:
+
+    * ``homeassistant/switch/<dev_id>/config`` is the discovery config.  It is
+      **retained**, so the broker keeps it forever - a device that has been
+      unplugged for weeks still shows up here.  It therefore only provides
+      *candidates*.
+    * ``homeassistant/sensor/<dev_id>/quick/state`` is pushed once a second and
+      is **not** retained.  Receiving one proves the device is talking to the
+      broker right now, so that is what a candidate has to do to be returned.
+
+    A device is thus only offered while its per-second stream is running; once
+    it stops, the candidate list goes back to the retained configs and the dead
+    device drops out.
 
     ``<dev_id>`` is ``"<client_prefix>-<SN>"``.  The prefix is a **user
     setting** - it is the MQTT client prefix and may be renamed to anything - so
@@ -128,31 +139,58 @@ async def async_discover_dev_ids(
     if mqtt is None:  # pragma: no cover
         return []
 
-    from .const import KNOWN_PIDS, T_DISCOVERY, serial_pid  # noqa: PLC0415
+    from .const import (  # noqa: PLC0415
+        KNOWN_PIDS,
+        T_DISCOVERY,
+        T_QUICK_WILDCARD,
+        serial_pid,
+    )
 
-    found: set[str] = set()
+    candidates: set[str] = set()
+    alive: set[str] = set()
 
-    def _message_received(msg: Any) -> None:
-        parts = str(msg.topic).split("/")
+    def _recognise(dev_id: str, topic_str: str) -> bool:
+        pid = serial_pid(dev_id)
+        if pid is None or pid not in KNOWN_PIDS:
+            _LOGGER.debug(
+                "Skipping %s: product id %r not recognised", topic_str, pid
+            )
+            return False
+        return True
+
+    def _on_config(msg: Any) -> None:
         # ``homeassistant/<component>/<dev_id>/config`` -> parts[2] is the id.
         # Deeper discovery topics (``.../<dev_id>/soc/config``) still carry the
         # same id in parts[2], and a wildcard the firmware did not expand would
         # be rejected by the PID check below.
+        parts = str(msg.topic).split("/")
         if len(parts) < 4 or not parts[2]:
             return
-        pid = serial_pid(parts[2])
-        if pid is None or pid not in KNOWN_PIDS:
-            _LOGGER.debug("Skipping %s: product id %r not recognised", msg.topic, pid)
-            return
-        found.add(parts[2])
+        if _recognise(parts[2], msg.topic):
+            candidates.add(parts[2])
 
-    unsub = await mqtt.async_subscribe(hass, T_DISCOVERY, _message_received, 1)
+    def _on_quick(msg: Any) -> None:
+        # ``homeassistant/sensor/<dev_id>/quick/state`` -> parts[2] is the id.
+        parts = str(msg.topic).split("/")
+        if len(parts) >= 4 and parts[2] and parts[3] == "quick":
+            alive.add(parts[2])
+
+    unsub_config = await mqtt.async_subscribe(hass, T_DISCOVERY, _on_config, 1)
+    unsub_quick = await mqtt.async_subscribe(hass, T_QUICK_WILDCARD, _on_quick, 0)
     try:
         await asyncio.sleep(timeout)
     finally:
-        unsub()
+        unsub_config()
+        unsub_quick()
 
-    return sorted(found)
+    if not alive:
+        _LOGGER.debug(
+            "Discovered %d device id(s) on retained configs but none is sending "
+            "quick/state right now",
+            len(candidates),
+        )
+
+    return sorted(alive)
 
 
 __all__ = [

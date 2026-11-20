@@ -379,16 +379,82 @@ function _hmHistoryRegister() {
     return String(value).padStart(2, "0");
   }
 
+  /**
+   * The time zone every time in this card is expressed in.
+   *
+   * `""` means "the browser's", which is what Home Assistant's own history does
+   * and what this card did before the region switch existed.  When a region is
+   * chosen (toolbar dropdown, or the options flow) the day boundaries, the axis
+   * labels and the tooltips all move to it, so 「今日」 on this chart starts at
+   * the *device's* midnight rather than the reader's.
+   */
+  function regionZone() {
+    const api = window.HoymilesG2Region;
+    return api && typeof api.zone === "function" ? api.zone() : "";
+  }
+
   function startOfDay(date) {
+    const api = window.HoymilesG2Region;
+    if (api && typeof api.startOfDayIn === "function") {
+      return api.startOfDayIn(date, api.zone());
+    }
     const d = new Date(date);
     d.setHours(0, 0, 0, 0);
     return d;
   }
 
   function endOfDay(date) {
+    const api = window.HoymilesG2Region;
+    if (api && typeof api.endOfDayIn === "function") {
+      return api.endOfDayIn(date, api.zone());
+    }
     const d = new Date(date);
     d.setHours(23, 59, 59, 999);
     return d;
+  }
+
+  /**
+   * `HH:MM` of one instant, in the chosen region.
+   *
+   * Replaces the direct `d.getHours()` calls: those answer for the browser, which
+   * is precisely the mismatch the region switch exists to fix.
+   */
+  function hhmm(ms) {
+    const api = window.HoymilesG2Region;
+    if (api && typeof api.timeLabel === "function") return api.timeLabel(ms, api.zone());
+    const d = new Date(ms);
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  }
+
+  /** The year/month/day/weekday of one instant, in the chosen region. */
+  function partsOf(ms) {
+    const api = window.HoymilesG2Region;
+    if (api && typeof api.partsIn === "function") return api.partsIn(ms, api.zone());
+    const d = new Date(ms);
+    return {
+      year: d.getFullYear(),
+      month: d.getMonth() + 1,
+      day: d.getDate(),
+      hour: d.getHours(),
+      minute: d.getMinutes(),
+      second: d.getSeconds(),
+      weekday: d.getDay(),
+    };
+  }
+
+  /** The first instant of a region-local calendar date. */
+  function regionDate(year, month, day) {
+    const api = window.HoymilesG2Region;
+    if (!api || typeof api.startOfDayIn !== "function") {
+      return new Date(year, month, day);
+    }
+    /* "Midnight of that date, pretended to be UTC" is a guess; correcting it by
+       the region's offset at the guess is the standard two-pass fix, the second
+       pass being needed because the offset itself can change on that night. */
+    const naive = Date.UTC(year, month, day);
+    const once = new Date(naive - api.offsetIn(new Date(naive), api.zone()));
+    const twice = new Date(naive - api.offsetIn(once, api.zone()));
+    return twice;
   }
 
   /** Width of bucket `i`, in milliseconds - the width of its bar.
@@ -514,6 +580,16 @@ function _hmHistoryRegister() {
       this._joinSync();
       this._watchWidth();
       this._startAutoRefresh();
+      /* A region change moves every day boundary, so the window, the labels and
+         the totals all have to be recomputed - not just redrawn. */
+      const api = window.HoymilesG2Region;
+      if (api && typeof api.watch === "function") {
+        this._unwatchRegion = api.watch(() => {
+          /* The anchor is an instant; keep it, but rebuild everything derived
+             from which calendar day that instant is on. */
+          this._reload();
+        });
+      }
     }
 
     disconnectedCallback() {
@@ -521,6 +597,7 @@ function _hmHistoryRegister() {
       super.disconnectedCallback();
       this._leaveSync();
       this._stopAutoRefresh();
+      if (this._unwatchRegion) { this._unwatchRegion(); this._unwatchRegion = null; }
       if (this._ro) { this._ro.disconnect(); this._ro = null; }
     }
 
@@ -845,14 +922,19 @@ function _hmHistoryRegister() {
 
     _window() {
       const a = this._anchor;
+      /* The anchor is a browser-local `Date`, but the calendar it is being read
+         against is the chosen region's - so the year/month/day come from the
+         region, not from `getFullYear()`/`getMonth()`. */
+      const p = partsOf(a);
       let start;
       let end;
       if (this._range === "month") {
-        start = startOfDay(new Date(a.getFullYear(), a.getMonth(), 1));
-        end = endOfDay(new Date(a.getFullYear(), a.getMonth() + 1, 0));
+        start = regionDate(p.year, p.month - 1, 1);
+        /* Day 0 of the next month = last day of this one. */
+        end = endOfDay(regionDate(p.year, p.month, 0));
       } else if (this._range === "year") {
-        start = startOfDay(new Date(a.getFullYear(), 0, 1));
-        end = endOfDay(new Date(a.getFullYear(), 11, 31));
+        start = regionDate(p.year, 0, 1);
+        end = endOfDay(regionDate(p.year, 11, 31));
       } else {
         start = startOfDay(a);
         end = endOfDay(a);
@@ -945,8 +1027,21 @@ function _hmHistoryRegister() {
       /* A bar is one *slot* of the window - one day of a month, one month of a
          year - so the buckets have to be that wide. Asking for hourly means of
          a month and then adding them up would also have been possible, but a
-         daily bucket is one recorder row instead of twenty-four. */
-      if (this._barMode()) return this._range === "year" ? ["month"] : ["day"];
+         daily bucket is one recorder row instead of twenty-four.
+
+         The list is a *fallback chain* rather than a single answer.  A newly
+         created total_increasing sensor does not have long-term statistics for
+         hours or days until the recorder has compiled them, so a card pointed
+         at one asked for `day` rows, got none, and drew "no statistics" even
+         though 5 minute rows existed for every bucket.  The finer periods are
+         only used when the coarse one is empty, and what they return is folded
+         back onto the slot grid by `_coarsen()` - the drawing stays one bar per
+         day either way. */
+      if (this._barMode()) {
+        return this._range === "year"
+          ? ["month", "day", "hour"]
+          : ["day", "hour", "5minute"];
+      }
       if (this._range === "month") return ["hour"];
       if (this._range === "year") return ["day"];
       // A day is best rendered from 5 minute statistics, but those are only
@@ -955,11 +1050,107 @@ function _hmHistoryRegister() {
       return ["5minute", "hour"];
     }
 
+    /**
+     * The bucket width the *drawing* wants, i.e. the first period of the chain.
+     *
+     * Used to decide whether rows that came back from a fallback period still
+     * have to be folded onto the slot grid before they are drawn.
+     */
+    _slotPeriod() {
+      return this._periods()[0];
+    }
+
+    /**
+     * Fold finer statistics onto the drawing's slot width.
+     *
+     * The recorder only compiles long-term statistics once it has had the data
+     * for a while: a `total_increasing` sensor created this morning has 5 minute
+     * rows for every bucket and no `day` row at all until the nightly compile
+     * runs.  The chart asked for `day`, got nothing, and printed 「统计数据不可用」
+     * over data that was sitting right there.
+     *
+     * So the query walks down to a finer period when the coarse one is empty,
+     * and this puts the answer back on the grid the card wants to draw.  The
+     * aggregation rules are the ones statistics already follow per row:
+     *
+     * * `change` is **summed** - one day's energy is the sum of its hours;
+     * * `state` keeps the **last** non-null value of the slot, because it is the
+     *   meter reading at the end of it;
+     * * `mean` is averaged over the rows that carried one (only measured
+     *   quantities have it, and a plain average is what the recorder itself does
+     *   for a coarser bucket).
+     *
+     * `sum` is dropped on purpose: it is the lifetime running total, and `_build`
+     * never reads it.
+     */
+    _coarsen(rows) {
+      const period = this._slotPeriod();
+      const bucketMs = PERIOD_MS[period] || 0;
+      if (!rows || !(bucketMs > 0)) return rows;
+
+      /* Aligned to the region's calendar, so a "day" bucket starts at regional
+         midnight and lines up with `_bucketGrid()` whether the browser and the
+         recorder agree on the zone or not.  A month slot is aligned to the 1st. */
+      const keyOf = (ms) => {
+        const p = partsOf(new Date(ms));
+        const start = period === "month"
+          ? regionDate(p.year, p.month - 1, 1)
+          : regionDate(p.year, p.month - 1, p.day);
+        return start.getTime();
+      };
+
+      const out = {};
+      for (const [id, list] of Object.entries(rows)) {
+        if (!Array.isArray(list)) { out[id] = list; continue; }
+        const slots = new Map();
+        for (const row of list) {
+          const t = num(row.start);
+          if (!Number.isFinite(t)) continue;
+          const key = keyOf(t);
+          let slot = slots.get(key);
+          if (!slot) {
+            slot = { start: key, end: num(row.end) || t + bucketMs, mean: null, state: null, change: null, n: 0 };
+            slots.set(key, slot);
+          }
+          if (row.change != null) slot.change = (slot.change || 0) + num(row.change);
+          if (row.state != null) slot.state = num(row.state);
+          if (row.mean != null) {
+            slot.mean = slot.mean == null ? num(row.mean) : slot.mean + num(row.mean);
+            slot.n += 1;
+          }
+          const end = num(row.end);
+          if (Number.isFinite(end) && end > slot.end) slot.end = end;
+        }
+        out[id] = [...slots.values()]
+          .sort((a, b) => a.start - b.start)
+          .map((slot) => ({
+            start: slot.start,
+            end: slot.end,
+            mean: slot.mean == null ? null : slot.mean / slot.n,
+            state: slot.state,
+            change: slot.change,
+          }));
+      }
+      return out;
+    }
+
     _shiftRange(step) {
-      const a = new Date(this._anchor);
-      if (this._range === "month") a.setMonth(a.getMonth() + step);
-      else if (this._range === "year") a.setFullYear(a.getFullYear() + step);
-      else a.setDate(a.getDate() + step);
+      /* Stepping is calendar arithmetic *in the region*: "yesterday" means the
+         previous regional day, not "24 hours earlier" (which lands on the same
+         date across a daylight-saving change). */
+      const p = partsOf(this._anchor);
+      let a;
+      if (this._range === "month") {
+        a = regionDate(p.year, p.month - 1 + step, 1);
+      } else if (this._range === "year") {
+        a = regionDate(p.year + step, 0, 1);
+      } else {
+        /* Noon keeps away from midnight, so a single-day step can never land on
+           the ambiguous hour of a clock change. */
+        const noon = regionDate(p.year, p.month - 1, p.day).getTime() + 12 * 3600 * 1000;
+        const next = partsOf(noon);
+        a = regionDate(next.year, next.month - 1, next.day + step);
+      }
       /* No clamp against ``since`` here.  An opt-in card used to refuse to step
          back past the moment it was enabled, which made it disagree with every
          other card of its `sync_group`: the group relayed "yesterday" and this
@@ -981,13 +1172,13 @@ function _hmHistoryRegister() {
       let a = null;
       if (this._range === "year") {
         const year = parseInt(value, 10);
-        if (Number.isFinite(year)) a = new Date(year, 0, 1);
+        if (Number.isFinite(year)) a = regionDate(year, 0, 1);
       } else if (this._range === "month" && /^\d{4}-\d{2}$/.test(value)) {
         const [y, m] = value.split("-").map(Number);
-        a = new Date(y, m - 1, 1);
+        a = regionDate(y, m - 1, 1);
       } else if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
         const [y, m, d] = value.split("-").map(Number);
-        a = new Date(y, m - 1, d);
+        a = regionDate(y, m - 1, d);
       }
       if (!a || Number.isNaN(a.getTime())) return;
       this._anchor = a;
@@ -1109,10 +1300,13 @@ function _hmHistoryRegister() {
     }
 
     _anchorValue() {
-      const a = this._anchor;
-      if (this._range === "year") return String(a.getFullYear());
-      if (this._range === "month") return `${a.getFullYear()}-${pad2(a.getMonth() + 1)}`;
-      return `${a.getFullYear()}-${pad2(a.getMonth() + 1)}-${pad2(a.getDate())}`;
+      /* The `<input type="date">` value has to read the anchor in the region's
+         calendar, otherwise picking "2026-11-20" in a region one offset away
+         would show up as the 19th in the field that was just used to set it. */
+      const a = partsOf(this._anchor);
+      if (this._range === "year") return String(a.year);
+      if (this._range === "month") return `${a.year}-${pad2(a.month)}`;
+      return `${a.year}-${pad2(a.month)}-${pad2(a.day)}`;
     }
 
     async _fetch() {
@@ -1164,7 +1358,22 @@ function _hmHistoryRegister() {
           if (Array.isArray(first) && first.length > 0) break;
         }
 
-        this._data = this._build(rows || {}, period);
+        /* The rows may have come back from a fallback period - a sensor whose
+           daily statistics the recorder has not compiled yet still answers with
+           hourly and 5 minute ones.  Fold them onto the grid the drawing wants
+           before building the layers, or a month would be plotted as hundreds of
+           bars a few pixels wide.
+           Only when the fallback is *finer* than the slot: the day range walks
+           the other way (`5minute` -> `hour`), and those rows are drawn as they
+           are with a wider bucket. */
+        const drawPeriod = this._slotPeriod();
+        let buildPeriod = period;
+        if ((PERIOD_MS[period] || 0) < (PERIOD_MS[drawPeriod] || 0)) {
+          rows = this._coarsen(rows);
+          buildPeriod = drawPeriod;
+        }
+
+        this._data = this._build(rows || {}, buildPeriod);
         /* A new window is drawn grown-out instead of snapped-in, so opening a
            card reads as the day filling up rather than as a diagram that was
            simply always there.  Only a *new* window: re-querying the same open
@@ -1203,11 +1412,15 @@ function _hmHistoryRegister() {
       const id = series[0] && series[0].entity;
       if (!id || !this._hass || typeof this._hass.callWS !== "function") return;
       const now = new Date();
-      const monthStart = startOfDay(new Date(now.getFullYear(), now.getMonth(), 1));
-      const yearStart = startOfDay(new Date(now.getFullYear(), 0, 1));
+      /* "This month" and "this year" are the *region's* months and years, so the
+         growth read out of the lifetime counter matches the 「今日」 / 「本月」 tiles
+         the device itself computes against its own midnight. */
+      const p = partsOf(now);
+      const monthStart = regionDate(p.year, p.month - 1, 1);
+      const yearStart = regionDate(p.year, 0, 1);
       /* The lifetime window starts at the epoch: the recorder simply returns
          whatever it has, which is the whole history of the counter. */
-      const epoch = new Date(2000, 0, 1);
+      const epoch = regionDate(2000, 0, 1);
       const token = ++this._totalToken;
       /* `change` is additive across buckets, so the granularity is free to
          follow the length of the window rather than being fixed: a day of
@@ -1229,11 +1442,26 @@ function _hmHistoryRegister() {
         for (const row of rows) total += num(row.change);
         return total;
       };
+      /* Same fallback as the chart itself, and for the same reason: a recently
+         created counter has no `day` or `month` aggregates until the recorder
+         compiles them, so the coarse sum comes back as 0 while the finer periods
+         already hold everything.  Tried only when the coarse answer was empty -
+         a genuine 0 is left alone, and the extra queries cost nothing on the
+         common path. */
+      const sumWithFallback = async (from, to, coarse, fine) => {
+        const first = await sum(from, to, coarse);
+        if (first > 0) return first;
+        const second = await sum(from, to, fine);
+        return second > 0 ? second : first;
+      };
       try {
         const [month, year, life] = await Promise.all([
-          sum(monthStart, now, "day"),
-          sum(yearStart, now, "month"),
-          sum(epoch, now, "month"),
+          sumWithFallback(monthStart, now, "day", "hour"),
+          sumWithFallback(yearStart, now, "month", "day"),
+          /* The lifetime window is a quarter of a century wide, so its fallback
+             steps to weeks rather than days: the sum is the same number, but a
+             few hundred rows instead of a few thousand on every repaint. */
+          sumWithFallback(epoch, now, "month", "week"),
         ]);
         if (token !== this._totalToken) return;
         this._totals = {
@@ -1535,19 +1763,23 @@ function _hmHistoryRegister() {
       const { start } = this._window();
       if (this._range === "day") return [];
       const slots = [];
+      /* The slots are the region's calendar dates, not the browser's: read the
+         year and month out of the window in the region, then build each slot
+         through `regionDate` so a bar sits exactly on regional midnight. */
+      const p = partsOf(start);
       if (this._range === "year") {
         for (let month = 0; month < 12; month += 1) {
-          slots.push(new Date(start.getFullYear(), month, 1).getTime());
+          slots.push(regionDate(p.year, month, 1).getTime());
         }
         return slots;
       }
-      const year = start.getFullYear();
-      const month = start.getMonth();
+      const year = p.year;
+      const month = p.month - 1;
       // Day 0 of the next month is the last day of this one, so February and a
       // leap year need no special case.
-      const last = new Date(year, month + 1, 0).getDate();
+      const last = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
       for (let day = 1; day <= last; day += 1) {
-        slots.push(new Date(year, month, day).getTime());
+        slots.push(regionDate(year, month, day).getTime());
       }
       return slots;
     }
@@ -1960,7 +2192,15 @@ function _hmHistoryRegister() {
           for (let i = 0; i < times.length; i += 1) {
             if (Math.abs(top[i] - base[i]) > 1e-9) { flat = false; break; }
           }
-          if (flat) continue;
+          /* A series that never leaves its base - every bucket zero, or a band
+             stacked on a sibling that happened to equal it - is skipped as a
+             filled *area* but never as a *line*.  Dropping it entirely made a
+             channel that honestly read 0 W look exactly like one the card had
+             failed to load, which is the misleading case the user reported: the
+             legend still lists the series, so a missing curve reads as a broken
+             chart rather than as "measured, and it was zero".  A flat series
+             therefore still strokes its top edge below, which lands on the zero
+             line as a thin line in the series colour. */
           /* The top edge is smoothed, the base stays straight: the base is the
              zero line or the band of the series below, and smoothing it would
              let one curve bleed into the next. `smoothPath()` is monotone, so a
@@ -2004,7 +2244,11 @@ function _hmHistoryRegister() {
           const d = `${smoothPath(topPts)}`
             + basePts.map(([bx, by]) => `L${bx.toFixed(1)} ${by.toFixed(1)}`).join("")
             + "Z";
-          areas += `<path d="${d}" fill="${esc(color)}" fill-opacity="${fillOp}" stroke="none"/>`;
+          /* A flat series has no area to fill - the band has zero height - so
+             only the edge is emitted, which is the whole point of keeping it. */
+          if (!flat) {
+            areas += `<path d="${d}" fill="${esc(color)}" fill-opacity="${fillOp}" stroke="none"/>`;
+          }
           // the visible edge of the band
           areas += `<path d="${smoothPath(topPts)}" fill="none" stroke="${esc(color)}"`
             + ` stroke-width="${strokeW}" stroke-opacity="${strokeOp}"`
@@ -2141,19 +2385,21 @@ function _hmHistoryRegister() {
         while (step > minute && spanMs / step <= maxLabels - 1) step /= 2;
       }
 
-      /* Align the first tick to a round boundary at that step, in *local* time.
-         For a month / year step this lands on midnight of the day, which is what
-         makes "1/5" sit under a real day rather than a fractional one. */
+      /* Align the first tick to a round boundary at that step, in the *chosen
+         region's* wall clock.  For a month / year step this lands on midnight of
+         the day, which is what makes "1/5" sit under a real day rather than a
+         fractional one. */
       const align = (ms) => {
-        const d = new Date(ms);
-        d.setSeconds(0, 0);
+        const p = partsOf(ms);
         if (step >= day) {
-          d.setHours(0, 0, 0, 0);
-        } else {
-          const stepMin = Math.max(1, Math.round(step / minute));
-          d.setMinutes(Math.floor(d.getMinutes() / stepMin) * stepMin, 0, 0);
+          return startOfDay(new Date(ms)).getTime();
         }
-        return d.getTime();
+        const stepMin = Math.max(1, Math.round(step / minute));
+        const minuteOfDay = p.hour * 60 + p.minute;
+        const snapped = Math.floor(minuteOfDay / stepMin) * stepMin;
+        /* Rebuild the instant from the region's own wall clock, so "08:30" is
+           08:30 where the device is, not where the browser is. */
+        return regionDate(p.year, p.month - 1, p.day).getTime() + snapped * minute;
       };
 
       const seen = new Set();
@@ -2184,20 +2430,20 @@ function _hmHistoryRegister() {
 
     /** Axis label for a timestamp, in the resolution the range calls for. */
     _label(ms) {
-      const d = new Date(num(ms));
+      const d = partsOf(ms);
       if (this._range === "year") {
         // A month number is all that fits under a 12-month axis; the tooltip
         // carries the full date.
-        return String(d.getMonth() + 1);
+        return String(d.month);
       }
       if (this._range === "month") {
         /* Just the day of the month.  "11/3" under every bar repeated the
            month 31 times and squeezed the number that actually differs into
            half the width; the month is already in the toolbar's date field and
            in the tooltip, so the axis only has to say which day it is. */
-        return String(d.getDate());
+        return String(d.day);
       }
-      return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+      return `${pad2(d.hour)}:${pad2(d.minute)}`;
     }
 
     /* ------------------------------ zoom ------------------------------ */
@@ -2500,12 +2746,14 @@ function _hmHistoryRegister() {
       // In the bar modes the guide line belongs on the centre of the column, not
       // on the boundary where the bucket happens to start.
       const x = markX ? markX(i) : toX(i);
-      const when = new Date(num(data.times[i]));
+      /* The tooltip stamp is the one place a reader compares this card against
+         the device's own app, so it is formatted in the region too. */
+      const when = partsOf(data.times[i]);
       const stamp = this._range === "day"
-        ? `${pad2(when.getHours())}:${pad2(when.getMinutes())}`
+        ? `${pad2(when.hour)}:${pad2(when.minute)}`
         : this._range === "month"
-          ? `${when.getMonth() + 1}/${when.getDate()}`
-          : `${when.getFullYear()}-${pad2(when.getMonth() + 1)}-${pad2(when.getDate())}`;
+          ? `${when.month}/${when.day}`
+          : `${when.year}-${pad2(when.month)}-${pad2(when.day)}`;
 
       const display = pickUnit(this._config.unit, data.max);
       const dec = Math.min((axDecimals || 0) + 1, 2);
