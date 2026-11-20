@@ -37,22 +37,24 @@ that mirror the layout of the Hoymiles app.
 - **Eight bundled Lovelace cards**, registered as frontend modules automatically, so
   there is no manual "add resource" step. All of them are self-drawn SVG with
   **no CDN and no third-party card** — they work offline.
-- **A sidebar panel, one per device.** Adding the integration puts an entry named after
-  your `dev_id` in the sidebar. It is a ready-made dashboard — live power flow, today's
-  energy, power history, energy sankey, battery & pack detail, and the full control /
-  TOU page — so nothing has to be assembled by hand. It composes the same eight cards;
-  see [The sidebar panel](#the-sidebar-panel).
-- **Follows the UI language.** All eight cards use the language of the Home Assistant
-  user viewing them (`hass.language`), so one dashboard reads correctly for an
-  English and a Chinese user at the same time. Text **you** write can follow too -
-  give `title` / `name` / `label` a map (`{en: History, zh: 历史数据}`) instead of a
-  string. See [docs/CARDS.md](docs/CARDS.md#making-your-own-text-follow-the-language-too).
-  Pin a card with `language: en` / `language: zh` only when you need to.
+- **Trilingual, and the reader decides.** English, Simplified Chinese and German, with
+  one language switch in the Home Assistant toolbar - left of the add / search /
+  assist / edit buttons, so it is on every view of every dashboard. Picking one
+  switches **every** card on the page at once and is remembered in the browser, so a
+  shared wall panel keeps its language without touching the Home Assistant profile.
+  **English is the default** - a card deliberately does not follow the UI language any
+  more. Text **you** write can follow too - give `title` / `name` / `label` a map
+  (`{en: History, zh: 历史数据, de: Verlauf}`) instead of a string. See
+  [docs/CARDS.md](docs/CARDS.md#making-your-own-text-follow-the-language-too).
+  Pin a single card with `language: en` / `language: zh` / `language: de` when you need
+  to.
 
 > Home Assistant's own text - the `markdown` card and the **view/tab titles** - has no
-> per-user language, so it cannot follow along. Write those bilingually
-> (`System status / 系统状态`) or keep them language-neutral. Also note that a view with
-> an `icon` shows **only the icon** unless you set `show_icon_and_title: true`.
+> per-user language and cannot be rewritten when the dropdown changes, so the generated
+> dashboards keep the three tabs in English (`System`, `Device`, `Control`). Write your
+> own bilingually (`System status / 系统状态`) if you want something else. Also note that
+> a view with an `icon` shows **only the icon** unless you set
+> `show_icon_and_title: true`.
 > See [docs/CARDS.md](docs/CARDS.md#why-the-view-tabs-cannot-follow-the-language).
 - **Honest availability.** If the device stops pushing, entities turn `unavailable`
   within 2 minutes instead of showing stale numbers forever.
@@ -63,7 +65,7 @@ that mirror the layout of the Hoymiles app.
 |---|---|
 | **Home Assistant** | 2023.8 or newer (declared in `hacs.json`) |
 | **Required integration** | Home Assistant **MQTT**, pointed at the same broker as the device |
-| **Devices** | MS-A2 · HiBattery 4020 X · HiBattery 1920 AC · RMI-1650 series |
+| **Devices** | MS-A2 · HiBattery 4020 X · HiBattery 1920 AC |
 | **Firmware** | Must publish MQTT discovery under the `homeassistant/` prefix |
 | **Recorder** | Optional — only needed by the history chart and the energy sankey |
 
@@ -124,32 +126,17 @@ device it finds in a dropdown, so you normally just pick one. You can also type 
 
 The `dev_id` is `<client_prefix>-<SN>`, or just the SN when no prefix is configured.
 
+The wizard asks whether to build the bundled dashboard. Say yes and you get the same
+three views (**System**, **Device**, **Control**) as every other device of this
+integration — the layout is a template, only the entity ids differ. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#auto-generated-dashboard) for how the
+template stays in sync while keeping edits you make by hand.
+
 ---
 
 ## Quick start
 
-Once the device is added you get entities, a sidebar panel and eight cards.
-
-### The sidebar panel
-
-Adding the integration registers a `panel_custom` page per device, at
-`/hoymiles-<dev_id>` and named after the `dev_id` in the sidebar. Nothing to configure —
-open it and it is already showing that device:
-
-| Tab | Contents |
-|---|---|
-| **System** | Live power flow, today's PV / charged / discharged energy, day power history, energy sankey |
-| **Device** | Battery stack with per-pack SOC and temperature, pack list, diagnostics (model, firmware, serial, live battery/grid readings) |
-| **Control** | On/off, EMS mode, power set-point, per-phase output, TOU plan editor, reboot |
-
-The panel is *composed*, not duplicated: it embeds the eight cards below and simply
-resolves the entity ids for you. Everything is still available as individual cards if
-you prefer to build your own dashboard.
-
-> Panel titles are fixed when the panel is registered, so the sidebar entry is the raw
-> `dev_id`. The text *inside* the panel follows the viewing user's language.
-
-### A minimal dashboard, if you prefer cards
+Once the device is added you get entities plus eight cards. A minimal dashboard:
 
 ```yaml
 type: vertical-stack
@@ -185,8 +172,9 @@ cards:
         icon: ⚡
 ```
 
-> Neither card sets `language`, so both follow the **viewing user's** UI language.
-> The gauge tiles are the exception — their wording is your own `name`, so write
+> Neither card sets `language`, so both use the choice from the toolbar switch -
+> English until someone picks otherwise. The gauge tiles are the
+> exception — their wording is your own `name`, so write
 > those in whichever language you want. See
 > [docs/CARDS.md](docs/CARDS.md#how-the-language-is-chosen).
 
@@ -208,7 +196,7 @@ Configuring a TOU plan, either way works:
 | `custom:hoymiles-pack-list` | Compact pack list — SOC bar, temperature, heating flag |
 | `custom:hoymiles-history-chart` | Day / month / year curves with date navigation, reads long-term statistics |
 | `custom:hoymiles-gauge` | Single-value gauge with range switching (e.g. Wh → kWh) |
-| `custom:hoymiles-control` | On/off, EMS mode, power, per-phase output, TOU fetch, reboot |
+| `custom:hoymiles-control` | On/off, EMS mode, target power, max output, per-phase limit, TOU fetch, reboot |
 | `custom:hoymiles-tou-editor` | Visual TOU plan editor |
 | `custom:hoymiles-energy-sankey` | Energy-flow sankey built from long-term statistics |
 

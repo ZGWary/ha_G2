@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
@@ -12,18 +10,23 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import (
-    BOOT_FILENAME,
+    CONF_CREATE_DASHBOARD,
     CONF_DEV_ID,
     DOMAIN,
     FRONTEND_ASSETS,
     FRONTEND_URL,
-    PANEL_ELEMENT,
-    PANEL_ICON,
-    PANEL_URL_PATH,
     PLATFORMS,
 )
 from .coordinator import HoymilesCoordinator
+from .dashboard import (
+    RESULT_CREATED,
+    RESULT_EXISTS,
+    RESULT_UPDATED,
+    async_create_device_dashboard,
+    async_upgrade_dashboard_template,
+)
 from .discovery_override import FirmwareDiscoveryPatcher
+from .power_repeat import get_manager as get_repeat_manager
 from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,9 +56,58 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     await _async_register_frontend(hass)
-    await _async_register_panel(hass, dev_id)
     await async_setup_services(hass)
+    await _async_maybe_create_dashboard(hass, entry, dev_id)
     return True
+
+
+async def _async_maybe_create_dashboard(
+    hass: HomeAssistant, entry: ConfigEntry, dev_id: str
+) -> None:
+    """Install the device dashboard when the user asked for one.
+
+    Runs after ``async_forward_entry_setups`` because the dashboard references
+    entity ids, which only exist once the platforms have been set up.
+
+    A dashboard that already exists is normally left alone, so user edits are
+    never overwritten on a restart.  The one exception is a dashboard that still
+    matches the exact content this integration generated for it: when the
+    bundled template has moved on it is rebuilt, which is what keeps every device
+    looking the same.  Editing the dashboard by hand opts it out for good.
+
+    Entries created before the config flow asked the question have no
+    ``create_dashboard`` key at all.  They used to be skipped, which is why a
+    device added months ago kept an old layout (or no dashboard) while a new one
+    looked completely different.  A missing key therefore means "yes": the
+    bundled dashboard is the integration's output for every device.
+    """
+    if not entry.data.get(CONF_CREATE_DASHBOARD, True):
+        return
+    try:
+        result = await async_create_device_dashboard(hass, dev_id)
+        if result == RESULT_EXISTS:
+            upgraded = await async_upgrade_dashboard_template(hass, dev_id)
+            if upgraded is not None:
+                result = upgraded
+    except Exception:  # noqa: BLE001 - a dashboard must never break the setup
+        _LOGGER.warning(
+            "Unable to create the dashboard for %s", dev_id, exc_info=True
+        )
+        return
+
+    if result in (RESULT_CREATED, RESULT_UPDATED):
+        _LOGGER.info("Dashboard for %s: %s", dev_id, result)
+        return
+
+    # Silence here is what made a half-created dashboard look like a bug in the
+    # integration instead of a message the user could act on, so the leftover
+    # cases are reported at warning level with the fix spelled out.
+    _LOGGER.warning(
+        "Dashboard for %s was not built (%s); run the hoymiles.create_dashboard "
+        "service for this device to retry",
+        dev_id,
+        result,
+    )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -64,21 +116,20 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded:
         entry_data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
         if entry_data:
+            # A running re-publish job for a device that is being removed would
+            # keep talking to the broker forever, so it stops with the entry.
+            await get_repeat_manager(hass).async_stop(entry_data["dev_id"])
             entry_data["patcher"].async_shutdown()
             await entry_data["coordinator"].async_shutdown()
-        await _async_remove_panel(hass, entry.data[CONF_DEV_ID], entry.entry_id)
     return unloaded
 
 
 async def _async_register_frontend(hass: HomeAssistant) -> None:
-    """Serve the bundled frontend assets and inject the entry module.
+    """Serve the bundled Lovelace cards and inject them as frontend modules.
 
     Every asset listed in ``const.FRONTEND_ASSETS`` is published under
-    ``FRONTEND_URL``, so users never have to register anything manually as a
-    Lovelace resource.  Only ``BOOT_FILENAME`` is appended with
-    ``add_extra_js_url``: it imports the rest, which pins the evaluation order
-    (``add_extra_js_url`` keeps its URLs in a set, so injecting all of them
-    would load a card before the bootstrap that provides LitElement).
+    ``FRONTEND_URL`` and appended with ``add_extra_js_url``, so users never
+    have to register the cards manually as Lovelace resources.
 
     The assets are served with ``Cache-Control: no-cache``: the browser may keep
     them, but it has to revalidate before every use.  Home Assistant's own static
@@ -131,134 +182,16 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     try:
         from homeassistant.components.frontend import add_extra_js_url  # noqa: PLC0415
 
-        # Only the boot module is injected: it imports the panel and every card
-        # with static ``import`` statements.  Injecting each file separately
-        # would not preserve order - ``add_extra_js_url`` keeps the URLs in a
-        # set, so the ``<script>`` tags come out in an arbitrary order and a
-        # card could evaluate before ``hoymiles-base.js`` provided LitElement.
         # The version is only used to bust the browser cache: the route matches
         # on the path and ignores the query string.
-        boot = next((asset for asset in assets if asset[0].endswith(f"/{BOOT_FILENAME}")), None)
-        if boot is None:
-            _LOGGER.warning("Bundled frontend module %s is missing, cards stay disabled", BOOT_FILENAME)
-            return
-        boot_url = f"{boot[0]}?v={boot[2]}"
-        add_extra_js_url(hass, boot_url)
-        # The panel is registered with the same URL, so the browser reuses the
-        # already-evaluated module instead of fetching a second copy.
-        domain_data["_boot_url"] = boot_url
+        for url, _path, version in assets:
+            add_extra_js_url(hass, f"{url}?v={version}")
     except Exception:  # noqa: BLE001 - never break setup because of the card
         _LOGGER.warning("Unable to register the Hoymiles frontend cards", exc_info=True)
         return
 
     domain_data["_frontend_registered"] = True
     _LOGGER.debug("Registered frontend assets: %s", [url for url, _p, _v in assets])
-
-
-def _panel_url_path(dev_id: str) -> str:
-    """Return the sidebar URL path for one device."""
-    slug = re.sub(r"[^a-z0-9]+", "-", dev_id.lower()).strip("-")
-    return f"{PANEL_URL_PATH}-{slug or 'device'}"
-
-
-async def _async_register_panel(hass: HomeAssistant, dev_id: str) -> None:
-    """Expose ``hoymiles-panel`` as a sidebar entry for this device.
-
-    The panel is a ``panel_custom`` page: Home Assistant loads the boot module
-    as an ES module and renders ``<hoymiles-panel>`` with ``panel.config``
-    available as a property, which is where ``dev_id`` comes from.  Registration
-    is skipped when the assets were not served, so the sidebar never links to a
-    panel that cannot render.
-    """
-    domain_data = hass.data.setdefault(DOMAIN, {})
-    url_path = _panel_url_path(dev_id)
-    panels: dict[str, str] = domain_data.setdefault("_panels", {})
-
-    if url_path in panels:
-        return
-
-    if not domain_data.get("_frontend_registered"):
-        # The module was never served, so the panel could not render.
-        _LOGGER.debug("Frontend assets are unavailable, skipping the sidebar panel")
-        return
-
-    try:
-        from homeassistant.components.panel_custom import (  # noqa: PLC0415
-            async_register_panel,
-        )
-    except ImportError:  # pragma: no cover - panel_custom ships with HA
-        _LOGGER.debug("panel_custom is unavailable, skipping the sidebar panel")
-        return
-
-    # ``async_register_panel`` gained and dropped keyword arguments over the
-    # years (``config_panel_domain`` is recent, ``trust_external`` was renamed
-    # from ``trust_external_script`` in the YAML schema), so only the arguments
-    # this Home Assistant actually accepts are passed.  ``js_url`` is
-    # deliberately left out: giving both would make the frontend load the same
-    # module twice.
-    kwargs: dict[str, Any] = {
-        "frontend_url_path": url_path,
-        "webcomponent_name": PANEL_ELEMENT,
-        "sidebar_title": dev_id,
-        "sidebar_icon": PANEL_ICON,
-        "module_url": domain_data.get("_boot_url") or f"{FRONTEND_URL}/{BOOT_FILENAME}",
-        "embed_iframe": False,
-        "trust_external": False,
-        "config": {"dev_id": dev_id},
-        "require_admin": False,
-    }
-    try:
-        parameters = inspect.signature(async_register_panel).parameters
-    except (TypeError, ValueError):  # pragma: no cover - builtins only
-        parameters = {}
-    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-        kwargs = {key: value for key, value in kwargs.items() if key in parameters}
-
-    try:
-        await async_register_panel(hass, **kwargs)
-    except ValueError:
-        # Already registered (for example after a reload that did not unload
-        # cleanly), which is the state we want anyway.
-        panels[url_path] = dev_id
-        return
-    except Exception:  # noqa: BLE001 - a panel must never break setup
-        _LOGGER.warning("Unable to register the Hoymiles sidebar panel", exc_info=True)
-        return
-
-    panels[url_path] = dev_id
-    _LOGGER.debug("Registered sidebar panel %s for %s", url_path, dev_id)
-
-
-async def _async_remove_panel(
-    hass: HomeAssistant, dev_id: str, entry_id: str | None = None
-) -> None:
-    """Remove this device's sidebar panel once no entry uses it any more."""
-    domain_data = hass.data.get(DOMAIN, {})
-    panels: dict[str, str] = domain_data.get("_panels", {})
-    url_path = _panel_url_path(dev_id)
-
-    if panels.get(url_path) != dev_id:
-        # Never registered under this path (setup failed, or it was already
-        # removed by an earlier unload).
-        return
-
-    # Keep the panel while another config entry for the same device is still
-    # loaded - ``async_unload_entry`` pops its own data before calling this, so
-    # anything still holding this dev_id is a different, live entry.
-    for other_id, other in domain_data.items():
-        if other_id == entry_id or not isinstance(other, dict):
-            continue
-        if other.get("dev_id") == dev_id:
-            return
-
-    panels.pop(url_path, None)
-
-    try:
-        from homeassistant.components.frontend import async_remove_panel  # noqa: PLC0415
-
-        async_remove_panel(hass, url_path)
-    except Exception:  # noqa: BLE001 - a stale panel is harmless
-        _LOGGER.debug("Unable to remove sidebar panel %s", url_path, exc_info=True)
 
 
 def _register_asset_routes(http: Any, assets: list[tuple[str, str, int]]) -> bool:
