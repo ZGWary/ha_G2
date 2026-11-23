@@ -3,14 +3,15 @@
     "step": {
       "user": {
         "title": "Hoymiles MS-G2",
-        "description": "Discovered {count} device(s). Pick one from the list or type the device id manually. The device id has the form client_prefix-SN.",
+        "description": "Discovered {count} device(s). Pick one from the list or type the device id manually. The device id has the form client_prefix-SN; only the serial (whose leading four digits are the product id) identifies the device, the prefix is yours to choose.",
         "data": {
           "dev_id": "Device ID"
         }
       }
     },
     "error": {
-      "dev_id_required": "A device id is required"
+      "dev_id_required": "A device id is required",
+      "dev_id_invalid": "The serial does not start with a four digit product id (e.g. 4161A0209FF6). The prefix in front of the dash can be anything."
     },
     "abort": {
       "already_configured": "This device is already configured"
@@ -19,13 +20,25 @@
   "options": {
     "step": {
       "init": {
-        "title": "TOU plan",
+        "title": "Hoymiles G2 options",
         "menu_options": {
+          "charts": "Optional device charts",
           "day_plan": "Edit day plan",
           "week_plan": "Edit week plan",
           "get_plan": "Get current plan",
           "set_mode": "Set EMS mode",
           "reboot": "Reboot device"
+        }
+      },
+      "charts": {
+        "title": "Optional device charts",
+        "description": "Tick a reading to add its curve card to this device's Device view. A card starts recording the moment it is ticked and only ever draws the data recorded after that, so an unticked-then-ticked card begins a fresh curve.",
+        "data": {
+          "grid_current": "Grid current (A)",
+          "grid_frequency": "Grid frequency (Hz)",
+          "active_power": "Active power (W)",
+          "reactive_power": "Reactive power (var)",
+          "rssi": "Signal strength (dBm)"
         }
       },
       "day_plan": {
@@ -81,11 +94,20 @@
         "data": {
           "confirm": "Confirm reboot"
         }
+      },
+      "region": {
+        "title": "Region",
+        "description": "The time zone this device's day is measured in. Today's yield resets at this zone's midnight and every displayed time follows it. Choose the first entry to follow Home Assistant, or type any IANA zone name such as Europe/Berlin.",
+        "data": {
+          "region": "Region"
+        }
       }
     },
     "abort": {
       "empty_week_plan": "No weekday was mapped to a day plan, nothing was sent",
-      "get_plan_failed": "The device did not answer the plan query"
+      "get_plan_failed": "The device did not answer the plan query",
+      "charts_unsupported": "Optional charts are only available on a micro inverter (HiFlow / HiFlow Pro)",
+      "charts_not_saved": "The dashboard could not be written; no chart was changed"
     }
   },
   "services": {
@@ -137,6 +159,37 @@
         "phase_a": { "name": "Phase A limit", "description": "Output power limit in watt (100..2500)." },
         "phase_b": { "name": "Phase B limit", "description": "Output power limit in watt (100..2500)." },
         "phase_c": { "name": "Phase C limit", "description": "Output power limit in watt (100..2500)." }
+      }
+    },
+    "start_power_ctrl_keepalive": {
+      "name": "Start power control keep-alive",
+      "description": "Re-publish one power_ctrl value on a period. The firmware treats it as a lease and falls back after about 60 seconds. Runs inside Home Assistant, so it keeps working with no dashboard open. Requires mqtt_ctrl mode.",
+      "fields": {
+        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
+        "power": { "name": "Power", "description": "Power limit in watt to hold." },
+        "period": { "name": "Period", "description": "Seconds between two sends (5..3600, default 30)." }
+      }
+    },
+    "stop_power_ctrl_keepalive": {
+      "name": "Stop power control keep-alive",
+      "description": "Stop re-publishing power_ctrl for a device.",
+      "fields": {
+        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." }
+      }
+    },
+    "get_optional_charts": {
+      "name": "Get optional device charts",
+      "description": "Return which opt-in Device-view curves are enabled, and when each of them started recording.",
+      "fields": {
+        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." }
+      }
+    },
+    "set_optional_charts": {
+      "name": "Set optional device charts",
+      "description": "Enable or disable the opt-in Device-view curves. A key that is left out is disabled, so send the complete set.",
+      "fields": {
+        "dev_id": { "name": "Device ID", "description": "Device id (client_prefix-SN)." },
+        "charts": { "name": "Charts", "description": "Object of chart key to boolean: grid_current, grid_frequency, active_power, reactive_power, rssi." }
       }
     }
   }

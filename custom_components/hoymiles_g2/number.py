@@ -18,7 +18,7 @@ This platform adds per phase control:
 * the last known values come from the coordinator, which watches the command
   topic itself - so values written by the firmware entity (or by anything else
   on the broker) are picked up as well;
-* ``hoymiles_g2.set_phase_output_power`` sets all three atomically.
+* ``hoymiles.set_phase_output_power`` sets all three atomically.
 
 ⚠️ The device never reports the configured per phase limits back, so the value
 shown here is the last value that was *commanded*.  Until a phase has been set at
@@ -28,6 +28,7 @@ a warning is logged whenever that happens.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from homeassistant.components.number import (
@@ -44,6 +45,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CAP_PHASE_OUTPUT,
     DOMAIN,
     MANUFACTURER,
     PHASE_A,
@@ -54,6 +56,9 @@ from .const import (
     PHASE_POWER_STEP,
 )
 from .coordinator import HoymilesCoordinator
+from .entity_gate import async_add_gated_entities
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -85,9 +90,39 @@ async def async_setup_entry(
     coordinator: HoymilesCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
     dev_id: str = hass.data[DOMAIN][entry.entry_id]["dev_id"]
 
-    async_add_entities(
-        HoymilesPhaseNumber(coordinator, dev_id, description)
-        for description in NUMBER_DESCRIPTIONS
+    await coordinator.async_wait_for_capabilities()
+
+    # Without the firmware's ``phase_output_power`` object there is nothing to
+    # control: the device has no multi phase output stage at all (an on-grid
+    # micro inverter, or a single phase storage unit), and the command topic is
+    # never read.  Creating the three numbers anyway would put entities in the UI
+    # that silently do nothing.
+    #
+    # The gate re-checks this, because the discovery object that proves the
+    # capability is a retained MQTT payload that may land after setup - that is
+    # exactly how this feature is reported (see ``discovery_override.py``).
+    def _build() -> list[HoymilesPhaseNumber]:
+        if not coordinator.has_capability(CAP_PHASE_OUTPUT):
+            return []
+        return [
+            HoymilesPhaseNumber(coordinator, dev_id, description)
+            for description in NUMBER_DESCRIPTIONS
+        ]
+
+    def _stale() -> set[str]:
+        """The three phase keys, when the unit has no multi phase stage."""
+        if coordinator.has_capability(CAP_PHASE_OUTPUT):
+            return set()
+        return {description.key for description in NUMBER_DESCRIPTIONS}
+
+    async_add_gated_entities(
+        coordinator,
+        async_add_entities,
+        _build,
+        entry,
+        hass=hass,
+        domain="number",
+        stale=_stale,
     )
 
 
@@ -121,6 +156,7 @@ class HoymilesPhaseNumber(
             identifiers={(DOMAIN, dev_id)},
             name=dev_id,
             manufacturer=MANUFACTURER,
+            model=coordinator.device_model,
         )
 
     @property

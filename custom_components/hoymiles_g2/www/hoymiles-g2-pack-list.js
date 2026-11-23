@@ -21,21 +21,33 @@ function _hmPackListRegister() {
   const html = LitElement.prototype.html;
   const css = LitElement.prototype.css;
 
-  /* ------------------------------------------------------------------ *
-   * Language
-   *
-   * An explicit `language:` in the card config wins. When it is absent the
-   * card follows the Home Assistant user's language (`hass.language`), so a
-   * dashboard matches the UI without per-card configuration. Any Chinese
-   * variant counts as Chinese - Home Assistant reports `zh-Hans` / `zh-Hant`
-   * and may carry a region suffix such as `zh-Hans-CN`.
-   * ------------------------------------------------------------------ */
-  function hmLang(hass, config) {
-    const wanted = config && config.language;
-    if (wanted) return String(wanted).toLowerCase().startsWith("zh") ? "zh" : "en";
-    const ui = hass && hass.language;
-    return ui && String(ui).toLowerCase().startsWith("zh") ? "zh" : "en";
-  }
+  /* The shared language module (`hoymiles-g2-i18n.js`) is injected before this
+   * file, so `window.HoymilesG2I18n` is already there.  The fallback below only
+   * matters if that asset failed to load - the cards then keep rendering in the
+   * Home Assistant UI language instead of breaking. */
+  const I18N = window.HoymilesG2I18n || {
+    lang(hass, config) {
+      const wanted = config && config.language;
+      const ui = wanted || (hass && hass.language);
+      return String(ui || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    },
+    text(value, lang) {
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const hit = value[lang];
+        if (hit != null) return hit;
+        if (value.en != null) return value.en;
+        const first = Object.values(value)[0];
+        return first == null ? "" : first;
+      }
+      return value;
+    },
+    field: (value) => (typeof value === "string" ? value : ""),
+    pick(current, en, zh) {
+      return current === "zh" ? zh : en;
+    },
+    watch: () => {},
+    unwatch: () => {},
+  };
 
   /* ------------------------------------------------------------------ *
    * Localised config strings
@@ -51,21 +63,12 @@ function _hmPackListRegister() {
    * of pinning a dashboard to one language. A map missing the current language
    * falls back to `en`, then to whichever entry exists.
    * ------------------------------------------------------------------ */
-  function hmText(value, lang) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      const hit = value[lang];
-      if (hit != null) return hit;
-      if (value.en != null) return value.en;
-      const first = Object.values(value)[0];
-      return first == null ? "" : first;
-    }
-    return value;
-  }
+  /** The language this card must render in (`en` | `zh` | `de`). */
+  const hmLang = (hass, config) => I18N.lang(hass, config);
+  const hmText = (value, lang) => I18N.text(value, lang);
 
   /** A text field can only hold a plain string, so a language map shows empty. */
-  function hmField(value) {
-    return typeof value === "string" ? value : "";
-  }
+  const hmField = (value) => I18N.field(value);
 
   const PACK_MAX = 4;
 
@@ -75,6 +78,24 @@ function _hmPackListRegister() {
 
   function norm(name) {
     return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+
+  /**
+   * Drop the `_2` / `_3` … Home Assistant appends to a colliding entity id.
+   *
+   * HA does not fail a registration whose derived `entity_id` is taken; it
+   * numbers it.  A unit whose serial was registered once before therefore has
+   * every id one suffix away from the plain one this card derives
+   * (`sensor.<serial>_pack_1_soc_2`), and the scan below would find nothing.
+   * Only a trailing `_<digits>` is removed, so `pack_1_soc` keeps its `1`.
+   */
+  function stripAuditSuffix(value) {
+    const text = String(value == null ? "" : value);
+    const at = text.lastIndexOf("_");
+    if (at <= 0) return text;
+    const tail = text.slice(at + 1);
+    if (!/^[0-9]+$/.test(tail) || /^0+$/.test(tail)) return text;
+    return text.slice(0, at);
   }
 
   function num(value) {
@@ -103,6 +124,9 @@ function _hmPackListRegister() {
       this._hass = null;
       this._config = null;
       this._cache = new Map();
+      /* Registry device ids owning this serial, filled lazily by `_deviceIds`
+         and only used by the name-matching fallback of `_resolve`. */
+      this._deviceIdsCache = null;
     }
 
     static getConfigElement() {
@@ -150,19 +174,38 @@ function _hmPackListRegister() {
       this.requestUpdate();
     }
 
+connectedCallback() {
+      super.connectedCallback();
+      /* The toolbar language switch only writes localStorage and fires
+         `hoymiles-language`; it never touches `hass.language`, so without this
+         the card would keep its old wording until a page reload. */
+      I18N.watch(this);
+    }
+
+    disconnectedCallback() {
+      I18N.unwatch(this);
+      super.disconnectedCallback();
+    }
+
     getCardSize() {
       return 4;
     }
 
     /* ----------------------------- lookups ----------------------------- */
 
+    /** One of the two strings the card carries, in the current language. */
     _t(en, zh) {
-      return hmLang(this._hass, this._config) === "zh" ? zh : en;
+      return I18N.pick(this._lang(), en, zh);
+    }
+
+    /** The language this card should render in (`en` | `zh` | `de`). */
+    _lang() {
+      return hmLang(this._hass, this._config);
     }
 
     /** Resolve one user-supplied string (plain string or language map). */
     _text(value) {
-      return hmText(value, hmLang(this._hass, this._config));
+      return hmText(value, this._lang());
     }
 
     _dev() {
@@ -183,21 +226,71 @@ function _hmPackListRegister() {
       const prefix = `${domain}.${slug(this._dev())}`;
       const wanted = norm(key);
       let found = null;
+      // 1. normalized exact match on the tail after `<domain>.<slug>_`.
       for (const entityId of Object.keys(hass.states)) {
         if (!entityId.startsWith(prefix)) continue;
         if (norm(entityId.slice(prefix.length + 1)) !== wanted) continue;
         if (!found || entityId.length < found.length) found = entityId;
       }
 
+      // 2. the same, tolerating Home Assistant's `_2` disambiguation number.
+      //    Without this a serial registered once before - every id numbered -
+      //    resolved to nothing and the pack list stayed empty.
+      if (!found) {
+        for (const entityId of Object.keys(hass.states)) {
+          if (!entityId.startsWith(prefix)) continue;
+          if (norm(stripAuditSuffix(entityId.slice(prefix.length + 1))) !== wanted) continue;
+          if (!found || entityId.length < found.length) found = entityId;
+        }
+      }
+
       if (!found && hass.entities) {
-        const wantUid = new Set([`${this._dev()}_${key}`, `hoymiles_g2_${this._dev()}_${key}`]);
+        // The unique_id check this replaced was dead code - `hass.entities`
+        // does not carry it - so the registry `name` / `translation_key` is
+        // matched instead, which is what the sensor descriptions set.  Scoped
+        // to this unit's devices where the serial can be traced: a name match
+        // across the whole registry would happily return another unit's sensor.
+        const deviceIds = this._deviceIds();
         for (const [entityId, entry] of Object.entries(hass.entities)) {
-          if (entry && wantUid.has(entry.unique_id)) { found = entityId; break; }
+          if (!entry || !entityId.startsWith(`${domain}.`)) continue;
+          if (deviceIds.size && !deviceIds.has(entry.device_id)) continue;
+          if (norm(stripAuditSuffix(entry.name)) !== wanted
+            && norm(stripAuditSuffix(entry.translation_key)) !== wanted) continue;
+          if (!hass.states[entityId]) continue;
+          if (!found || entityId.length < found.length) found = entityId;
         }
       }
 
       if (found) this._cache.set(cacheKey, found);
       return found;
+    }
+
+    /**
+     * The registry device ids that belong to this card's serial, resolved once.
+     *
+     * `hass.devices` holds an array of `[domain, identifier]` pairs per device
+     * and the integration registers the serial verbatim, so a surviving serial
+     * in an identifier is what ties a device record to this card.  An empty set
+     * means "could not tell" - the caller then skips the scoped fallback.
+     */
+    _deviceIds() {
+      if (this._deviceIdsCache) return this._deviceIdsCache;
+      const out = new Set();
+      const devices = (this._hass && this._hass.devices) || {};
+      const serial = String(this._dev() || "");
+      if (serial) {
+        for (const [deviceId, device] of Object.entries(devices)) {
+          if (!device) continue;
+          for (const pair of device.identifiers || []) {
+            if (Array.isArray(pair) && String(pair[1]) === serial) {
+              out.add(deviceId);
+              break;
+            }
+          }
+        }
+      }
+      this._deviceIdsCache = out;
+      return out;
     }
 
     _state(key, domain = "sensor") {
@@ -255,7 +348,7 @@ function _hmPackListRegister() {
 
       return html`
         <ha-card>
-          <div class="title">${this._text(this._config.title) || this._t("Battery packs", "电池包")}</div>
+          <div class="title">${this._text(this._config.title) || this._t("Battery Packs", "电池包")}</div>
           ${count === 0
             ? html`<div class="none">${this._t("No pack data", "无电池包数据")}</div>`
             : html`<div class="grid" style="grid-template-columns:repeat(${columns},1fr)">${rows}</div>`}
